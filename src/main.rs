@@ -70,7 +70,7 @@ fn main() -> ExitCode {
             cmd_slot::run(&cx, &args[1..], &mut stdout)
         }
         _ => {
-            // A slot that stays on bash says so first (engine=rust on a pod or container slot).
+            // A slot that stays on bash says so first (an engine value that is not rust or bash).
             if let (Some("slot"), Some(name)) = (args.first().map(String::as_str), args.get(1)) {
                 if let Route::Bash { note: Some(note) } = cmd_slot::route(&paths, name) {
                     let _ = writeln!(stdout, "{note}");

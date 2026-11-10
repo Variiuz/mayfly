@@ -1203,7 +1203,7 @@ pub fn set_pool_value(path: &str, key: &str, value: &str) -> io::Result<()> {
 // ------------------------------------------------------------------ small helpers
 
 /// `base64 -w0`.
-fn base64(data: &[u8]) -> String {
+pub(crate) fn base64(data: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
     for ch in data.chunks(3) {

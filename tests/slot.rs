@@ -1,4 +1,4 @@
-//! The Rust slot loop (`engine=rust`, `kind=vm`) against the recording fake Proxmox host and a fake
+//! The Rust slot loops (`engine=rust`, `kind=vm`, `lxc` and `pod`) against the recording fake Proxmox host and a fake
 //! GitHub: whole job cycles with the exact commands in their exact order, the snippet and firewall
 //! file, the hooks, the log lines and the drain. Nothing here needs Proxmox, a network or root.
 
@@ -1275,9 +1275,19 @@ fn a_slot_is_checked_before_anything_runs() {
             "slot a-1: max_idle_hours= must be a whole number of hours",
         ),
         (
-            "a-1 9002 linux 8 16 60 no current kind=pod\n",
+            "a-1 9002 linux 8 16 60 no current kind=pod containers=0\n",
             "a-1",
-            "slot a-1: kind=pod runs on the bash loop (mayfly.sh), not here",
+            "slot a-1: containers=0 must be a number from 1 to ram_gb",
+        ),
+        (
+            "a-1 9002 linux 8 16 60 no current kind=pod containers=17\n",
+            "a-1",
+            "slot a-1: containers=17 must be a number from 1 to ram_gb",
+        ),
+        (
+            "a-1 9002 linux 8 16 60 no current kind=pod containers=x2\n",
+            "a-1",
+            "slot a-1: containers=x2 must be a number from 1 to ram_gb",
         ),
     ];
     for (slots, name, want) in cases {
@@ -1533,29 +1543,16 @@ fn engine_routing() {
         routed("SLOT_ENGINE=bash\nSLOT_ENGINE=rust\n", SLOT_LINE, "a-1"),
         Route::Rust
     );
-    // Pods and containers stay on bash, with one line saying so.
+    // Pods and containers run on rust too, by the slot's key or by pool.env.
     for kind in ["pod", "lxc"] {
         let slots = format!("p-1 9041 l 8 16 60 no current kind={kind} engine=rust\n");
-        assert_eq!(
-            routed("", &slots, "p-1"),
-            Route::Bash {
-                note: Some(format!(
-                    "slot p-1: engine=rust does not cover kind={kind} yet; running it on bash"
-                ))
-            }
-        );
+        assert_eq!(routed("", &slots, "p-1"), Route::Rust);
         let slots = format!("p-1 9041 l 8 16 60 no current kind={kind}\n");
-        assert_eq!(
-            routed("SLOT_ENGINE=rust\n", &slots, "p-1"),
-            Route::Bash {
-                note: Some(format!(
-                    "slot p-1: engine=rust does not cover kind={kind} yet; running it on bash"
-                ))
-            }
-        );
+        assert_eq!(routed("SLOT_ENGINE=rust\n", &slots, "p-1"), Route::Rust);
         // On bash anyway: nothing to say.
-        let slots = format!("p-1 9041 l 8 16 60 no current kind={kind}\n");
         assert_eq!(routed("", &slots, "p-1"), bash);
+        let slots = format!("p-1 9041 l 8 16 60 no current kind={kind} engine=bash\n");
+        assert_eq!(routed("SLOT_ENGINE=rust\n", &slots, "p-1"), bash);
     }
     // Not an engine: bash, and a line about it.
     assert_eq!(
@@ -1620,7 +1617,7 @@ fn text(b: &[u8]) -> String {
 }
 
 #[test]
-fn the_binary_runs_the_rust_loop_only_for_vm_slots_on_rust() {
+fn the_binary_runs_the_rust_loop_for_slots_on_rust() {
     // Rust: the loop starts and stops at the missing ORG.
     for (pool, slots) in [
         ("", "a-1 9002 l 8 16 60 no current engine=rust\n"),
@@ -1645,17 +1642,13 @@ fn the_binary_runs_the_rust_loop_only_for_vm_slots_on_rust() {
         assert_eq!(o.status.code(), Some(7), "{slots}");
         assert_eq!(text(&o.stdout), "bash: slot a-1\n", "{slots}");
     }
-    // Pods and containers: bash, after one line.
+    // Pods and containers: the Rust loop too.
     for kind in ["pod", "lxc"] {
         let slots = format!("p-1 9041 l 8 16 60 no current kind={kind} engine=rust\n");
         let o = slot_binary("", &slots, "p-1");
-        assert_eq!(o.status.code(), Some(7));
-        assert_eq!(
-            text(&o.stdout),
-            format!(
-                "slot p-1: engine=rust does not cover kind={kind} yet; running it on bash\nbash: slot p-1\n"
-            )
-        );
+        assert_eq!(o.status.code(), Some(1), "{kind}");
+        assert!(text(&o.stderr).contains("set ORG"), "{}", text(&o.stderr));
+        assert_eq!(text(&o.stdout), "");
     }
     // No such slot: bash says so.
     let o = slot_binary(
@@ -1665,4 +1658,979 @@ fn the_binary_runs_the_rust_loop_only_for_vm_slots_on_rust() {
     );
     assert_eq!(o.status.code(), Some(7));
     assert_eq!(text(&o.stdout), "bash: slot nope\n");
+}
+
+// ------------------------------------------------------------------ kind=lxc
+
+const CT_SLOT: &str = "a-1 9002 linux 2 4 20 no current kind=lxc\n";
+const LXC_POOL: &str = "LXC_TEMPLATE_VMID=9099\n";
+const CT_RUNNER_NET0: &str = "name=eth0,bridge=vmbr0,ip=dhcp,firewall=1";
+const CT_CLONE: &str = "pct clone 9099 9002 --hostname ci-a-1";
+const CT_START: &str = "pct start 9002";
+const CT_CONFIG: &str = "pct config 9002";
+const CT_CONFIG_TPL: &str = "pct config 9099";
+const CT_STOP: &str = "pct stop 9002 --skiplock 1";
+const CT_DESTROY: &str = "pct destroy 9002 --purge 1 --destroy-unreferenced-disks 1 --force 1";
+const CT_INFO: &str = "lxc-info -n 9002 -sH";
+const CT_BOOT: &str = "timeout 10 lxc-attach -n 9002 -- systemctl is-system-running";
+const CT_JIT: &str =
+    "timeout 30 lxc-attach -n 9002 -- sh -c umask 077; mkdir -p /etc/mayfly; cat >/etc/mayfly/jit";
+const CT_ENV: &str = "timeout 30 lxc-attach -n 9002 -- sh -c umask 077; cat >/etc/mayfly/job.env";
+const CT_JOB: &str =
+    "timeout 30 lxc-attach -n 9002 -- systemctl start --no-block mayfly-job.service";
+const CT_PGREP: &str = "timeout 10 lxc-attach -n 9002 -- pgrep -f bin/Runner\\.Worker";
+const CT_CFG: &str = "hostname: ci-a-1\ntags: mayfly\nrootfs: local-lvm:vm-9002-disk-0,size=8G\n";
+const CT_TEMPLATE_CFG: &str = "hostname: ci-ct-template\ntags: mayfly\ntemplate: 1\n";
+
+fn ct_exec_line() -> String {
+    format!("timeout 10 lxc-attach -n 9002 -- sh -c {SCRIPT}")
+}
+
+fn ct_set(net0: &str) -> String {
+    format!(
+        "pct set 9002 --cores 2 --memory 4096 --swap 0 --onboot 0 --tags mayfly --description runner {RUNNER}, template 9099 --net0 {net0}"
+    )
+}
+
+impl Rig {
+    /// The host as an lxc slot sees it: the container template, a pool at 10%, `pct clone` that makes the
+    /// container's config file and `pct destroy` that removes it, and a container that `lxc-info` calls
+    /// RUNNING or STOPPED per question (the last answer repeating). Every `sleep 30` moves the clock 30 s.
+    fn ct_pve(&self, states: &[bool]) -> FakePve {
+        fs::write(self.dir("pve/lxc/9099.conf"), "").unwrap();
+        let conf = self.dir("pve/lxc/9002.conf");
+        let conf2 = conf.clone();
+        let (snip, fw) = (self.snippet(), self.dir("fw/9002.fw"));
+        let seen = Rc::clone(&self.started);
+        let stop = Rc::clone(&self.stop_after_destroy);
+        let signal = self.signal();
+        let answers: Vec<(i32, &str)> = states
+            .iter()
+            .map(|s| (0, if *s { "RUNNING\n" } else { "STOPPED\n" }))
+            .collect();
+        FakePve::new()
+            .answer(PVESM, &format!("{}/x\n", self.dir("snip")))
+            .answer(CT_CONFIG_TPL, CT_TEMPLATE_CFG)
+            .answer(POOL, USED_10)
+            .answer(CT_CONFIG, CT_CFG)
+            .answer(CT_CLONE, "")
+            .on_call(CT_CLONE, move || fs::write(&conf, "").unwrap())
+            .answer(&ct_set(CT_RUNNER_NET0), "")
+            .answer("pct resize 9002 rootfs 20G", "")
+            .answer(CT_START, "")
+            .on_call(CT_START, move || {
+                let mut s = seen.borrow_mut();
+                s.snippet = fs::read_to_string(&snip).ok();
+                s.snippet_mode = fs::metadata(&snip).ok().map(|m| m.mode() & 0o777);
+                s.firewall = fs::read_to_string(&fw).ok();
+            })
+            .answer(CT_BOOT, "running\n")
+            .answer(CT_JIT, "")
+            .answer(CT_ENV, "")
+            .answer(CT_JOB, "")
+            .answer(CT_STOP, "")
+            .answer(CT_DESTROY, "")
+            .on_call(CT_DESTROY, move || {
+                let _ = fs::remove_file(&conf2);
+                if stop.get() {
+                    signal();
+                }
+            })
+            .sequence(CT_INFO, &answers)
+            .on_call("sleep 30", self.advance(30))
+    }
+}
+
+#[test]
+fn an_lxc_job_cycle_from_clone_to_runner_delete() {
+    let rig = Rig::new(
+        LXC_POOL,
+        "a-1 9002 linux 2 4 20 cache,missing current kind=lxc\n",
+    );
+    fs::write(
+        format!("{}/cache.env", rig.paths.env_dir),
+        "A=1\n# comment\nB=two\n",
+    )
+    .unwrap();
+    rig.hook("10-notify", 0o755);
+    let up = rig.hook_line("10-notify", &format!("vm-up a-1 9002 {RUNNER}"));
+    let gone = rig.hook_line("10-notify", "vm-gone a-1 9002 1");
+    let pve = rig
+        .ct_pve(&[true, true, false])
+        .answer(&up, "")
+        .answer(&gone, "");
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        format!(
+            "slot a-1: lxc 9002 up as {RUNNER} (template 9099)\nslot a-1: VM 9002 gone after 1 min\n"
+        )
+    );
+    assert_eq!(
+        o.err,
+        format!(
+            "warning: env missing: {}/missing.env missing or empty; jobs run without it\n",
+            rig.paths.env_dir
+        )
+    );
+    assert_eq!(
+        pve.calls(),
+        lines![
+            PVESM,
+            PVESM,
+            CT_CONFIG_TPL,
+            POOL,
+            CT_CLONE,
+            ct_set(CT_RUNNER_NET0),
+            // ct_grow: the template's rootfs is 8G, the slot wants 20G.
+            CT_CONFIG,
+            "pct resize 9002 rootfs 20G",
+            CT_START,
+            // deliver: booted, the JIT config and the job env over stdin, then the job service.
+            CT_BOOT,
+            CT_JIT,
+            CT_ENV,
+            CT_JOB,
+            up,
+            CT_INFO,
+            "sleep 30",
+            CT_INFO,
+            POOL,
+            "sleep 30",
+            // The container powered itself off.
+            CT_INFO,
+            CT_CONFIG,
+            CT_CONFIG,
+            CT_STOP,
+            CT_DESTROY,
+            gone,
+        ]
+    );
+    // The secret and the environment travel on stdin only.
+    assert_eq!(pve.stdins(), lines!["JITSECRET", "A=1\nB=two\n"]);
+    assert_eq!(
+        gh.calls(),
+        lines![
+            "token",
+            format!("jit tok {RUNNER} linux"),
+            "token",
+            "delete 77 tok"
+        ]
+    );
+    // No cloud-init snippet for a container; the firewall file is the VM's.
+    let seen = rig.started.borrow();
+    assert_eq!(seen.snippet, None);
+    assert!(seen
+        .firewall
+        .as_deref()
+        .unwrap()
+        .starts_with("[OPTIONS]\nenable: 1\ndhcp: 1\npolicy_in: DROP\n"));
+    assert!(!Path::new(&rig.dir("fw/9002.fw")).exists());
+    no_secret(&o, &pve, &gh);
+}
+
+#[test]
+fn an_lxc_slot_uses_its_own_net_and_keeps_a_big_enough_rootfs() {
+    let rig = Rig::new(
+        LXC_POOL,
+        "a-1 9002 linux 2 4 8 no current kind=lxc bridge=vmbr2 vlan=42\n",
+    );
+    let net0 = "name=eth0,bridge=vmbr2,tag=42,ip=dhcp,firewall=1";
+    let pve = rig.ct_pve(&[true, false]).answer(&ct_set(net0), "");
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert!(pve.calls().contains(&ct_set(net0)));
+    // 8G wanted, 8G there: no resize.
+    assert!(!pve.calls().iter().any(|c| c.starts_with("pct resize")));
+    // An empty env column delivers no job.env.
+    assert_eq!(pve.stdins(), lines!["JITSECRET"]);
+}
+
+#[test]
+fn an_lxc_slot_without_a_container_template_waits() {
+    let rig = Rig::new("", CT_SLOT);
+    let pve = rig.ct_pve(&[]).on_call("sleep 300", rig.signal());
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(
+        o.out,
+        format!(
+            "slot a-1: no template (TEMPLATE_VMID in {} or template= in {}); run mayfly template build\n",
+            rig.paths.pool_env, rig.paths.slots_conf
+        )
+    );
+    assert_eq!(pve.calls(), lines![PVESM, PVESM, "sleep 300"]);
+    assert!(gh.calls().is_empty());
+}
+
+#[test]
+fn an_lxc_canary_slot_clones_the_next_container_template() {
+    let rig = Rig::new(
+        "LXC_TEMPLATE_VMID=9099\nNEXT_LXC_TEMPLATE_VMID=9097\n",
+        "a-1 9002 linux 2 4 20 no next kind=lxc\n",
+    );
+    fs::write(rig.dir("pve/lxc/9097.conf"), "").unwrap();
+    let pve = rig
+        .ct_pve(&[true, false])
+        .answer("pct config 9097", CT_TEMPLATE_CFG)
+        .on_call("sleep 120", rig.signal());
+    rig.run(&pve, &FakeGh::new());
+    assert!(pve
+        .calls()
+        .contains(&"pct clone 9097 9002 --hostname ci-a-1".to_string()));
+}
+
+#[test]
+fn an_lxc_set_that_fails_is_cleaned_up_and_retried() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    let pve = rig.ct_pve(&[]).fail(&ct_set(CT_RUNNER_NET0), 1);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "slot a-1: could not create container 9002 from template 9099\n"
+    );
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_CLONE).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![
+            CT_CLONE,
+            ct_set(CT_RUNNER_NET0),
+            // The clone exists, so it is destroyed; its runner goes.
+            CT_CONFIG,
+            CT_CONFIG,
+            CT_STOP,
+            CT_DESTROY,
+            "sleep 120"
+        ]
+    );
+    assert_eq!(
+        gh.calls(),
+        lines!["token", format!("jit tok {RUNNER} linux"), "delete 77 tok"]
+    );
+    assert!(pve.stdins().is_empty());
+}
+
+#[test]
+fn an_lxc_clone_that_fails_leaves_nothing_to_destroy() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    // The failed clone leaves no config file behind.
+    let pve = rig
+        .ct_pve(&[])
+        .fail(CT_CLONE, 1)
+        .on_call(CT_CLONE, || {})
+        .on_call("sleep 120", rig.signal());
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(
+        o.out,
+        "slot a-1: could not create container 9002 from template 9099\n"
+    );
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_CLONE).unwrap();
+    assert_eq!(calls[at..].to_vec(), lines![CT_CLONE, "sleep 120"]);
+    assert_eq!(gh.calls().last().map(String::as_str), Some("delete 77 tok"));
+}
+
+#[test]
+fn an_lxc_container_that_does_not_start_is_destroyed() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    let pve = rig.ct_pve(&[]).fail(CT_START, 1);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(
+        o.out,
+        "slot a-1: container 9002 did not start or did not take the runner config\n"
+    );
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_START).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![
+            CT_START,
+            CT_CONFIG,
+            CT_CONFIG,
+            CT_STOP,
+            CT_DESTROY,
+            "sleep 120"
+        ]
+    );
+    assert_eq!(gh.calls().last().map(String::as_str), Some("delete 77 tok"));
+    assert!(pve.stdins().is_empty());
+    assert!(!Path::new(&rig.dir("fw/9002.fw")).exists());
+}
+
+#[test]
+fn an_lxc_container_that_does_not_take_the_runner_config_is_destroyed() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    let pve = rig.ct_pve(&[]).fail(CT_JIT, 1);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(
+        o.out,
+        "slot a-1: container 9002 did not start or did not take the runner config\n"
+    );
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_BOOT).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![
+            CT_BOOT,
+            CT_JIT,
+            CT_CONFIG,
+            CT_CONFIG,
+            CT_STOP,
+            CT_DESTROY,
+            "sleep 120"
+        ]
+    );
+    assert_eq!(gh.calls().last().map(String::as_str), Some("delete 77 tok"));
+    no_secret(&o, &pve, &gh);
+}
+
+#[test]
+fn an_lxc_container_that_is_slow_to_boot_is_waited_for() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    let pve = rig
+        .ct_pve(&[true, false])
+        .sequence(CT_BOOT, &[(1, ""), (0, "starting\n"), (0, "degraded\n")]);
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_START).unwrap();
+    assert_eq!(
+        calls[at..at + 7].to_vec(),
+        lines![CT_START, CT_BOOT, "sleep 2", CT_BOOT, "sleep 2", CT_BOOT, CT_JIT]
+    );
+}
+
+#[test]
+fn an_lxc_container_that_never_reports_running_is_given_the_config_anyway() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    let pve = rig.ct_pve(&[true, false]).fail(CT_BOOT, 1);
+    rig.run(&pve, &FakeGh::new());
+    let calls = pve.calls();
+    assert_eq!(calls.iter().filter(|c| *c == CT_BOOT).count(), 60);
+    // 59 waits of 2 s: none after the last look.
+    assert_eq!(calls.iter().filter(|c| *c == "sleep 2").count(), 59);
+    assert!(calls.contains(&CT_JIT.to_string()));
+}
+
+#[test]
+fn a_stop_while_the_container_is_idle_stops_it_at_once() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    rig.stop_after_destroy.set(false);
+    let pve = rig
+        .ct_pve(&[true, true, false])
+        .fail(&ct_exec_line(), 3)
+        .on_call("sleep 30", rig.signal());
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_JOB).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![
+            CT_JOB,
+            CT_INFO,
+            "sleep 30",
+            // The signal: is a job running? No (exit 3): stop the container.
+            CT_INFO,
+            ct_exec_line(),
+            CT_STOP,
+            CT_INFO,
+            // Then it is gone: destroy.
+            CT_CONFIG,
+            CT_CONFIG,
+            CT_STOP,
+            CT_DESTROY
+        ]
+    );
+    assert_eq!(pve.calls().iter().filter(|c| *c == CT_CLONE).count(), 1);
+    assert_eq!(gh.calls().last().map(String::as_str), Some("delete 77 tok"));
+}
+
+#[test]
+fn a_stop_while_a_container_runs_a_job_lets_the_job_finish() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    rig.stop_after_destroy.set(false);
+    let pve = rig
+        .ct_pve(&[true, true, true, false])
+        .answer(&ct_exec_line(), "42\n")
+        .on_call("sleep 30", rig.signal());
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CT_JOB).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![
+            CT_JOB,
+            CT_INFO,
+            "sleep 30",
+            // The signal: a job runs, nothing is stopped. The loop looks again while stopping.
+            CT_INFO,
+            ct_exec_line(),
+            CT_INFO,
+            ct_exec_line(),
+            POOL,
+            "sleep 30",
+            // The job ended and the container powered off.
+            CT_INFO,
+            CT_CONFIG,
+            CT_CONFIG,
+            CT_STOP,
+            CT_DESTROY
+        ]
+    );
+    assert_eq!(pve.calls().iter().filter(|c| *c == CT_CLONE).count(), 1);
+}
+
+#[test]
+fn an_lxc_runner_that_never_comes_online_is_replaced() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    rig.stop_after_destroy.set(false);
+    let pve = rig
+        .ct_pve(&[true, true, true, false])
+        .on_call("sleep 30", rig.advance(300))
+        .on_call("sleep 120", rig.signal());
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        format!(
+            "slot a-1: lxc 9002 up as {RUNNER} (template 9099)\n\
+             slot a-1: runner {RUNNER} not online after 10 min; replacing lxc 9002 (check its template: mayfly check)\n\
+             slot a-1: VM 9002 gone after 10 min\n"
+        )
+    );
+    // Asked once the container is 10 minutes old: is a job running?
+    assert!(pve.calls().contains(&CT_PGREP.to_string()));
+}
+
+#[test]
+fn an_lxc_vmid_that_is_not_ours_is_refused() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    fs::write(rig.dir("pve/lxc/9002.conf"), "").unwrap();
+    let pve = rig
+        .ct_pve(&[])
+        .answer(CT_CONFIG, "hostname: web\ntags: other\n");
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(
+        o.code,
+        Err("VMID 9002 exists but is not a mayfly guest; refusing to touch it".to_string())
+    );
+    assert_eq!(pve.calls(), lines![PVESM, CT_CONFIG]);
+    assert!(gh.calls().is_empty());
+}
+
+#[test]
+fn an_lxc_template_in_the_slots_vmid_is_never_destroyed() {
+    let rig = Rig::new(LXC_POOL, CT_SLOT);
+    fs::write(rig.dir("pve/lxc/9002.conf"), "").unwrap();
+    let pve = rig
+        .ct_pve(&[])
+        .answer(CT_CONFIG, "hostname: ci-a-1\ntags: mayfly\ntemplate: 1\n");
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(
+        o.code,
+        Err("VMID 9002 is a template; refusing to destroy it from a slot".to_string())
+    );
+    assert_eq!(pve.calls(), lines![PVESM, CT_CONFIG, CT_CONFIG]);
+}
+
+// ------------------------------------------------------------------ kind=pod
+
+const POD_SLOT: &str = "a-1 9002 linux 8 16 60 no current kind=pod containers=4\n";
+const POD_SET: &str = "qm set 9002 --cores 8 --memory 16384 --balloon 0 --onboot 0 --tags mayfly --description pod a-1, template 9098 --net0 virtio,bridge=vmbr0,firewall=1 --ipconfig0 ip=dhcp --cicustom user=local:snippets/mayfly-9002.yaml";
+const POD_READY: &str =
+    "timeout 40 qm guest exec 9002 --timeout 30 -- /usr/local/sbin/mayfly-pod ready";
+const POD_WANT: &str =
+    "timeout 40 qm guest exec 9002 --timeout 30 -- /usr/local/sbin/mayfly-pod want";
+const POD_DRAIN: &str =
+    "timeout 40 qm guest exec 9002 --timeout 30 -- /usr/local/sbin/mayfly-pod drain";
+const POD_BUSY: &str =
+    "timeout 40 qm guest exec 9002 --timeout 30 -- /usr/local/sbin/mayfly-pod busy";
+const OK: &str = "{\"exitcode\":0}";
+
+fn out_data(s: &str) -> String {
+    format!("{{\"exitcode\":0,\"out-data\":\"{s}\\n\"}}")
+}
+
+fn put_line(i: u32, secret: &str) -> String {
+    format!(
+        "timeout 40 qm guest exec 9002 --timeout 30 -- /usr/local/sbin/mayfly-pod put mf-a-1-{i}-1700000000 {secret}"
+    )
+}
+
+impl Rig {
+    /// The VM host of a pod slot, with the pod script on disk and `mayfly-pod` answering `ready`, `drain`
+    /// and `busy` (idle). `want` is for the test to answer.
+    fn pod_pve(&self, states: &[bool]) -> FakePve {
+        fs::create_dir_all(&self.paths.share).unwrap();
+        fs::write(format!("{}/pod-vm.sh", self.paths.share), "echo pod\n").unwrap();
+        self.pve(states)
+            .answer(POD_SET, "")
+            .answer(POD_READY, OK)
+            .answer(POD_DRAIN, OK)
+            .answer(POD_BUSY, &out_data("0"))
+    }
+}
+
+const POD_SNIPPET: &str = "\
+#cloud-config
+hostname: ci-a-1
+write_files:
+  - path: /usr/local/sbin/mayfly-pod
+    permissions: '0755'
+    encoding: b64
+    content: ZWNobyBwb2QK
+  - path: /etc/mayfly/pod.env
+    permissions: '0600'
+    content: |
+      CONTAINERS=4
+      CPUS=2.00
+      MEMORY=4g
+      MAX_JOB_SECS=10800
+      MAX_IDLE_SECS=7200
+runcmd:
+  - [bash, -c, '/usr/local/sbin/mayfly-pod image > /var/log/mayfly-pod-image.log 2>&1']
+";
+
+#[test]
+fn a_pod_cycle_feeds_idle_containers_and_drains_on_a_signal() {
+    let rig = Rig::new("", POD_SLOT);
+    rig.stop_after_destroy.set(false);
+    rig.hook("10-notify", 0o755);
+    let up = rig.hook_line("10-notify", "pod-up a-1 9002 4");
+    let gone = rig.hook_line("10-notify", "pod-gone a-1 9002 0");
+    let (clock, signal) = (rig.advance(15), rig.signal());
+    let sleeps = Cell::new(0);
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(&up, "")
+        .answer(&gone, "")
+        .sequence(POD_WANT, &[(0, &out_data("2")), (0, &out_data("0"))])
+        // Two idle containers: the first config is taken, the second is refused (its runner goes).
+        .answer(&put_line(1, "JITSECRET"), OK)
+        .fail(&put_line(2, "JITSECRET"), 1)
+        .on_call("sleep 15", move || {
+            sleeps.set(sleeps.get() + 1);
+            if sleeps.get() == 1 {
+                clock();
+            } else {
+                signal();
+            }
+        });
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "pod a-1: VM 9002 booting (4 containers, template 9098)\n\
+         pod a-1: ready after 0 min\n\
+         pod a-1: VM 9002 gone after 0 min\n"
+    );
+    assert_eq!(
+        pve.calls(),
+        lines![
+            PVESM,
+            PVESM,
+            CONFIG_TPL,
+            POOL,
+            CLONE,
+            POD_SET,
+            CONFIG,
+            "qm resize 9002 scsi0 60G",
+            START,
+            up,
+            POD_READY,
+            POD_WANT,
+            put_line(1, "JITSECRET"),
+            put_line(2, "JITSECRET"),
+            "sleep 15",
+            POD_WANT,
+            "sleep 15",
+            // The signal: no stop of the pod VM, only a drain; no running job, so on to the destroy.
+            POD_DRAIN,
+            POD_BUSY,
+            CONFIG,
+            CONFIG,
+            STOP,
+            DESTROY,
+            gone,
+        ]
+    );
+    assert_eq!(
+        gh.calls(),
+        lines![
+            "token",
+            "jit tok mf-a-1-1-1700000000 linux",
+            "jit tok mf-a-1-2-1700000000 linux",
+            "delete 77 tok",
+        ]
+    );
+    // The snippet existed with the pod script and its limits, mode 0600, and is gone.
+    let seen = rig.started.borrow();
+    assert_eq!(seen.snippet.as_deref(), Some(POD_SNIPPET));
+    assert_eq!(seen.snippet_mode, Some(0o600));
+    assert!(!Path::new(&rig.snippet()).exists());
+    assert!(seen.firewall.is_some());
+    // The pod VM stops only in destroy.
+    assert_eq!(pve.calls().iter().filter(|c| *c == STOP).count(), 1);
+}
+
+#[test]
+fn a_pod_takes_at_most_eight_configs_a_pass_and_stops_at_a_refusal() {
+    let rig = Rig::new("", POD_SLOT);
+    let signal = rig.signal();
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(POD_WANT, &out_data("12"))
+        .on_call("sleep 15", signal);
+    let gh = FakeGh::new();
+    gh.jit_fails.set(0);
+    rig.stop_after_destroy.set(false);
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    let puts = pve
+        .calls()
+        .iter()
+        .filter(|c| c.contains("mayfly-pod put"))
+        .count();
+    // Nothing answers `put`, so every config is refused: 8 tries, 8 runners deleted.
+    assert_eq!(puts, 8);
+    assert_eq!(
+        gh.calls().iter().filter(|c| *c == "delete 77 tok").count(),
+        8
+    );
+}
+
+#[test]
+fn a_refused_jit_config_in_a_pod_waits_a_minute() {
+    let rig = Rig::new("", POD_SLOT);
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(POD_WANT, &out_data("2"))
+        .on_call("sleep 60", rig.signal());
+    rig.stop_after_destroy.set(false);
+    let gh = FakeGh::new();
+    gh.jit_fails.set(5);
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "pod a-1: VM 9002 booting (4 containers, template 9098)\n\
+         pod a-1: ready after 0 min\n\
+         pod a-1: GitHub refused the runner registration; retrying in 1 min\n\
+         pod a-1: VM 9002 gone after 0 min\n"
+    );
+    // The first refusal ends the pass: one try, no `put`.
+    assert_eq!(
+        gh.calls(),
+        lines!["token", "jit tok mf-a-1-1-1700000000 linux".to_string()]
+    );
+}
+
+#[test]
+fn a_pod_drain_waits_for_running_jobs() {
+    let rig = Rig::new("", POD_SLOT);
+    rig.stop_after_destroy.set(false);
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(POD_WANT, &out_data("0"))
+        .sequence(
+            POD_BUSY,
+            &[
+                (0, &out_data("2")),
+                (0, &out_data("1")),
+                (0, &out_data("0")),
+            ],
+        )
+        .on_call("sleep 15", rig.signal());
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == POD_DRAIN).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![
+            POD_DRAIN, POD_BUSY, "sleep 30", POD_BUSY, "sleep 30", POD_BUSY, CONFIG, CONFIG, STOP,
+            DESTROY
+        ]
+    );
+}
+
+#[test]
+fn a_pod_whose_template_changed_is_recycled() {
+    let rig = Rig::new("", POD_SLOT);
+    let pool_env = rig.paths.pool_env.clone();
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(POD_WANT, &out_data("0"))
+        .on_call("sleep 15", move || {
+            fs::write(
+                &pool_env,
+                "ORG=acme\nRUNNER_PREFIX=mf\nTEMPLATE_VMID=9099\n",
+            )
+            .unwrap()
+        });
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "pod a-1: VM 9002 booting (4 containers, template 9098)\n\
+         pod a-1: ready after 0 min\n\
+         pod a-1: recycling VM 9002 (template 9099 replaces 9098)\n\
+         pod a-1: VM 9002 gone after 0 min\n"
+    );
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == POD_WANT).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![POD_WANT, "sleep 15", POD_DRAIN, POD_BUSY, CONFIG, CONFIG, STOP, DESTROY]
+    );
+}
+
+#[test]
+fn a_slot_template_pins_the_pod_to_it() {
+    let rig = Rig::new(
+        "",
+        "a-1 9002 linux 8 16 60 no current kind=pod containers=4 template=9098\n",
+    );
+    rig.stop_after_destroy.set(false);
+    let pool_env = rig.paths.pool_env.clone();
+    let signal = rig.signal();
+    let sleeps = Cell::new(0);
+    // After the first pass pool.env moves on to another template; the slot's own template= does not.
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(POD_WANT, &out_data("0"))
+        .on_call("sleep 15", move || {
+            sleeps.set(sleeps.get() + 1);
+            if sleeps.get() == 1 {
+                fs::write(&pool_env, "ORG=acme\nTEMPLATE_VMID=9099\n").unwrap();
+            } else {
+                signal();
+            }
+        });
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert!(!o.out.contains("recycling"), "{}", o.out);
+    assert_eq!(pve.calls().iter().filter(|c| *c == POD_WANT).count(), 2);
+}
+
+#[test]
+fn a_pod_older_than_pod_max_age_hours_is_recycled() {
+    // 1 h, plus (9002 % 8) * 30 min = 1 h.
+    let rig = Rig::new("POD_MAX_AGE_HOURS=1\n", POD_SLOT);
+    let pve = rig
+        .pod_pve(&[true])
+        .answer(POD_WANT, &out_data("0"))
+        .on_call("sleep 15", rig.advance(7200));
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "pod a-1: VM 9002 booting (4 containers, template 9098)\n\
+         pod a-1: ready after 0 min\n\
+         pod a-1: recycling VM 9002 (older than 1 h)\n\
+         pod a-1: VM 9002 gone after 120 min\n"
+    );
+}
+
+#[test]
+fn a_pod_whose_guest_stops_answering_is_replaced_after_twenty_misses() {
+    let rig = Rig::new("", POD_SLOT);
+    let pve = rig.pod_pve(&[true]);
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert!(
+        o.out
+            .contains("pod a-1: recycling VM 9002 (the guest has not answered for 5 min)\n"),
+        "{}",
+        o.out
+    );
+    let calls = pve.calls();
+    assert_eq!(calls.iter().filter(|c| *c == POD_WANT).count(), 20);
+    assert_eq!(calls.iter().filter(|c| *c == "sleep 15").count(), 19);
+}
+
+#[test]
+fn a_pod_that_never_gets_ready_is_replaced_with_a_backoff() {
+    let rig = Rig::new("", POD_SLOT);
+    rig.stop_after_destroy.set(false);
+    let pve = rig
+        .pod_pve(&[true])
+        .fail(POD_READY, 1)
+        .on_call("sleep 120", rig.signal());
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "pod a-1: VM 9002 booting (4 containers, template 9098)\n\
+         pod a-1: VM 9002 never got ready (see /var/log/mayfly-pod-image.log inside); replacing it\n\
+         pod a-1: VM 9002 gone after 0 min\n"
+    );
+    let calls = pve.calls();
+    assert_eq!(calls.iter().filter(|c| *c == POD_READY).count(), 90);
+    assert_eq!(calls.iter().filter(|c| *c == "sleep 20").count(), 90);
+    // Not ready: no drain, and one failure waits two minutes.
+    assert!(!calls.contains(&POD_DRAIN.to_string()));
+    assert_eq!(calls.last().map(String::as_str), Some("sleep 120"));
+}
+
+#[test]
+fn a_pool_over_the_panic_limit_stops_the_pod() {
+    let rig = Rig::new("POOL_PANIC_PERCENT=50\n", POD_SLOT);
+    rig.stop_after_destroy.set(false);
+    let pve = rig
+        .pod_pve(&[true])
+        .on_call("sleep 120", rig.signal())
+        .answer(POD_WANT, &out_data("0"))
+        .sequence(POOL, &[(0, USED_10), (0, "{\"total\":1000,\"used\":900}")]);
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(
+        o.out,
+        "pod a-1: VM 9002 booting (4 containers, template 9098)\n\
+         pod a-1: ready after 0 min\n\
+         pod a-1: local-lvm is 90% full (limit 50%); stopping VM 9002 (its jobs are cancelled)\n\
+         pod a-1: VM 9002 gone after 0 min\n"
+    );
+    // Cancelled jobs are not waited for, and the pod is not "never ready": one nap of two minutes.
+    let calls = pve.calls();
+    assert!(!calls.contains(&POD_DRAIN.to_string()));
+    assert_eq!(calls.last().map(String::as_str), Some("sleep 120"));
+    assert_eq!(calls.iter().filter(|c| *c == POD_WANT).count(), 4);
+}
+
+#[test]
+fn the_container_count_sets_the_pod_limits() {
+    let rig = Rig::new(
+        "MAX_JOB_HOURS=2\n",
+        "a-1 9002 linux 8 16 60 no current kind=pod containers=3 max_idle_hours=1\n",
+    );
+    let pve = rig.pod_pve(&[false]).answer(POD_SET, "");
+    rig.run(&pve, &FakeGh::new());
+    let snippet = rig.started.borrow().snippet.clone().unwrap();
+    assert!(
+        snippet.contains(
+            "      CONTAINERS=3\n      CPUS=2.67\n      MEMORY=5g\n      MAX_JOB_SECS=7200\n      MAX_IDLE_SECS=3600\n"
+        ),
+        "{snippet}"
+    );
+}
+
+#[test]
+fn a_pod_snippet_carries_the_job_env() {
+    let rig = Rig::new(
+        "",
+        "a-1 9002 linux 8 16 60 cache current kind=pod containers=4\n",
+    );
+    fs::write(format!("{}/cache.env", rig.paths.env_dir), "A=1\nB=two\n").unwrap();
+    let pve = rig.pod_pve(&[false]);
+    rig.run(&pve, &FakeGh::new());
+    let snippet = rig.started.borrow().snippet.clone().unwrap();
+    assert!(
+        snippet.contains(
+            "      MAX_IDLE_SECS=7200\n  - path: /etc/mayfly/job.env\n    permissions: '0600'\n    content: |\n      A=1\n      B=two\nruncmd:\n"
+        ),
+        "{snippet}"
+    );
+}
+
+#[test]
+fn a_pod_without_a_template_waits_five_minutes() {
+    let rig = Rig::new("TEMPLATE_VMID=\n", POD_SLOT);
+    let pve = rig.pod_pve(&[]).on_call("sleep 300", rig.signal());
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(
+        o.out,
+        format!(
+            "pod a-1: no template (TEMPLATE_VMID in {} or template= in {}); run mayfly template build\n",
+            rig.paths.pool_env, rig.paths.slots_conf
+        )
+    );
+    assert_eq!(pve.calls(), lines![PVESM, PVESM, "sleep 300"]);
+}
+
+#[test]
+fn a_pod_clone_that_fails_is_cleaned_up_and_retried() {
+    let rig = Rig::new("", POD_SLOT);
+    let pve = rig.pod_pve(&[]).fail(POD_SET, 1);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(
+        o.out,
+        "pod a-1: could not create VM 9002 from template 9098\n"
+    );
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == CLONE).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![CLONE, POD_SET, CONFIG, CONFIG, STOP, DESTROY, "sleep 120"]
+    );
+    // A pod registers no runner of its own.
+    assert!(gh.calls().is_empty());
+    assert!(!Path::new(&rig.snippet()).exists());
+}
+
+#[test]
+fn a_pod_vm_that_does_not_start_is_destroyed() {
+    let rig = Rig::new("", POD_SLOT);
+    let pve = rig.pod_pve(&[]).fail(START, 1);
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.out, "pod a-1: VM 9002 did not start\n");
+    let calls = pve.calls();
+    let at = calls.iter().position(|c| c == START).unwrap();
+    assert_eq!(
+        calls[at..].to_vec(),
+        lines![START, CONFIG, CONFIG, STOP, DESTROY, "sleep 120"]
+    );
+    assert!(!Path::new(&rig.snippet()).exists());
+    assert!(!Path::new(&rig.dir("fw/9002.fw")).exists());
+}
+
+#[test]
+fn a_signal_before_the_pod_starts_nothing() {
+    let rig = Rig::new("", POD_SLOT);
+    rig.terms.store(1, Ordering::SeqCst);
+    let pve = rig.pod_pve(&[]);
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(o.out, "");
+    assert_eq!(pve.calls(), lines![PVESM]);
+}
+
+#[test]
+fn a_pod_vmid_that_is_not_ours_is_refused() {
+    let rig = Rig::new("", POD_SLOT);
+    fs::write(rig.dir("pve/qemu-server/9002.conf"), "").unwrap();
+    let pve = rig.pod_pve(&[]).answer(CONFIG, "name: web\ntags: other\n");
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(
+        o.code,
+        Err("VMID 9002 exists but is not a mayfly guest; refusing to touch it".to_string())
+    );
+    assert_eq!(pve.calls(), lines![PVESM, CONFIG]);
+}
+
+#[test]
+fn a_failing_pod_destroy_ends_the_slot_with_its_exit_code() {
+    let rig = Rig::new("", POD_SLOT);
+    fs::write(rig.dir("pve/qemu-server/9002.conf"), "").unwrap();
+    let pve = rig
+        .pod_pve(&[])
+        .answer(CONFIG, "name: ci-a-1\ntags: mayfly\n")
+        .fail(DESTROY, 5);
+    let o = rig.run(&pve, &FakeGh::new());
+    assert_eq!(o.code, Ok(5));
 }
