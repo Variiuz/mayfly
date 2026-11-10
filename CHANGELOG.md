@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/Variiuz/mayfly/compare/v0.4.0...v0.4.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* **template:** run the profile from a directory runner can read ([#21](https://github.com/Variiuz/mayfly/issues/21)) ([2617d3f](https://github.com/Variiuz/mayfly/commit/2617d3f8516ee3323bde5e511e48f464e2a5ad61))
+* **update:** the timer never installs a breaking release ([#20](https://github.com/Variiuz/mayfly/issues/20)) ([24e30a8](https://github.com/Variiuz/mayfly/commit/24e30a8341fae602310180e0e0bfe806465549f7))
+
 ## [0.4.0](https://github.com/Variiuz/mayfly/compare/v0.3.0...v0.4.0) (2026-11-10)
 
 
