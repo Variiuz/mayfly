@@ -773,8 +773,8 @@ fn a_build_outside_a_unit_starts_one_and_returns() {
         .with_command("systemd-run")
         .fail("systemctl is-active -q mayfly-template-build", 3)
         .answer("systemctl reset-failed mayfly-template-build", "")
-        .answer("systemd-run -q --unit=mayfly-template-build --description=mayfly template build --collect --setenv=MAYFLY_CONF_DIR=/etc/mayfly --setenv=NO_COLOR=1 /usr/local/sbin/mayfly template build polara --lxc --foreground", "");
-    let res = h.run_with(&pve, &o, &["build", "polara", "--lxc"]);
+        .answer("systemd-run -q --unit=mayfly-template-build --description=mayfly template build --collect --setenv=MAYFLY_CONF_DIR=/etc/mayfly --setenv=NO_COLOR=1 /usr/local/sbin/mayfly template build ci --lxc --foreground", "");
+    let res = h.run_with(&pve, &o, &["build", "ci", "--lxc"]);
     assert_eq!(res.r, Ok(0));
     assert_eq!(
         res.out,
@@ -785,7 +785,7 @@ fn a_build_outside_a_unit_starts_one_and_returns() {
         [
             "systemctl is-active -q mayfly-template-build",
             "systemctl reset-failed mayfly-template-build",
-            "systemd-run -q --unit=mayfly-template-build --description=mayfly template build --collect --setenv=MAYFLY_CONF_DIR=/etc/mayfly --setenv=NO_COLOR=1 /usr/local/sbin/mayfly template build polara --lxc --foreground"
+            "systemd-run -q --unit=mayfly-template-build --description=mayfly template build --collect --setenv=MAYFLY_CONF_DIR=/etc/mayfly --setenv=NO_COLOR=1 /usr/local/sbin/mayfly template build ci --lxc --foreground"
         ]
     );
     // The lock is let go before the unit starts, so that the unit can take it.
@@ -1435,8 +1435,11 @@ fn canary_marks_a_container_template_next_lxc() {
         res.out,
         "lxc slots marked next now clone 9095\n  when their jobs pass: mayfly template promote 9095\n"
     );
-    // No layout check for a container.
-    assert_eq!(pve.calls(), ["pct config 9095", "pct config 9095"]);
+    // Containers are checked for a profile description too.
+    assert_eq!(
+        pve.calls(),
+        ["pct config 9095", "pct config 9095", "pct config 9095"]
+    );
     assert_eq!(
         h.pool_env(),
         "ORG=acme\nIMAGE_URL=https://img.test/x/disk.img\nTEMPLATE_VMID=9098\nNEXT_TEMPLATE_VMID=9099\nLXC_TEMPLATE_VMID=9096\nNEXT_LXC_TEMPLATE_VMID=9095\n"
@@ -1470,24 +1473,26 @@ fn promote_a_container_template_only_touches_the_lxc_keys() {
 }
 
 #[test]
-fn a_polara_ci_template_gets_a_note_and_the_same_edit() {
+fn canary_and_promote_refuse_a_template_mayfly_did_not_build() {
     let h = Host::new("");
     h.conf("qemu-server", "9097");
     let pve = FakePve::new().answer(
         "qm config 9097",
         "name: ci-template-old\ntags: mayfly\ntemplate: 1\n",
     );
-    for (sub, last) in [
-        ("canary", "slots marked next now clone 9097\n  when their jobs pass: mayfly template promote 9097\n"),
-        ("promote", "every slot clones 9097 from its next job on\n"),
-    ] {
+    for sub in ["canary", "promote"] {
         let res = h.run(&pve, &[sub, "9097"]);
         assert_eq!(
-            res.out,
-            format!("warning: template 9097 was built by polara-ci: its jobs get the /etc/polara-ci paths it expects\n  rebuild it with mayfly template build when convenient\n{last}"),
+            res.r,
+            Err(
+                "template 9097 was not built by mayfly template build; its jobs may never start"
+                    .to_string()
+            ),
             "{sub}"
         );
+        assert_eq!(res.out, "", "{sub}");
     }
+    assert!(!h.pool_env().contains("9097"));
 }
 
 #[test]
