@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/Variiuz/mayfly/compare/v0.8.1...v0.9.0) (2026-11-10)
+
+
+### Features
+
+* mayfly stats, per-slot jobs, idle and stuck guests and errors from the journal ([#38](https://github.com/Variiuz/mayfly/issues/38)) ([338b1c7](https://github.com/Variiuz/mayfly/commit/338b1c79c0effcb92d403ac5fc829cb5b814f9e7))
+
 ## [0.8.1](https://github.com/Variiuz/mayfly/compare/v0.8.0...v0.8.1) (2026-11-10)
 
 
