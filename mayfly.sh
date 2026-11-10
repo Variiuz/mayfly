@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mayfly.sh: throwaway CI runners on a Proxmox host, one VM (or LXC container) per job.
 # Installed to /usr/local/share/mayfly by install.sh and run as root by the mayfly binary, which owns
-# version, help, status and check and hands every other command to this script. It also runs on its
+# version, help, status, check and update and hands every other command to this script. It also runs on its
 # own. See README.md.
 #
 #   mayfly slot <name>               loop behind mayfly-slot@<name>.service (kind=vm, pod or lxc)
@@ -14,6 +14,7 @@
 #   mayfly template list
 #   mayfly enable [slot ...]         start slots (all in slots.conf when none named) and the gc timer
 #   mayfly disable [slot ...]        stop slots after their running job (all when none named)
+#   mayfly update [--check|--rollback]  self-update from the latest release (the mayfly binary does this)
 #   mayfly version
 #
 # Every VM this tool creates carries the tag TAG (mayfly), a name starting with NAME_PREFIX (ci-) and a
@@ -1383,6 +1384,7 @@ ${C_DIM}Run${C_0}
 ${C_DIM}Other${C_0}
   gc                                stale runners, orphan guests, old snippets (the timer runs it)
   slot <name>                       one slot's loop (mayfly-slot@<name>.service runs it)
+  update [--check|--rollback]       update Mayfly from the latest release (the update timer runs it)
   version
 
 Config in $CONF_DIR: pool.env, slots.conf. Docs: https://github.com/variiuz/mayfly

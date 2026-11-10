@@ -15,9 +15,17 @@ pub struct Paths {
     pub share: String,
     pub pve_etc: String,
     pub pve_fw_dir: String,
+    /// Where the `mayfly` binary lives (`MAYFLY_SBIN`).
+    pub sbin: String,
+    /// Where the systemd units live (`MAYFLY_SYSTEMD_DIR`).
+    pub systemd_dir: String,
+    /// `update.state` is kept here (`MAYFLY_STATE_DIR`).
+    pub state_dir: String,
+    /// Where `mayfly update` makes its temporary directory (`MAYFLY_TMP`).
+    pub tmp_dir: String,
 }
 
-fn env_or(name: &str, default: &str) -> String {
+pub fn env_or(name: &str, default: &str) -> String {
     match std::env::var(name) {
         Ok(v) if !v.is_empty() => v,
         _ => default.to_string(),
@@ -25,16 +33,22 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 impl Paths {
-    /// `MAYFLY_CONF_DIR`, `MAYFLY_SHARE`, `MAYFLY_PVE_ETC` and `MAYFLY_PVE_FW_DIR`, as bash reads them.
+    /// `MAYFLY_CONF_DIR`, `MAYFLY_SHARE`, `MAYFLY_PVE_ETC` and `MAYFLY_PVE_FW_DIR`, as bash reads them, and
+    /// `MAYFLY_SBIN`, `MAYFLY_SYSTEMD_DIR`, `MAYFLY_STATE_DIR` and `MAYFLY_TMP` for `update`.
     pub fn from_env() -> Paths {
         let pve_etc = env_or("MAYFLY_PVE_ETC", "/etc/pve");
         let fw = env_or("MAYFLY_PVE_FW_DIR", &format!("{pve_etc}/firewall"));
-        Paths::new(
+        let mut p = Paths::new(
             &env_or("MAYFLY_CONF_DIR", "/etc/mayfly"),
             &env_or("MAYFLY_SHARE", "/usr/local/share/mayfly"),
             &pve_etc,
             &fw,
-        )
+        );
+        p.sbin = env_or("MAYFLY_SBIN", &p.sbin);
+        p.systemd_dir = env_or("MAYFLY_SYSTEMD_DIR", &p.systemd_dir);
+        p.state_dir = env_or("MAYFLY_STATE_DIR", &p.state_dir);
+        p.tmp_dir = env_or("MAYFLY_TMP", &p.tmp_dir);
+        p
     }
 
     pub fn new(conf_dir: &str, share: &str, pve_etc: &str, pve_fw_dir: &str) -> Paths {
@@ -46,6 +60,10 @@ impl Paths {
             share: share.to_string(),
             pve_etc: pve_etc.to_string(),
             pve_fw_dir: pve_fw_dir.to_string(),
+            sbin: "/usr/local/sbin".to_string(),
+            systemd_dir: "/etc/systemd/system".to_string(),
+            state_dir: "/var/lib/mayfly".to_string(),
+            tmp_dir: "/var/tmp".to_string(),
         }
     }
 }
@@ -261,6 +279,7 @@ fn defaults(conf_dir: &str) -> Vec<(&'static str, String)> {
             s("https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"),
         ),
         ("RUNNER_PREFIX", s("")),
+        ("UPDATE", s("auto")),
     ]
 }
 
@@ -365,6 +384,26 @@ pub fn load(paths: &Paths, pve: &dyn Pve, node: &str, strict: bool) -> R<(Config
         },
         issues,
     ))
+}
+
+/// `UPDATE` of pool.env for the update timer: `auto` (the default), `patch` or `off`. Read on its own,
+/// so the timer works before the rest of pool.env is filled in.
+pub fn update_mode(paths: &Paths) -> R<String> {
+    let text = fs::read(&paths.pool_env)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let (vars, _) = parse_pool_env(&text);
+    let v = vars
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "UPDATE")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    match v {
+        "" | "auto" => Ok("auto".to_string()),
+        "patch" | "off" => Ok(v.to_string()),
+        _ => die(format!("UPDATE={v}: use auto, patch or off")),
+    }
 }
 
 // ------------------------------------------------------------------ slots.conf

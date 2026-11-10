@@ -55,6 +55,8 @@ jobs:
           tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly$"
           tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly.sh$"
           tar -tvzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^-rwxr-xr-x.* mayfly-$v/mayfly$"
+          tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly-update.service$"
+          tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly-update.timer$"
           if tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -Eq '/(tests|src)/|Cargo'; then echo "tests or sources in the tarball" >&2; exit 1; fi
           grep -q "^VERSION=$v " "$RUNNER_TEMP/dist/install.sh"
           grep -q " mayfly-$v-x86_64-linux$" "$RUNNER_TEMP/dist/SHA256SUMS"

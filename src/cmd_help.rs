@@ -31,6 +31,7 @@ pub fn help(paths: &Paths, out: &Out, w: &mut dyn Write) {
 {d}Other{z}
   gc                                stale runners, orphan guests, old snippets (the timer runs it)
   slot <name>                       one slot's loop (mayfly-slot@<name>.service runs it)
+  update [--check|--rollback]       update Mayfly from the latest release (the update timer runs it)
   version
 
 Config in {conf}: pool.env, slots.conf. Docs: https://github.com/variiuz/mayfly

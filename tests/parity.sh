@@ -148,7 +148,7 @@ b-1 9041 small 2 4 30 no current kind=pod containers=4
 c-1 9051 small 2 4 20 no current kind=lxc
 long-slot-name-1 9099 small-and-fast 1 1 1 no next
 SLOTS
-export PATH="$t/bin:$PATH" MAYFLY_CONF_DIR="$t/conf" MAYFLY_SHARE="$t/share" MAYFLY_PVE_ETC="$t/pve" MAYFLY_PVE_FW_DIR="$t/fw"
+export PATH="$t/bin:$PATH" MAYFLY_STATE_DIR="$t/state" MAYFLY_CONF_DIR="$t/conf" MAYFLY_SHARE="$t/share" MAYFLY_PVE_ETC="$t/pve" MAYFLY_PVE_FW_DIR="$t/fw"
 unset NO_COLOR
 cp "$here/mayfly.sh" "$t/share/mayfly.sh"
 
@@ -160,6 +160,9 @@ same() {
   rb=$?
   "$bin" "$@" >"$t/rust.out" 2>"$t/rust.err" </dev/null
   rr=$?
+  # Known difference: only the Rust status prints the `update <version>, last ...` line (the update
+  # state is Rust-only). Take it out of the Rust output before comparing.
+  sed -i '/^update /d' "$t/rust.out"
   n=$((n + 1))
   if [ "$rb" = "$rr" ] && cmp -s "$t/bash.out" "$t/rust.out" && cmp -s "$t/bash.err" "$t/rust.err"; then
     echo "ok   $name (exit $rb, $(wc -l <"$t/bash.out") lines)"

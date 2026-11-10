@@ -48,12 +48,13 @@ impl Fixture {
     fn new(name: &str, pool_env: &str, slots: &str) -> Fixture {
         let root = tmp(name);
         let r = root.display().to_string();
-        let paths = Paths::new(
+        let mut paths = Paths::new(
             &format!("{r}/conf"),
             &format!("{r}/share"),
             &format!("{r}/pve"),
             &format!("{r}/fw"),
         );
+        paths.state_dir = format!("{r}/state");
         write(&paths.pool_env, pool_env);
         write(&paths.slots_conf, slots);
         fs::create_dir_all(format!("{r}/share/profiles/default")).unwrap();
@@ -359,7 +360,9 @@ storage    local-lvm 42% used, limit 70%
 ram        32 GB free, 8 GB kept for the host
 template   9098, next 9099, profile default
 lxc        9096, next 9095
+update     {version}, no update run yet
 ";
+    let want = want.replace("{version}", env!("CARGO_PKG_VERSION"));
     assert_eq!(out, want);
     assert_eq!(code, 0);
 }
@@ -369,10 +372,25 @@ fn status_without_lxc_templates_has_no_lxc_line() {
     let (f, pve) = status_fixture("");
     let (_, out) = f.run_status(&pve);
     assert!(
-        out.ends_with("template   9098, next 9099, profile default\n"),
+        out.ends_with(&format!(
+            "template   9098, next 9099, profile default\nupdate     {}, no update run yet\n",
+            env!("CARGO_PKG_VERSION")
+        )),
         "{out}"
     );
     assert!(!out.contains("\nlxc "));
+    write(
+        format!("{}/update.state", f.paths.state_dir),
+        "last_attempt=2026-11-10T04:12:09Z\nlast_result=rolled-back\nskipped=9.9.9\n",
+    );
+    let (_, out) = f.run_status(&pve);
+    assert!(
+        out.ends_with(&format!(
+            "\nupdate     {}, last 2026-11-10T04:12:09Z rolled-back\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{out}"
+    );
 }
 
 #[test]
@@ -925,8 +943,9 @@ warning: 1 running guest(s) have no online runner on GitHub; a job VM that boots
 storage    local-lvm 42% used, limit 70%
 ram        32 GB free, 8 GB kept for the host
 template   9098, next 9099, profile default
+update     {version}, no update run yet
 ";
-    assert_eq!(out, want);
+    assert_eq!(out, want.replace("{version}", env!("CARGO_PKG_VERSION")));
     let seen = gh.seen.lock().unwrap();
     let paths: Vec<&str> = seen.iter().map(|s| s.path.as_str()).collect();
     assert_eq!(
@@ -990,4 +1009,511 @@ fn check_warns_about_polara_ci_templates() {
     );
     let (_, out) = f.run_check(&pve).unwrap();
     assert!(!out.contains("polara-ci"), "{out}");
+}
+
+// ------------------------------------------------------------------ mayfly update
+
+/// A tiny HTTP server: `routes` maps a path to its body, anything else is a 404. Returns the port and
+/// the paths asked for.
+fn fake_release_server(routes: HashMap<String, Vec<u8>>) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                continue;
+            }
+            loop {
+                let mut l = String::new();
+                if reader.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" {
+                    break;
+                }
+            }
+            let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+            let (code, body) = match routes.get(&path) {
+                Some(b) => (200, b.clone()),
+                None => (404, b"{}".to_vec()),
+            };
+            log.lock().unwrap().push(path);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+    });
+    (port, seen)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A stand-in for the `mayfly` command: prints its version and passes or fails `check`.
+fn fake_mayfly(version: &str, check_exit: i32) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$1\" in\n  version) echo \"mayfly {version}\" ;;\n  check) echo \"check says {check_exit}\"; exit {check_exit} ;;\nesac\n"
+    )
+}
+
+/// The release tarball of version `v`: a fake command, mayfly.sh, the update units and an install.sh that
+/// copies them where MAYFLY_SBIN, MAYFLY_SHARE and MAYFLY_SYSTEMD_DIR say.
+fn release_tarball(v: &str, mayfly: &str) -> Vec<u8> {
+    let install = "#!/bin/sh\nset -e\nhere=$(cd \"$(dirname \"$0\")\" && pwd)\n\
+        cp \"$here/mayfly\" \"$MAYFLY_SBIN/mayfly\"\n\
+        cp \"$here/mayfly.sh\" \"$MAYFLY_SHARE/mayfly.sh\"\n\
+        cp \"$here/mayfly-update.service\" \"$here/mayfly-update.timer\" \"$MAYFLY_SYSTEMD_DIR/\"\n";
+    let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut b = tar::Builder::new(enc);
+    let files: [(&str, &str, u32); 5] = [
+        ("mayfly", mayfly, 0o755),
+        ("mayfly.sh", "new mayfly.sh\n", 0o755),
+        ("install.sh", install, 0o755),
+        ("mayfly-update.service", "new update service\n", 0o644),
+        ("mayfly-update.timer", "new update timer\n", 0o644),
+    ];
+    for (name, body, mode) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(mode);
+        h.set_mtime(0);
+        b.append_data(&mut h, format!("mayfly-{v}/{name}"), body.as_bytes())
+            .unwrap();
+    }
+    b.into_inner().unwrap().finish().unwrap()
+}
+
+struct Release {
+    port: u16,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl Release {
+    /// A server whose latest release is `v`; `sums` overrides the checksum line (to make it wrong).
+    fn serve(v: &str, mayfly: &str, sums: Option<&str>) -> Release {
+        let tgz = release_tarball(v, mayfly);
+        let name = format!("mayfly-{v}.tar.gz");
+        let sums = match sums {
+            Some(s) => s.to_string(),
+            None => sha256_hex(&tgz),
+        };
+        let mut routes = HashMap::new();
+        let tag = format!("{{\"tag_name\":\"v{v}\"}}").into_bytes();
+        routes.insert("/api/releases/latest".to_string(), tag.clone());
+        routes.insert(format!("/api/releases/tags/v{v}"), tag);
+        routes.insert(
+            format!("/repo/releases/download/v{v}/SHA256SUMS"),
+            format!("{sums}  {name}\n").into_bytes(),
+        );
+        routes.insert(format!("/repo/releases/download/v{v}/{name}"), tgz);
+        let (port, seen) = fake_release_server(routes);
+        Release { port, seen }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn downloads(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|p| p.contains("/download/"))
+            .count()
+    }
+}
+
+/// An installed Mayfly in a temporary directory, with a fake `systemctl` that logs its calls.
+struct Host {
+    root: PathBuf,
+}
+
+impl Host {
+    fn new(name: &str, old_check_exit: i32, pool_env: &str) -> Host {
+        let root = tmp(name);
+        let h = Host { root };
+        write(
+            h.sbin().join("mayfly"),
+            &fake_mayfly("0.0.1", old_check_exit),
+        );
+        fs::set_permissions(h.sbin().join("mayfly"), fs::Permissions::from_mode(0o755)).unwrap();
+        write(h.share().join("mayfly.sh"), "old mayfly.sh\n");
+        write(
+            h.share().join("profiles/default/provision.sh"),
+            "old profile\n",
+        );
+        write(h.units().join("mayfly-gc.timer"), "old gc timer\n");
+        write(h.units().join("mayfly-slot@.service"), "old slot service\n");
+        write(h.root.join("conf/pool.env"), pool_env);
+        let systemctl = h.root.join("bin/systemctl");
+        write(
+            &systemctl,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}/systemctl.log\n",
+                h.root.display()
+            ),
+        );
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(h.tmp()).unwrap();
+        h
+    }
+
+    fn sbin(&self) -> PathBuf {
+        self.root.join("sbin")
+    }
+    fn share(&self) -> PathBuf {
+        self.root.join("share")
+    }
+    fn units(&self) -> PathBuf {
+        self.root.join("units")
+    }
+    fn tmp(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+    fn state(&self) -> String {
+        fs::read_to_string(self.root.join("state/update.state")).unwrap_or_default()
+    }
+    fn systemctl_log(&self) -> String {
+        fs::read_to_string(self.root.join("systemctl.log")).unwrap_or_default()
+    }
+    fn read(&self, p: PathBuf) -> String {
+        fs::read_to_string(p).unwrap_or_else(|_| "<missing>".to_string())
+    }
+
+    /// `mayfly update <args>` against `port` (0: no server).
+    fn update(&self, port: u16, args: &[&str]) -> std::process::Output {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_mayfly"));
+        c.arg("update")
+            .args(args)
+            .env("MAYFLY_SHARE", self.share())
+            .env("MAYFLY_CONF_DIR", self.root.join("conf"))
+            .env("MAYFLY_SBIN", self.sbin())
+            .env("MAYFLY_SYSTEMD_DIR", self.units())
+            .env("MAYFLY_STATE_DIR", self.root.join("state"))
+            .env("MAYFLY_TMP", self.tmp())
+            .env("MAYFLY_RELEASE_API", format!("http://127.0.0.1:{port}/api"))
+            .env("MAYFLY_REPO_URL", format!("http://127.0.0.1:{port}/repo"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("NO_COLOR");
+        run_retry(&mut c)
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn text(o: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&o.stdout).to_string(),
+        String::from_utf8_lossy(&o.stderr).to_string(),
+    )
+}
+
+fn no_temp_left(h: &Host) {
+    let left: Vec<_> = fs::read_dir(h.tmp()).unwrap().collect();
+    assert!(left.is_empty(), "temporary files left: {left:?}");
+}
+
+/// The current version with the patch raised by one.
+fn next_patch() -> String {
+    let mut p: Vec<u64> = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .map(|n| n.parse().unwrap())
+        .collect();
+    p[2] += 1;
+    format!("{}.{}.{}", p[0], p[1], p[2])
+}
+
+#[test]
+fn update_says_when_there_is_nothing_newer() {
+    let h = Host::new("up-to-date", 0, "ORG=acme\n");
+    let rel = Release::serve(env!("CARGO_PKG_VERSION"), &fake_mayfly("9", 0), None);
+    let o = h.update(rel.port, &[]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(out.contains("is up to date"), "{out}");
+    assert_eq!(rel.downloads(), 0);
+    assert!(h.state().contains("last_result=up-to-date"));
+    assert!(!h.share().join("previous").exists());
+}
+
+#[test]
+fn update_check_only_reports() {
+    let h = Host::new("check-only", 0, "ORG=acme\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), None);
+    let o = h.update(rel.port, &["--check"]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(out.contains("mayfly 9.9.9 is available"), "{out}");
+    assert_eq!(rel.downloads(), 0);
+    assert_eq!(h.state(), "");
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+}
+
+#[test]
+fn update_installs_the_release_and_keeps_the_old_files() {
+    let h = Host::new("update-ok", 0, "ORG=acme\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), None);
+    let o = h.update(rel.port, &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(out.contains("mayfly 9.9.9 installed"), "{out}");
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("9.9.9", 0));
+    assert_eq!(h.read(h.share().join("mayfly.sh")), "new mayfly.sh\n");
+    assert_eq!(
+        h.read(h.units().join("mayfly-update.timer")),
+        "new update timer\n"
+    );
+    // The old files are in previous/.
+    let prev = h.share().join("previous");
+    assert_eq!(
+        h.read(prev.join("VERSION")),
+        format!("{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(h.read(prev.join("sbin/mayfly")), fake_mayfly("0.0.1", 0));
+    assert_eq!(h.read(prev.join("share/mayfly.sh")), "old mayfly.sh\n");
+    assert_eq!(
+        h.read(prev.join("share/profiles/default/provision.sh")),
+        "old profile\n"
+    );
+    assert_eq!(
+        h.read(prev.join("systemd/mayfly-gc.timer")),
+        "old gc timer\n"
+    );
+    assert!(!prev.join("systemd/mayfly-update.timer").exists());
+    assert!(!prev.join("share/previous").exists());
+    let state = h.state();
+    assert!(
+        state.contains("last_result=ok\n") && !state.contains("skipped"),
+        "{state}"
+    );
+    no_temp_left(&h);
+}
+
+#[test]
+fn a_wrong_checksum_stops_before_anything_changes() {
+    let h = Host::new("bad-sum", 0, "ORG=acme\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), Some(&"0".repeat(64)));
+    let o = h.update(rel.port, &[]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("checksum mismatch for mayfly-9.9.9.tar.gz"),
+        "{err}"
+    );
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    assert_eq!(h.read(h.share().join("mayfly.sh")), "old mayfly.sh\n");
+    assert!(!h.share().join("previous").exists());
+    assert!(!h.units().join("mayfly-update.timer").exists());
+    assert!(h.state().contains("last_result=failed"));
+    no_temp_left(&h);
+}
+
+#[test]
+fn a_new_command_with_the_wrong_version_is_not_installed() {
+    let h = Host::new("bad-version", 0, "ORG=acme\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("1.0.0", 0), None);
+    let o = h.update(rel.port, &[]);
+    let (_, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("prints \"mayfly 1.0.0\", not \"mayfly 9.9.9\""),
+        "{err}"
+    );
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    assert!(!h.share().join("previous").exists());
+    no_temp_left(&h);
+}
+
+#[test]
+fn a_failing_new_check_rolls_back_and_skips_the_version() {
+    let h = Host::new("rollback-check", 0, "ORG=acme\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 1), None);
+    let o = h.update(rel.port, &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(1), "{out}{err}");
+    assert!(err.contains("mayfly 9.9.9 failed mayfly check"), "{err}");
+    assert!(err.contains("rolled back to"), "{err}");
+    assert!(out.contains("check says 1"), "{out}");
+    // Everything is as before; units the old version did not have are gone.
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    assert_eq!(h.read(h.share().join("mayfly.sh")), "old mayfly.sh\n");
+    assert_eq!(
+        h.read(h.share().join("profiles/default/provision.sh")),
+        "old profile\n"
+    );
+    assert_eq!(h.read(h.units().join("mayfly-gc.timer")), "old gc timer\n");
+    assert!(!h.units().join("mayfly-update.timer").exists());
+    assert!(!h.units().join("mayfly-update.service").exists());
+    assert!(h.systemctl_log().contains("daemon-reload"));
+    let state = h.state();
+    assert!(state.contains("last_result=rolled-back\n"), "{state}");
+    assert!(state.contains("skipped=9.9.9\n"), "{state}");
+    no_temp_left(&h);
+    let downloads = rel.downloads();
+    assert_eq!(downloads, 2);
+
+    // The timer and a plain update leave the skipped version alone ...
+    for args in [&["--auto"][..], &[][..]] {
+        let o = h.update(rel.port, args);
+        let (out, _) = text(&o);
+        assert_eq!(o.status.code(), Some(0), "{args:?}");
+        assert!(out.contains("9.9.9 is skipped"), "{out}");
+        assert_eq!(rel.downloads(), downloads);
+    }
+    // ... and --version forces it.
+    let o = h.update(rel.port, &["--version", "9.9.9"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(rel.downloads(), downloads + 2);
+}
+
+#[test]
+fn the_timer_logs_plain_lines_and_skips_a_skipped_version() {
+    let h = Host::new("auto-skip", 0, "ORG=acme\n");
+    write(
+        h.root.join("state/update.state"),
+        "last_attempt=2026-11-10T04:12:09Z\nlast_result=rolled-back\nskipped=9.9.9\n",
+    );
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), None);
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(out.starts_with("update: mayfly 9.9.9 is skipped"), "{out}");
+    assert_eq!(rel.downloads(), 0);
+    // A newer release than the skipped one is tried.
+    let rel = Release::serve("9.9.10", &fake_mayfly("9.9.10", 0), None);
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(out.contains("update: mayfly 9.9.10 installed"), "{out}");
+    assert!(!h.state().contains("skipped"));
+}
+
+#[test]
+fn update_patch_takes_patches_only() {
+    let h = Host::new("patch-only", 0, "ORG=acme\nUPDATE=patch\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), None);
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    let minor: Vec<&str> = env!("CARGO_PKG_VERSION").split('.').take(2).collect();
+    assert!(
+        out.contains(&format!("UPDATE=patch only takes {}.x", minor.join("."))),
+        "{out}"
+    );
+    assert_eq!(rel.downloads(), 0);
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    // By hand UPDATE does not apply.
+    let o = h.update(rel.port, &[]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("9.9.9", 0));
+
+    let h = Host::new("patch-ok", 0, "ORG=acme\nUPDATE=\"patch\"\n");
+    let v = next_patch();
+    let rel = Release::serve(&v, &fake_mayfly(&v, 0), None);
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly(&v, 0));
+}
+
+#[test]
+fn update_off_does_nothing_and_asks_nobody() {
+    let h = Host::new("off", 0, "ORG=acme\nUPDATE=off\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), None);
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(out, "update: UPDATE=off in pool.env, nothing to do\n");
+    assert!(rel.requests().is_empty());
+    assert_eq!(h.state(), "");
+
+    let h = Host::new("bad-mode", 0, "ORG=acme\nUPDATE=sometimes\n");
+    let o = h.update(rel.port, &["--auto"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o)
+        .1
+        .contains("UPDATE=sometimes: use auto, patch or off"));
+}
+
+#[test]
+fn a_failing_check_before_the_update_does_not_roll_back() {
+    let h = Host::new("old-check-fails", 1, "ORG=acme\n");
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 1), None);
+    let o = h.update(rel.port, &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(out.contains("it failed with"), "{out}");
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("9.9.9", 1));
+}
+
+#[test]
+fn rollback_restores_the_saved_files() {
+    let h = Host::new("manual-rollback", 0, "ORG=acme\n");
+    let o = h.update(0, &["--rollback"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).1.contains("no previous version saved"));
+
+    let rel = Release::serve("9.9.9", &fake_mayfly("9.9.9", 0), None);
+    assert_eq!(h.update(rel.port, &[]).status.code(), Some(0));
+    assert_eq!(h.read(h.share().join("mayfly.sh")), "new mayfly.sh\n");
+    let reloads = h.systemctl_log().matches("daemon-reload").count();
+
+    let o = h.update(0, &["--rollback"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.contains(&format!("restored mayfly {}", env!("CARGO_PKG_VERSION"))),
+        "{out}"
+    );
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    assert_eq!(h.read(h.share().join("mayfly.sh")), "old mayfly.sh\n");
+    assert_eq!(
+        h.read(h.share().join("profiles/default/provision.sh")),
+        "old profile\n"
+    );
+    assert_eq!(h.read(h.units().join("mayfly-gc.timer")), "old gc timer\n");
+    assert!(!h.units().join("mayfly-update.timer").exists());
+    assert_eq!(
+        h.systemctl_log().matches("daemon-reload").count(),
+        reloads + 1
+    );
+    assert!(h.state().contains("last_result=rolled-back"));
+}
+
+#[test]
+fn update_refuses_bad_arguments() {
+    let h = Host::new("args", 0, "ORG=acme\n");
+    for args in [
+        vec!["--version", "1.2"],
+        vec!["--rollback", "--check"],
+        vec!["--frobnicate"],
+    ] {
+        let o = h.update(0, &args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}");
+    }
+    // An unreachable release server is a plain error, not a panic.
+    let o = h.update(1, &["--check"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).1.contains("cannot look up the release"));
 }
