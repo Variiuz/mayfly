@@ -1,5 +1,6 @@
 //! `mayfly update`: self-update from the latest GitHub release, with a backup, a health check and a
-//! rollback. The files are put in place by the release's own `install.sh`.
+//! rollback. The files are put in place by the release's own binary (`<release>/mayfly install --from
+//! <release>`); updating always runs the new release's binary, and every release from this one on has `install`.
 
 use crate::config::{env_or, update_mode, Paths};
 use crate::github::now;
@@ -13,7 +14,7 @@ use std::process::{Command, ExitStatus, Output};
 use std::time::Duration;
 
 /// The systemd units Mayfly installs; they are saved and restored with the rest.
-const UNITS: [&str; 5] = [
+pub const UNITS: [&str; 5] = [
     "mayfly-slot@.service",
     "mayfly-gc.service",
     "mayfly-gc.timer",
@@ -787,9 +788,6 @@ fn update(paths: &Paths, o: &Opts, out: &Out, w: &mut dyn Write) -> R<i32> {
             "the new mayfly prints \"{seen}\", not \"mayfly {target}\"; nothing was changed"
         ));
     }
-    if !root.join("install.sh").is_file() {
-        return die(format!("{name} has no install.sh; nothing was changed"));
-    }
 
     // The old command's verdict decides whether a failing new one is the update's fault.
     let old_ok = health(paths).is_some_and(|h| h.0);
@@ -802,11 +800,13 @@ fn update(paths: &Paths, o: &Opts, out: &Out, w: &mut dyn Write) -> R<i32> {
     let _ = w.flush();
     let installed = io_err(
         status(
-            Command::new("bash")
-                .arg(root.join("install.sh"))
+            Command::new(root.join("mayfly"))
+                .arg("install")
+                .arg("--from")
+                .arg(&root)
                 .current_dir(&root),
         ),
-        "running install.sh",
+        "running mayfly install",
     )?;
     if !installed.success() {
         let code = installed
@@ -815,7 +815,7 @@ fn update(paths: &Paths, o: &Opts, out: &Out, w: &mut dyn Write) -> R<i32> {
         restore(paths)?;
         record(paths, "failed", Skip::Keep);
         print_die(&Die(format!(
-            "install.sh of {target} failed (exit {code}); restored mayfly {current}"
+            "mayfly install of {target} failed (exit {code}); restored mayfly {current}"
         )));
         return Ok(1);
     }
