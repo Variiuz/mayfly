@@ -710,7 +710,7 @@ write_pod_snippet() {
 }
 
 cmd_pod() {
-  local n tpl cur token resp jit rname want i misses born ready recycle busy waited ticks=0
+  local n tpl cur token resp jit rname want i misses born ready recycle busy waited ticks=0 unready=0
   n=$(slot_opt containers "$extra" 4)
   [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$ram" ] || die "slot $name: containers=$n must be a number from 1 to ram_gb"
   trap on_term_pod TERM INT
@@ -760,8 +760,11 @@ cmd_pod() {
       if pod_exec ready >/dev/null; then ready=1; break; fi
       nap 20
     done
-    if [ "$ready" = 1 ]; then log "pod $name: ready after $(( ($(date +%s) - born) / 60 )) min"
-    elif [ "$stopping" = 0 ]; then log "pod $name: VM $vmid never got ready (see /var/log/mayfly-pod-image.log inside); replacing it"; fi
+    if [ "$ready" = 1 ]; then log "pod $name: ready after $(( ($(date +%s) - born) / 60 )) min"; unready=0
+    elif [ "$stopping" = 0 ]; then
+      unready=$((unready + 1))
+      log "pod $name: VM $vmid never got ready (see /var/log/mayfly-pod-image.log inside); replacing it"
+    fi
 
     misses=0 recycle=""
     while [ "$ready" = 1 ] && [ "$stopping" = 0 ] && vm_running "$vmid"; do
@@ -816,7 +819,8 @@ cmd_pod() {
     destroy_vm "$vmid"
     log "pod $name: VM $vmid gone after $(( ($(date +%s) - born) / 60 )) min"
     run_hook pod-gone "$name" "$vmid" "$(( ($(date +%s) - born) / 60 ))"
-    [ "$stopping" = 1 ] || { [ "$ready" = 1 ] || nap 120; }
+    # A pod that never gets ready again and again: back off instead of rebuilding its image every half hour.
+    [ "$stopping" = 1 ] || [ "$ready" = 1 ] || nap $(( unready < 2 ? 120 : unready * 120 < 1800 ? unready * 120 : 1800 ))
   done
 }
 
