@@ -183,6 +183,11 @@ ok "no colour when not a terminal" '[ "$TTY" = 0 ] && [ -z "$C_GRN" ]'
 ok "warn: prefixed off a terminal" '[ "$(warn x)" = "warning: x" ]'
 ok "item: label column, counts warnings" 'CHECK_WARN=0; out=$(item warn storage "70% used"; echo "$CHECK_WARN"); [ "$out" = "$(printf "warn storage   70%% used\n1")" ]'
 ok "paint pads plain text" '[ "$(paint busy 6 busy=BLU)|" = "busy  |" ]'
+BUILD_LOCK="$t/build.lock"
+exec 8>>"$BUILD_LOCK"; flock -n 8
+(cmd_template build) >"$t/lock.out" 2>&1; rc=$?
+ok "template build refuses while another build holds the lock" '[ "$rc" = 1 ] && grep -q "another template build is running" "$t/lock.out"'
+exec 8>&-
 ok "help lists the commands" 'cmd_help | grep -q "template build" && cmd_help | grep -q "enable"'
 ok "version" '[[ "$(bash "$here/mayfly" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
 ok "unknown command fails" '! bash "$here/mayfly" nope >/dev/null 2>&1'
