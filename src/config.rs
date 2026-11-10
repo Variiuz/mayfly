@@ -23,6 +23,8 @@ pub struct Paths {
     pub state_dir: String,
     /// Where `mayfly update` makes its temporary directory (`MAYFLY_TMP`).
     pub tmp_dir: String,
+    /// The lock of `template build` (`MAYFLY_BUILD_LOCK`).
+    pub build_lock: String,
 }
 
 pub fn env_or(name: &str, default: &str) -> String {
@@ -48,6 +50,7 @@ impl Paths {
         p.systemd_dir = env_or("MAYFLY_SYSTEMD_DIR", &p.systemd_dir);
         p.state_dir = env_or("MAYFLY_STATE_DIR", &p.state_dir);
         p.tmp_dir = env_or("MAYFLY_TMP", &p.tmp_dir);
+        p.build_lock = env_or("MAYFLY_BUILD_LOCK", &p.build_lock);
         p
     }
 
@@ -64,6 +67,7 @@ impl Paths {
             systemd_dir: "/etc/systemd/system".to_string(),
             state_dir: "/var/lib/mayfly".to_string(),
             tmp_dir: "/var/tmp".to_string(),
+            build_lock: "/run/lock/mayfly-template-build.lock".to_string(),
         }
     }
 }

@@ -3,7 +3,8 @@ use mayfly::config::Paths;
 use mayfly::out::{print_die, Out};
 use mayfly::pve::RealPve;
 use mayfly::{
-    cmd_check, cmd_gc, cmd_help, cmd_install, cmd_slots, cmd_status, cmd_update, forward, Ctx,
+    cmd_check, cmd_gc, cmd_help, cmd_install, cmd_slots, cmd_status, cmd_template, cmd_update,
+    forward, Ctx,
 };
 use std::io::{IsTerminal, Write};
 use std::process::{Command, ExitCode};
@@ -40,7 +41,7 @@ fn main() -> ExitCode {
             cmd_install::run(&paths, &args[1..], tty, &mut stdout)
         }
         Some("update") => cmd_update::run(&paths, &args[1..], &out, &mut stdout),
-        Some(cmd @ ("status" | "check" | "gc" | "enable" | "disable")) => {
+        Some(cmd @ ("status" | "check" | "gc" | "enable" | "disable" | "template")) => {
             let node = node();
             let cx = Ctx {
                 paths: &paths,
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
                 "status" => cmd_status::run(&cx, &out, &mut stdout),
                 "check" => cmd_check::run(&cx, &out, &mut stdout),
                 "gc" => cmd_gc::run(&cx, &out, &mut stdout),
+                "template" => cmd_template::run(&cx, &args[1..], &out, &mut stdout),
                 "enable" => cmd_slots::run(&cx, Verb::Enable, &args[1..], &out, &mut stdout),
                 _ => cmd_slots::run(&cx, Verb::Disable, &args[1..], &out, &mut stdout),
             }

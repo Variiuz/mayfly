@@ -5,8 +5,8 @@ clone of a template, which is destroyed when the job ends. Short jobs can instea
 long-lived VM that runs one throwaway container per job.
 
 Mayfly is a static binary, a Bash script and a set of systemd units on the Proxmox host. The binary
-(Rust) runs `version`, `help`, `status`, `check`, `update`, `gc`, `enable` and `disable` and hands `slot`
-and `template` to the script. It requires a GitHub App, a thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
+(Rust) runs `version`, `help`, `status`, `check`, `update`, `gc`, `enable`, `disable` and `template` and
+hands `slot` to the script. It requires a GitHub App, a thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
 
 ## Install
 
@@ -78,8 +78,8 @@ again; configuration, slots and running jobs are kept.
 
 | File | Installed to | Purpose |
 | --- | --- | --- |
-| `mayfly` | `/usr/local/sbin` | the command: `version`, `help`, `status`, `check`, `update`, `gc`, `enable`, `disable`; runs `mayfly.sh` for `slot` and `template` |
-| `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC) and templates; also still has its own `gc`, `enable` and `disable` |
+| `mayfly` | `/usr/local/sbin` | the command: `version`, `help`, `status`, `check`, `update`, `gc`, `enable`, `disable`, `template`; runs `mayfly.sh` for `slot` |
+| `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC); also still has its own `gc`, `enable`, `disable` and `template` |
 | `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf` |
 | `mayfly-gc.{service,timer}` | systemd | every 15 min: removes stale runner registrations, orphan guests, old snippets |
 | `mayfly-update.{service,timer}` | systemd | daily: `mayfly update --auto` (see Updates) |

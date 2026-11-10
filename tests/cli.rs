@@ -876,13 +876,7 @@ fn other_commands_are_forwarded_with_args_env_and_exit_code() {
         &share,
         "#!/bin/sh\necho \"args=$#:$*\"\necho \"env=$MAYFLY_TEST_VAR\"\necho oops >&2\nexit 7\n",
     );
-    for args in [
-        vec!["slot", "build-1"],
-        vec!["template", "list"],
-        vec!["template", "build", "--lxc", "my profile"],
-        vec!["frobnicate", "--now"],
-        vec![],
-    ] {
+    for args in [vec!["slot", "build-1"], vec!["frobnicate", "--now"], vec![]] {
         let out = run_retry(mayfly(&share).args(&args).env("MAYFLY_TEST_VAR", "kept"));
         assert_eq!(out.status.code(), Some(7), "{args:?}");
         assert_eq!(
@@ -897,7 +891,7 @@ fn other_commands_are_forwarded_with_args_env_and_exit_code() {
 #[test]
 fn a_missing_script_is_a_clear_error() {
     let share = tmp("missing");
-    let out = mayfly(&share).args(["template", "list"]).output().unwrap();
+    let out = mayfly(&share).args(["slot", "a-1"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(

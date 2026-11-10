@@ -6,6 +6,9 @@
 # install: the bash install.sh of 0.4.1 (tests/fixtures/install-0.4.1.sh) and `mayfly install` run against
 # the same stub root; stdout, stderr, the exit code, the stub calls and the tree they leave (paths, modes,
 # link targets, checksums) are compared.
+# template list, canary, promote and build are compared like gc (a VM build to the end, with a stub qm that
+# answers the guest agent and a stand-in qemu process; MAYFLY_TEST_NAP=0 and MAYFLY_QEMU_RUN_DIR keep it
+# fast and local).
 # Usage: bash tests/parity.sh [path to the mayfly binary]   (default target/release/mayfly)
 set -uo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -13,7 +16,16 @@ bin=${1:-$here/target/release/mayfly}
 [ -x "$bin" ] || { echo "no binary at $bin (cargo build --release)" >&2; exit 2; }
 t=$(mktemp -d)
 srv="" srv2=""
+# The stand-in qemu processes of the template build (pid files under $t/g/qemu).
+kill_qemu() {
+  local f
+  for f in "$t"/g/qemu/*.pid; do
+    [ -e "$f" ] || continue
+    kill "$(cat "$f")" 2>/dev/null || true
+  done
+}
 cleanup() {
+  kill_qemu
   [ -z "$srv" ] || kill "$srv" 2>/dev/null
   [ -z "$srv2" ] || kill "$srv2" 2>/dev/null
   rm -rf "$t"
@@ -214,6 +226,31 @@ echo "qm $*" >>"$CALLS"
 case "$1" in
   config) cat "$MAYFLY_PVE_ETC/qemu-server/$2.conf" 2>/dev/null || exit 2 ;;
   destroy) if [ "$2" = "${FAIL_DESTROY:-}" ]; then echo "destroy failed" >&2; exit 5; fi ;;
+  create)
+    : >"$MAYFLY_PVE_ETC/qemu-server/$2.conf"
+    cp "$GSNIP/mayfly-$2.yaml" "$CAP/" 2>/dev/null ;;
+  start)
+    # A stand-in for the qemu process: vm_running looks for a live pid whose command line has "-id <vmid> ".
+    if [ -z "${NO_START_PROC:-}" ]; then
+      python3 -c 'import time; time.sleep(300)' -id "$2" x </dev/null >/dev/null 2>&1 &
+      echo $! >"$MAYFLY_QEMU_RUN_DIR/$2.pid"
+      # Until python has exec'd, the command line is still this script's.
+      for _ in $(seq 100); do
+        tr '\0' ' ' <"/proc/$!/cmdline" 2>/dev/null | grep -q -- "-id $2 " && break
+        sleep 0.05
+      done
+    fi ;;
+  shutdown)
+    kill "$(cat "$MAYFLY_QEMU_RUN_DIR/$2.pid")" 2>/dev/null
+    rm -f "$MAYFLY_QEMU_RUN_DIR/$2.pid" ;;
+  template) echo "template: 1" >>"$MAYFLY_PVE_ETC/qemu-server/$2.conf" ;;
+  guest)
+    case "$*" in
+      *"-- test -e "*".done") if [ -n "${FAIL_PROVISION:-}" ]; then echo '{"exitcode":1}'; else echo '{"exitcode":0}'; fi ;;
+      *"-- test -e "*".failed") if [ -n "${FAIL_PROVISION:-}" ]; then echo '{"exitcode":0}'; else echo '{"exitcode":1}'; fi ;;
+      *"-- tail "*) printf '{"exitcode":0,"out-data":"boom\\n"}\n' ;;
+      *) echo '{"exitcode":0}' ;;
+    esac ;;
 esac
 exit 0
 STUB
@@ -229,6 +266,33 @@ cat >"$g/bin/lxc-info" <<'STUB'
 #!/bin/sh
 echo "lxc-info $*" >>"$CALLS"
 if [ "$2" = 9051 ]; then echo RUNNING; else echo STOPPED; fi
+STUB
+cat >"$g/bin/pvesh" <<'STUB'
+#!/bin/sh
+echo "pvesh $*" >>"$CALLS"
+case "$2" in
+  /storage/*) echo '{"type":"lvmthin"}' ;;
+  *) exec "$TBIN/pvesh" "$@" ;;
+esac
+STUB
+cat >"$g/bin/curl" <<'STUB'
+#!/bin/sh
+echo "curl $*" >>"$CALLS"
+out="" prev="" url=""
+for a in "$@"; do
+  [ "$prev" = -o ] && out=$a
+  prev=$a
+  url=$a
+done
+case "$url" in
+  */SHA256SUMS) cat "$IMGSUMS" ;;
+  *) [ -z "$out" ] || printf IMAGE >"$out" ;;
+esac
+exit 0
+STUB
+cat >"$g/bin/systemd-run" <<'STUB'
+#!/bin/sh
+echo "systemd-run $*" >>"$CALLS"
 STUB
 cat >"$g/bin/pvesm" <<'STUB'
 #!/bin/sh
@@ -320,7 +384,7 @@ srv2=$!
 for _ in $(seq 50); do [ -s "$t/gport" ] && break; sleep 0.1; done
 [ -s "$t/gport" ] || { echo "the fake GitHub for gc did not start" >&2; exit 2; }
 
-cat >"$g/conf/pool.env" <<ENV
+cat >"$g/pool.env.orig" <<ENV
 APP_ID=12345
 ORG=acme
 KEY_PATH=$t/app.pem
@@ -345,6 +409,11 @@ state_reset() {
   rm -rf "$g/pve" "$g/fw" "$g/snip"
   mkdir -p "$g/pve/qemu-server" "$g/pve/lxc" "$g/fw" "$g/snip"
   cp "$g/slots.conf" "$g/conf/slots.conf"
+  cp "$g/pool.env.orig" "$g/conf/pool.env"
+  kill_qemu
+  rm -rf "$g/cap" "$g/qemu" "$g/build.lock" "$t/state/images"
+  mkdir -p "$g/cap" "$g/qemu"
+  printf '%s  disk.img\n' "$(printf IMAGE | sha256sum | cut -d' ' -f1)" >"$g/sums"
   guest qemu-server 9002 'name: ci-a\ntags: mayfly\ndescription: runner mf-a-1-111, template 9098\n'
   guest qemu-server 9003 'name: ci-orphan\ntags: mayfly\n'
   guest qemu-server 9004 'name: ci-b\ntags: mayfly\ndescription: runner mf-b-1-5\n'
@@ -372,6 +441,17 @@ state_reset() {
   : >"$g/gh.log"
 }
 
+# The unit a detached build starts runs this program: bash runs `bash mayfly.sh`, Rust runs itself.
+binreal=$(readlink -f "$bin")
+norm() {
+  local l
+  while IFS= read -r l; do
+    l=${l//" bash $here/mayfly.sh "/" SELF "}
+    l=${l//" $binreal "/" SELF "}
+    printf '%s\n' "$l"
+  done
+}
+
 # snap_run <prefix> <command ...>: resets the host, runs the command and saves its output, its exit code
 # and the state it left: the calls the stubs recorded (the parallel `systemctl stop`s sorted), the
 # requests the GitHub saw and the files that are left.
@@ -380,19 +460,30 @@ snap_run() {
   shift
   state_reset
   [ -z "${PRE:-}" ] || "$PRE"
-  env "PATH=$g/bin:$PATH" "CALLS=$g/calls" "ACTIVE=$g/active" "GSNIP=$g/snip" \
+  env -u INVOCATION_ID "PATH=$g/bin:$PATH" "CALLS=$g/calls" "ACTIVE=$g/active" "GSNIP=$g/snip" \
+    "CAP=$g/cap" "IMGSUMS=$g/sums" "TBIN=$t/bin" "MAYFLY_TEST_NAP=0" "MAYFLY_QEMU_RUN_DIR=$g/qemu" \
+    "MAYFLY_BUILD_LOCK=$g/build.lock" \
     "MAYFLY_CONF_DIR=$g/conf" "MAYFLY_PVE_ETC=$g/pve" "MAYFLY_PVE_FW_DIR=$g/fw" \
     "$@" >"$p.out" 2>"$p.err" </dev/null
   echo "$?" >"$p.rc"
   {
     echo "--- calls"
-    grep -v '^systemctl stop ' "$g/calls"
+    grep -v '^systemctl stop ' "$g/calls" | norm
     echo "--- parallel stops, sorted"
     grep '^systemctl stop ' "$g/calls" | sort
     echo "--- github"
     cat "$g/gh.log"
     echo "--- files"
     (cd "$g" && ls fw snip)
+    echo "--- pool.env"
+    cat "$g/conf/pool.env"
+    echo "--- firewall and snippets"
+    local f
+    for f in "$g"/fw/* "$g"/cap/*; do
+      [ -s "$f" ] || continue
+      echo "== ${f#"$g"/}"
+      cat "$f"
+    done
   } >"$p.state"
 }
 
@@ -429,6 +520,49 @@ PRE=pre_no_slots same_state "enable without slots" enable
 PRE=pre_no_slots same_state "disable without slots" disable
 PRE=pre_no_slots same_state "enable a slot that is not there" enable a-1
 
+# ---- template list, canary, promote and build
+printf 'P\n' >"$t/share/provision.sh"
+printf 'J\n' >"$t/share/ci-job.sh"
+printf 'S\n' >"$t/share/mayfly-job.service"
+printf 'E\n' >"$t/share/template.env"
+printf 'echo profile\n' >"$t/share/profiles/default/provision.sh"
+pre_tpl() {
+  printf 'IMAGE_URL=http://img.test/x/disk.img\nTEMPLATE_VMIDS="9094 9095 9096 9054"\nTEMPLATE_VMID=9094\n# keep me\nNEXT_TEMPLATE_VMID=9096\nLXC_TEMPLATE_VMID=9054\n' >>"$g/conf/pool.env"
+  guest qemu-server 9094 'name: ci-template-old\ntags: mayfly\ndescription: profile default\ntemplate: 1\n'
+  guest qemu-server 9096 'name: ci-template-poly\ntags: mayfly\ntemplate: 1\n'
+  guest lxc 9054 'hostname: ci-ct-template\ntags: mayfly\ntemplate: 1\n'
+}
+pre_badsums() { pre_tpl; echo "0000000000000000000000000000000000000000000000000000000000000000  disk.img" >"$g/sums"; }
+pre_held() {
+  pre_tpl
+  exec 8>>"$g/build.lock"
+  flock -n 8
+}
+
+PRE=pre_tpl same_state "template list" template list
+PRE=pre_tpl same_state "template canary, a mayfly template" template canary 9094
+PRE=pre_tpl same_state "template canary, a polara-ci template" template canary 9096
+PRE=pre_tpl same_state "template canary, a container template" template canary 9054
+PRE=pre_tpl same_state "template promote, a mayfly template" template promote 9094
+PRE=pre_tpl same_state "template promote, a polara-ci template" template promote 9096
+PRE=pre_tpl same_state "template promote, a container template" template promote 9054
+PRE=pre_tpl same_state "template canary, not a template" template canary 9002
+PRE=pre_tpl same_state "template canary, no vmid" template canary
+PRE=pre_tpl same_state "template promote, unknown vmid" template promote 9095
+PRE=pre_tpl same_state "template, no subcommand" template
+PRE=pre_tpl same_state "template build, bad option" template build --bogus
+PRE=pre_tpl same_state "template build, unknown profile" template build nope --foreground
+PRE=pre_tpl same_state "template build, VM, to the end" template build --foreground
+PRE=pre_tpl same_state "template build, VM, named profile" template build default --foreground
+PRE=pre_tpl FAIL_PROVISION=1 same_state "template build, VM, provisioning fails" template build --foreground
+PRE=pre_tpl NO_START_PROC=1 same_state "template build, VM stops early" template build --foreground
+PRE=pre_badsums same_state "template build, bad checksum" template build --foreground
+PRE=pre_tpl same_state "template build, detached" template build default
+PRE=pre_held same_state "template build, lock held" template build --foreground
+exec 8>&-
+PRE=pre_held same_state "template build, lock held, detached" template build
+exec 8>&-
+PRE=pre_no_slots same_state "template list without slots" template list
 # ---- install: the bash install.sh of 0.4.1 against `mayfly install`
 # One release directory holds this checkout's files, the binary and the old install.sh (made to read
 # MAYFLY_CONF_DIR like the binary does; the 0.4.1 script has /etc/mayfly built in). Stubs for id, qm,
