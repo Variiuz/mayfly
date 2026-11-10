@@ -2335,7 +2335,7 @@ fn a_refused_jit_config_in_a_pod_waits_a_minute() {
     // The first refusal ends the pass: one try, no `put`.
     assert_eq!(
         gh.calls(),
-        lines!["token", format!("jit tok mf-a-1-1-1700000000 linux")]
+        lines!["token", "jit tok mf-a-1-1-1700000000 linux".to_string()]
     );
 }
 
