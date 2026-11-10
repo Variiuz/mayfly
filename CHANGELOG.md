@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/Variiuz/mayfly/compare/v0.8.0...v0.8.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* drain trap only flags the stop, the loop does the rest ([#35](https://github.com/Variiuz/mayfly/issues/35)) ([eac6ead](https://github.com/Variiuz/mayfly/commit/eac6eadf6220bf588d475e8e72a90f3f87c2e449))
+
 ## [0.8.0](https://github.com/Variiuz/mayfly/compare/v0.7.0...v0.8.0) (2026-11-10)
 
 
