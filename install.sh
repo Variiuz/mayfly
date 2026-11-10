@@ -51,7 +51,8 @@ first=no
 [ -e /usr/local/sbin/mayfly ] || first=yes
 [ "$timer" = no ] || [ "$first" = no ] || timer=yes
 
-old=$( [ "$first" = no ] && /usr/local/sbin/mayfly version 2>/dev/null | awk '{print $2}' || true)
+# Builds without a version command print their help instead; only take a real "mayfly <version>" line.
+old=$( [ "$first" = no ] && /usr/local/sbin/mayfly version 2>/dev/null | awk 'NR == 1 && /^mayfly [0-9]/ { print $2 }' || true)
 new=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' "$src/mayfly")
 step "installing Mayfly $new${old:+ (was $old)}"
 
