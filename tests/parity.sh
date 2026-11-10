@@ -277,13 +277,18 @@ esac
 STUB
 cat >"$g/bin/curl" <<'STUB'
 #!/bin/sh
-echo "curl $*" >>"$CALLS"
+# Only the image host of the template build is faked; every other URL (bash's GitHub calls) goes to the real curl.
 out="" prev="" url=""
 for a in "$@"; do
   [ "$prev" = -o ] && out=$a
   prev=$a
   url=$a
 done
+case "$url" in
+  http://img.test/*) ;;
+  *) PATH=${PATH#*:}; exec curl "$@" ;;
+esac
+echo "curl $*" >>"$CALLS"
 case "$url" in
   */SHA256SUMS) cat "$IMGSUMS" ;;
   *) [ -z "$out" ] || printf IMAGE >"$out" ;;
