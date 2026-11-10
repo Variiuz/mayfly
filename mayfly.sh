@@ -21,7 +21,7 @@
 # VMID inside VMID_MIN..VMID_MAX. It never stops, changes or destroys a VM that misses any of the three.
 set -euo pipefail
 
-MAYFLY_VERSION=0.3.0 # x-release-please-version
+MAYFLY_VERSION=0.4.0 # x-release-please-version
 CONF_DIR=${MAYFLY_CONF_DIR:-/etc/mayfly}
 BUILD_LOCK=${MAYFLY_BUILD_LOCK:-/run/lock/mayfly-template-build.lock}
 BUILD_UNIT=mayfly-template-build
