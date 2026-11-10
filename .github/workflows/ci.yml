@@ -62,3 +62,10 @@ jobs:
           grep -q " mayfly-$v-x86_64-linux$" "$RUNNER_TEMP/dist/SHA256SUMS"
           (cd "$RUNNER_TEMP/dist" && sha256sum -c SHA256SUMS)
           [ "$("$RUNNER_TEMP/dist/mayfly-$v-x86_64-linux" version)" = "mayfly $v" ]
+      # The previous release, and 0.4.1 (the first with mayfly update), update themselves to this build.
+      - name: update from older releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash tests/update.sh "$RUNNER_TEMP/dist" </dev/null
+          bash tests/update.sh "$RUNNER_TEMP/dist" 0.4.1 </dev/null
