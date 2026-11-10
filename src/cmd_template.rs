@@ -485,7 +485,7 @@ impl Run<'_> {
                 }
             }
             // The step goes to stderr (the function's stdout is the VMID). A destroy that fails is not
-            // fatal here (bash runs this in a command substitution, where `set -e` is off).
+            // fatal (the new template is already built), but it is reported with the command to retry.
             self.out
                 .step(self.ew, &format!("removing old template {id}"));
             let pve = self.cx.pve;
@@ -497,10 +497,19 @@ impl Run<'_> {
                 "--destroy-unreferenced-disks",
                 "1",
             ];
-            if self.kind(id) == Some(GuestKind::Ct) {
-                pve.run_stderr("pct", &destroy);
+            let tool = if self.kind(id) == Some(GuestKind::Ct) {
+                "pct"
             } else {
-                pve.run_stderr("qm", &destroy);
+                "qm"
+            };
+            let code = pve.run_stderr(tool, &destroy);
+            if code != 0 {
+                self.out.warn(
+                    self.ew,
+                    &format!(
+                        "could not remove old template {id} (exit {code}); remove it by hand: {tool} destroy {id} --purge 1 --destroy-unreferenced-disks 1"
+                    ),
+                );
             }
         }
         Ok(id.to_string())
@@ -931,9 +940,6 @@ impl Run<'_> {
             self.out
                 .warn(self.w, "pveam update failed; using the cached image index");
         }
-        // file=$(pveam available --section system | awk '{print $2}' | grep "^$LXC_OSTEMPLATE" | sort -V | tail -n1)
-        // Under `set -euo pipefail` a failing pipeline ends the script right there, so an empty answer
-        // exits 1 without the "no container image" message below it ever being reached.
         let avail = pve.run_keep_err("pveam", &["available", "--section", "system"]);
         let ostemplate = c.get("LXC_OSTEMPLATE");
         let mut files: Vec<&str> = avail
@@ -944,10 +950,20 @@ impl Run<'_> {
             .collect();
         files.sort_by(|a, b| version_cmp(a, b));
         let Some(file) = files.last().copied() else {
-            return Err(Stop::Code(1));
+            let why = if avail.code != 0 {
+                format!(
+                    "pveam available failed (exit {}); no container image matching {ostemplate} (pveam update, or check LXC_OSTEMPLATE)",
+                    avail.code
+                )
+            } else {
+                format!(
+                    "no container image matching {ostemplate} in pveam available (pveam update, or check LXC_OSTEMPLATE)"
+                )
+            };
+            return tdie(why);
         };
         if avail.code != 0 {
-            return Err(Stop::Code(avail.code));
+            return tdie(format!("pveam available failed (exit {})", avail.code));
         }
         let storage = c.get("LXC_TEMPLATE_STORAGE");
         let listed = pve.run("pveam", &["list", storage]);

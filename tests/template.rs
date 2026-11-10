@@ -965,6 +965,23 @@ fn a_template_with_clones_is_never_replaced() {
 }
 
 #[test]
+fn a_failed_old_template_removal_warns_and_the_build_goes_on() {
+    let h = Host::new("");
+    h.conf("qemu-server", "9097");
+    let tpl = "name: ci-template-old\ntags: mayfly\ntemplate: 1\n";
+    let pve = h.vm_host("9097").answer("qm config 9097", tpl).fail(
+        "qm destroy 9097 --purge 1 --destroy-unreferenced-disks 1",
+        5,
+    );
+    let res = h.run(&pve, &["build"]);
+    assert_eq!(
+        res.err,
+        "removing old template 9097\nwarning: could not remove old template 9097 (exit 5); remove it by hand: qm destroy 9097 --purge 1 --destroy-unreferenced-disks 1\n"
+    );
+    assert!(pve.calls().iter().any(|c| c.starts_with("qm create 9097 ")));
+}
+
+#[test]
 fn an_old_template_is_destroyed_before_the_build() {
     let h = Host::new("");
     h.conf("qemu-server", "9097");
@@ -1225,19 +1242,30 @@ fn the_newest_container_image_is_chosen_by_version() {
 }
 
 #[test]
-fn no_matching_container_image_ends_the_build_with_exit_1() {
-    // bash: the `file=$(... | grep ...)` pipeline fails under `set -eo pipefail` before the "no container
-    // image" die is reached, so the build exits 1 without a message.
+fn no_matching_container_image_dies_with_a_message() {
     let h = Host::new("LXC_OSTEMPLATE=nixos\n");
     let pve = h.ct_host("9097", "");
     let res = h.run(&pve, &["build", "--lxc"]);
-    assert_eq!(res.r, Ok(1));
-    assert_eq!(res.out, "");
-    assert_eq!(res.err, "");
+    assert_eq!(
+        res.r,
+        Err("no container image matching nixos in pveam available (pveam update, or check LXC_OSTEMPLATE)".to_string())
+    );
     assert_eq!(
         pve.calls(),
         ["pveam update", "pveam available --section system"]
     );
+}
+
+#[test]
+fn a_failed_pveam_available_names_the_exit_code() {
+    let h = Host::new("");
+    let pve = h
+        .ct_host("9097", "")
+        .fail("pveam available --section system", 3);
+    let res = h.run(&pve, &["build", "--lxc"]);
+    let err = res.r.unwrap_err();
+    assert!(err.starts_with("pveam available failed (exit 3)"), "{err}");
+    assert!(!pve.calls().iter().any(|c| c.starts_with("pveam download")));
 }
 
 #[test]
