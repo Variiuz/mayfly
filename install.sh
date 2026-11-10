@@ -9,6 +9,10 @@
 # /etc/mayfly/{pool.env,slots.conf} only when missing. Starts no slot and touches no VM.
 # The gc timer is switched on by the first install only; later installs keep it as it is.
 # --no-timer leaves it off (while another tool still runs slots in the same VMID range).
+# The update timer (mayfly update --auto) is switched on the first time its units are installed, unless
+# pool.env says UPDATE=off; later installs keep it as it is.
+# MAYFLY_SBIN, MAYFLY_SHARE and MAYFLY_SYSTEMD_DIR move the command, the share directory and the units
+# (tests, and mayfly update, which passes its own through).
 set -euo pipefail
 
 VERSION=main # set to the release version when the release is built
@@ -48,13 +52,17 @@ fi
 timer=keep
 [ "${1:-}" != --no-timer ] || timer=no
 conf=/etc/mayfly
-share=/usr/local/share/mayfly
+share=${MAYFLY_SHARE:-/usr/local/share/mayfly}
+sbin=${MAYFLY_SBIN:-/usr/local/sbin}
+units=${MAYFLY_SYSTEMD_DIR:-/etc/systemd/system}
 first=no
-[ -e /usr/local/sbin/mayfly ] || first=yes
+[ -e "$sbin/mayfly" ] || first=yes
 [ "$timer" = no ] || [ "$first" = no ] || timer=yes
+uptimer=keep
+[ -e "$units/mayfly-update.timer" ] || uptimer=yes
 
 # Builds without a version command print their help instead; only take a real "mayfly <version>" line.
-old=$( [ "$first" = no ] && /usr/local/sbin/mayfly version 2>/dev/null | awk 'NR == 1 && /^mayfly [0-9]/ { print $2 }' || true)
+old=$( [ "$first" = no ] && "$sbin/mayfly" version 2>/dev/null | awk 'NR == 1 && /^mayfly [0-9]/ { print $2 }' || true)
 bin=$src/mayfly
 if [ ! -f "$bin" ]; then
   # A checkout has no binary yet.
@@ -85,7 +93,8 @@ step "installing Mayfly $new${old:+ (was $old)}"
 apt-get install -y -q jq curl openssl >/dev/null
 install -d -m 0700 "$conf" "$conf/env"
 install -d -m 0755 "$conf/hooks.d" "$conf/profiles"
-install -m 0755 "$bin" /usr/local/sbin/mayfly
+install -d "$sbin"
+install -m 0755 "$bin" "$sbin/mayfly"
 install -d "$share"
 install -m 0755 "$src/mayfly.sh" "$share/mayfly.sh"
 install -m 0644 "$src"/template/{provision.sh,ci-job.sh,pod-vm.sh,mayfly-job.service,template.env} "$share/"
@@ -93,7 +102,9 @@ install -m 0644 "$src"/template/{provision.sh,ci-job.sh,pod-vm.sh,mayfly-job.ser
 rm -rf "$share/profiles"
 cp -r "$src/profiles" "$share/profiles"
 chmod -R u=rwX,go=rX "$share/profiles"
-install -m 0644 "$src"/mayfly-slot@.service "$src"/mayfly-gc.service "$src"/mayfly-gc.timer /etc/systemd/system/
+install -d "$units"
+install -m 0644 "$src"/mayfly-slot@.service "$src"/mayfly-gc.service "$src"/mayfly-gc.timer \
+  "$src"/mayfly-update.service "$src"/mayfly-update.timer "$units/"
 created=()
 [ -e "$conf/pool.env" ] || { install -m 0600 "$src/pool.env.example" "$conf/pool.env"; created+=(pool.env); }
 [ -e "$conf/slots.conf" ] || { install -m 0644 "$src/slots.conf.example" "$conf/slots.conf"; created+=(slots.conf); }
@@ -108,7 +119,11 @@ case ",$content," in
   *) pvesm set "$SNIPPET_STORAGE" --content "$content,snippets"; done_ "storage $SNIPPET_STORAGE now holds snippets" ;;
 esac
 
+UPDATE=$(sed -n 's/^UPDATE=//p' "$conf/pool.env" | tail -n1 | tr -d "\"'" | awk '{ print $1 }')
+[ "$UPDATE" != off ] || uptimer=keep
+
 systemctl daemon-reload
+[ "$uptimer" != yes ] || systemctl enable -q --now mayfly-update.timer
 case "$timer" in
   yes) systemctl enable -q --now mayfly-gc.timer ;;
   no) systemctl disable -q --now mayfly-gc.timer 2>/dev/null || true ;;

@@ -1,5 +1,6 @@
 //! `mayfly status`: slots, guests, jobs, pool fill, free RAM and templates.
 
+use crate::cmd_update::status_text;
 use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{self, GitHub, Runner};
 use crate::out::{Colour, Out, R};
@@ -227,5 +228,7 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
     if !lxc.is_empty() || !lxc_next.is_empty() {
         let _ = writeln!(w, "{d}{:<10}{z} {}{}", "lxc", or_none(lxc), next(lxc_next));
     }
+    // Only the Rust status has this line; bash status does not (tests/parity.sh ignores it).
+    let _ = writeln!(w, "{d}{:<10}{z} {}", "update", status_text(cx.paths));
     Ok(0)
 }

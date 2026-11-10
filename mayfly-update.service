@@ -1,0 +1,6 @@
+[Unit]
+Description=mayfly: update to the latest release (UPDATE in pool.env)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mayfly update --auto

@@ -78,10 +78,11 @@ again; configuration, slots and running jobs are kept.
 
 | File | Installed to | Purpose |
 | --- | --- | --- |
-| `mayfly` | `/usr/local/sbin` | the command: `version`, `help`, `status`, `check`; runs `mayfly.sh` for the rest |
+| `mayfly` | `/usr/local/sbin` | the command: `version`, `help`, `status`, `check`, `update`; runs `mayfly.sh` for the rest |
 | `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC), gc, templates, enable/disable |
 | `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf` |
 | `mayfly-gc.{service,timer}` | systemd | every 15 min: removes stale runner registrations, orphan guests, old snippets |
+| `mayfly-update.{service,timer}` | systemd | daily: `mayfly update --auto` (see Updates) |
 | `pool.env.example`, `slots.conf.example` | `/etc/mayfly/` | host settings and slots, with all options documented |
 | `template/` | template guest | core provisioning (runner, Docker, gh), single-job service, pod script |
 | `profiles/<name>/` | template guest | additional toolchains, libraries and images |
@@ -233,6 +234,34 @@ latency breaks file-lock and timing tests, even with `DISK_CACHE=unsafe`.
 - Runners register with the base labels plus the slot's labels and are removed after their job.
 - `ACTIONS_RUNNER_INPUT_JITCONFIG` is not present in a job's environment.
 - `mayfly status` and thin pool usage stay stable over a day of jobs.
+
+## Updates
+
+`mayfly update` installs the latest release: it downloads `mayfly-<version>.tar.gz` and `SHA256SUMS`
+from the GitHub release (no token), checks the checksum, runs the new `mayfly version`, saves the
+installed files in `/usr/local/share/mayfly/previous/` and runs the release's `install.sh`. Running slots
+are not restarted; they use the new command from their next job. Then it runs the new `mayfly check`: if
+the old one passed and the new one fails, everything is restored, the version is skipped and the exit code is 1.
+
+```
+mayfly update                    # latest release
+mayfly update --check            # only say whether a newer release exists
+mayfly update --version 0.3.1    # that release (also an older one, or one that was skipped)
+mayfly update --rollback         # restore previous/ (the version before the last update)
+```
+
+`mayfly-update.timer` runs `mayfly update --auto` daily, up to an hour late. The first install that has
+the timer switches it on. `UPDATE` in `pool.env` sets what `--auto` does: `auto` (default) takes any newer
+release, `patch` only a newer patch of the installed `major.minor`, `off` nothing (also keeps the timer
+from being switched on). `mayfly update` by hand ignores `UPDATE`. `journalctl -u mayfly-update` has the log.
+
+`/var/lib/mayfly/update.state` holds `last_attempt`, `last_result` (`ok`, `up-to-date`, `rolled-back`,
+`failed`) and `skipped=<version>`. A skipped version is not installed again by the timer or by a plain
+`mayfly update`; `mayfly update --version <version>` forces it. `mayfly update --rollback` skips the
+version it removed. `mayfly status` ends with the installed version and the last attempt.
+
+Tests and other installs can move the paths: `MAYFLY_SBIN`, `MAYFLY_SHARE`, `MAYFLY_SYSTEMD_DIR`,
+`MAYFLY_STATE_DIR`, `MAYFLY_TMP` (default `/var/tmp`), `MAYFLY_RELEASE_API` and `MAYFLY_REPO_URL`.
 
 ## Releases
 

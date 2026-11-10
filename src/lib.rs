@@ -1,11 +1,12 @@
 //! Mayfly: throwaway GitHub Actions runners on Proxmox VE.
 //!
-//! This crate owns `version`, `help`, `status` and `check`. Every other command is forwarded to
+//! This crate owns `version`, `help`, `status`, `check` and `update`. Every other command is forwarded to
 //! `mayfly.sh` (see `forward`).
 
 pub mod cmd_check;
 pub mod cmd_help;
 pub mod cmd_status;
+pub mod cmd_update;
 pub mod config;
 pub mod forward;
 pub mod github;

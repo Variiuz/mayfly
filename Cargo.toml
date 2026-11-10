@@ -8,8 +8,11 @@ repository = "https://github.com/Variiuz/mayfly"
 publish = false
 
 [dependencies]
+flate2 = "1"
 jsonwebtoken = "9"
 serde_json = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [profile.release]

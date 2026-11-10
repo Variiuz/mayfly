@@ -1,7 +1,7 @@
 use mayfly::config::Paths;
 use mayfly::out::{print_die, Out};
 use mayfly::pve::RealPve;
-use mayfly::{cmd_check, cmd_help, cmd_status, forward, Ctx};
+use mayfly::{cmd_check, cmd_help, cmd_status, cmd_update, forward, Ctx};
 use std::io::Write;
 use std::process::{Command, ExitCode};
 
@@ -30,6 +30,7 @@ fn main() -> ExitCode {
             cmd_help::help(&paths, &out, &mut stdout);
             Ok(0)
         }
+        Some("update") => cmd_update::run(&paths, &args[1..], &out, &mut stdout),
         Some(cmd @ ("status" | "check")) => {
             let node = node();
             let cx = Ctx {
