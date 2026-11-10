@@ -20,8 +20,9 @@
 # VMID inside VMID_MIN..VMID_MAX. It never stops, changes or destroys a VM that misses any of the three.
 set -euo pipefail
 
-MAYFLY_VERSION=0.1.0 # x-release-please-version
+MAYFLY_VERSION=0.1.2 # x-release-please-version
 CONF_DIR=${MAYFLY_CONF_DIR:-/etc/mayfly}
+BUILD_LOCK=${MAYFLY_BUILD_LOCK:-/run/lock/mayfly-template-build.lock}
 POOL_ENV=$CONF_DIR/pool.env
 SLOTS_CONF=$CONF_DIR/slots.conf
 ENV_DIR=$CONF_DIR/env
@@ -232,6 +233,13 @@ guest_config() {
   esac
 }
 
+# Name of the job files in a VM template: mayfly (/etc/mayfly/jit, mayfly-job.service) for
+# templates mayfly built (description "profile <name>"), polara-ci for templates built by
+# polara-ci, whose job unit waits for /etc/polara-ci/jit.
+template_layout() {
+  if guest_config "$1" | grep -q '^description: profile'; then echo mayfly; else echo polara-ci; fi
+}
+
 # The node a VMID belongs to anywhere in the cluster (empty when unused). qm only sees this node.
 vmid_node() { jq -r --arg id "$1" '.ids[$id].node // empty' "$PVE_ETC/.vmlist" 2>/dev/null; }
 used_elsewhere() { local n; n=$(vmid_node "$1"); [ -n "$n" ] && [ "$n" != "$NODE" ]; }
@@ -394,7 +402,7 @@ write_firewall() {
 # cloud-init user-data for one job VM. Holds the one-use JIT config, so 0600 and deleted
 # as soon as the VM has started (Proxmox has built its cloud-init drive by then).
 write_snippet() {
-  local id=$1 host=$2 jit=$3 envspec=$4 f lines
+  local id=$1 host=$2 jit=$3 envspec=$4 d=${5:-mayfly} f lines
   f="$SNIPPET_DIR/mayfly-$id.yaml"
   lines=$(job_env "$envspec")
   (
@@ -403,18 +411,18 @@ write_snippet() {
       echo "#cloud-config"
       echo "hostname: $host"
       echo "write_files:"
-      echo "  - path: /etc/mayfly/jit"
+      echo "  - path: /etc/$d/jit"
       echo "    permissions: '0600'"
       echo "    content: $jit"
       if [ -n "$lines" ]; then
-        echo "  - path: /etc/mayfly/job.env"
+        echo "  - path: /etc/$d/job.env"
         echo "    permissions: '0600'"
         echo "    content: |"
         sed 's/^/      /' <<<"$lines"
       fi
       # Also start the job from cloud-final, so a template whose unit did not start at boot still works.
       echo "runcmd:"
-      echo "  - [systemctl, start, --no-block, mayfly-job.service]"
+      echo "  - [systemctl, start, --no-block, $d-job.service]"
     } >"$f"
   )
 }
@@ -544,7 +552,7 @@ cmd_slot() {
       fi
       unset jit
     else
-      write_snippet "$vmid" "$host" "$jit" "$envspec"
+      write_snippet "$vmid" "$host" "$jit" "$envspec" "$(template_layout "$tpl")"
       unset jit
       if ! qm clone "$tpl" "$vmid" --name "$host" >/dev/null ||
          ! qm set "$vmid" --cores "$vcpu" --memory $((ram * 1024)) --balloon 0 --onboot 0 ${CPU_TYPE:+--cpu "$CPU_TYPE"} \
@@ -785,11 +793,48 @@ cmd_pod() {
 
 # ------------------------------------------------------------------ status, check, gc
 
+# "<name> <online|offline> <busy>" for every runner of ours on GitHub; fails when GitHub can't be asked.
+github_runners() {
+  local token page out
+  token=$(install_token) || return 1
+  page=1
+  while :; do
+    out=$(gh_api "$token" GET "/$SCOPE/actions/runners?per_page=100&page=$page") || return 1
+    [ "$(jq '.runners | length' <<<"$out")" -gt 0 ] || break
+    jq -r --arg p "$RUNNER_PREFIX-" '.runners[] | select(.name | startswith($p)) | "\(.name) \(.status) \(.busy)"' <<<"$out"
+    page=$((page + 1))
+  done
+}
+
+# GitHub's view of a slot: the runner named in the VM's description (VM and LXC slots), or the
+# pod's runners by name. online, busy, offline, or none (no runner registered).
+github_state() {
+  local name=$1 vmid=$2 kind=$3 r on=0 off=0 busy=0 n st="" b=""
+  if [ "$kind" = pod ]; then
+    while read -r n st b; do
+      [[ $n == "$RUNNER_PREFIX-$name-"* ]] || continue
+      if [ "$st" = online ] && [ "$b" = true ]; then busy=$((busy + 1)); elif [ "$st" = online ]; then on=$((on + 1)); else off=$((off + 1)); fi
+    done <<<"$GH_RUNNERS"
+    [ $((on + off + busy)) -gt 0 ] || { echo none; return; }
+    echo "$((on + busy))/$((on + off + busy))"; return
+  fi
+  r=$(guest_config "$vmid" 2>/dev/null | sed -n 's/^description: runner \([^ ,]*\).*/\1/p') || true
+  [ -n "$r" ] || { echo -; return; }
+  read -r _ st b < <(grep "^$r " <<<"$GH_RUNNERS") || true
+  case "$st/$b" in
+    online/true) echo busy ;;
+    online/*) echo online ;;
+    offline/*) echo offline ;;
+    *) echo none ;;
+  esac
+}
+
 cmd_status() {
-  local name line vmid labels vcpu ram disk envspec which extra state job svc kind
+  local name line vmid labels vcpu ram disk envspec which extra state job svc kind gh gh_ok=yes stuck=0
   load_env
   [ -s "$SLOTS_CONF" ] && [ -n "$(slot_names)" ] || { warn "no slots in $SLOTS_CONF"; return 0; }
-  printf '%s%-10s %-6s %-4s %-22s %-7s %-9s %-8s %s%s\n' "$C_DIM" SLOT VMID KIND LABELS SIZE SERVICE GUEST JOB "$C_0"
+  GH_RUNNERS=$(github_runners) || { GH_RUNNERS=""; gh_ok=no; }
+  printf '%s%-10s %-6s %-4s %-22s %-7s %-9s %-8s %-6s %s%s\n' "$C_DIM" SLOT VMID KIND LABELS SIZE SERVICE GUEST JOB GITHUB "$C_0"
   while read -r name; do
     line=$(slot_line "$name")
     read -r _ vmid labels vcpu ram disk envspec which extra <<<"$line"
@@ -806,11 +851,18 @@ cmd_status() {
       job_active "$vmid" && job=busy || job=idle
     fi
     svc=$(systemctl is-active "mayfly-slot@$name" 2>/dev/null || true)
-    printf '%-10s %-6s %-4s %-22s %-7s %s %s %s\n' "$name" "$vmid" "$kind" "$labels" "${vcpu}c/${ram}G" \
+    gh=-
+    if [ "$gh_ok" = no ]; then gh="?"
+    elif [ "$state" = running ]; then gh=$(github_state "$name" "$vmid" "$kind"); fi
+    case "$gh" in offline|none|0/*) stuck=$((stuck + 1)) ;; esac
+    printf '%-10s %-6s %-4s %-22s %-7s %s %s %s %s\n' "$name" "$vmid" "$kind" "$labels" "${vcpu}c/${ram}G" \
       "$(paint "$svc" 9 active=GRN failed=RED activating=BLU deactivating=YEL)" \
-      "$(paint "${state:-none}" 8 running=GRN)" "$(paint "$job" 0 busy=BLU idle=DIM)"
+      "$(paint "${state:-none}" 8 running=GRN)" "$(paint "$job" 6 busy=BLU idle=DIM)" \
+      "$(paint "$gh" 0 online=GRN busy=BLU offline=RED none=RED)"
   done < <(slot_names)
   echo
+  [ "$gh_ok" = yes ] || warn "could not list the runners on GitHub (mayfly check)"
+  [ "$stuck" = 0 ] || warn "$stuck running guest(s) have no online runner on GitHub; a job VM that boots but never registers points at the template (mayfly check)"
   printf '%s%-10s%s %s %s%% used, limit %s%%\n' "$C_DIM" storage "$C_0" "$STORAGE" "$(pool_percent)" "$MAX_POOL_PERCENT"
   printf '%s%-10s%s %s GB free, %s GB kept for the host\n' "$C_DIM" ram "$C_0" "$(free_ram_gb)" "$MIN_FREE_RAM_GB"
   printf '%s%-10s%s %s%s, profile %s\n' "$C_DIM" template "$C_0" "${TEMPLATE_VMID:-none}" "${NEXT_TEMPLATE_VMID:+, next $NEXT_TEMPLATE_VMID}" "$PROFILE"
@@ -855,6 +907,11 @@ cmd_check() {
   esac; fi
   if [ -n "$TEMPLATE_VMID" ] && is_template "$TEMPLATE_VMID"; then item ok template "$TEMPLATE_VMID"
   else item warn template "none yet: mayfly template build, then mayfly template promote <vmid>"; fi
+  for e in $TEMPLATE_VMID $NEXT_TEMPLATE_VMID; do
+    if is_template "$e" && [ "$(guest_kind "$e")" = vm ] && [ "$(template_layout "$e")" != mayfly ]; then
+      item warn template "$e was built by polara-ci; jobs get its /etc/polara-ci paths. Rebuild: mayfly template build"
+    fi
+  done
   if find_profile "$PROFILE" >/dev/null; then item ok profile "$PROFILE"
   else item bad profile "$PROFILE not found in $CONF_DIR/profiles or $SHARE/profiles"; fi
   n=0
@@ -955,6 +1012,12 @@ set_pool_value() {
   fi
 }
 
+legacy_template_note() {
+  [ "$(guest_kind "$1")" = vm ] && [ "$(template_layout "$1")" != mayfly ] || return 0
+  warn "template $1 was built by polara-ci: its jobs get the /etc/polara-ci paths it expects"
+  hint "rebuild it with mayfly template build when convenient"
+}
+
 cmd_template() {
   local sub=${1:-}
   load_env
@@ -963,9 +1026,14 @@ cmd_template() {
       shift
       local lxc=no profile=$PROFILE a
       for a in "$@"; do if [ "$a" = --lxc ]; then lxc=yes; else profile=$a; fi; done
+      # One build at a time: a second one would pick the same free VMID and destroy the first's VM.
+      mkdir -p "$(dirname "$BUILD_LOCK")"
+      exec 9>>"$BUILD_LOCK"
+      flock -n 9 || die "another template build is running (lock $BUILD_LOCK); wait for it to finish"
       if [ "$lxc" = yes ]; then template_build_ct "$profile"; else template_build "$profile"; fi ;;
     canary)
       [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template canary <template vmid>"
+      legacy_template_note "$2"
       if [ "$(guest_kind "$2")" = ct ]; then
         set_pool_value NEXT_LXC_TEMPLATE_VMID "$2"; done_ "lxc slots marked next now clone $2"
       else
@@ -974,6 +1042,7 @@ cmd_template() {
       hint "when their jobs pass: mayfly template promote $2" ;;
     promote)
       [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template promote <template vmid>"
+      legacy_template_note "$2"
       if [ "$(guest_kind "$2")" = ct ]; then
         set_pool_value LXC_TEMPLATE_VMID "$2"; set_pool_value NEXT_LXC_TEMPLATE_VMID ""
         done_ "every lxc slot clones $2 from its next job on"
@@ -1017,6 +1086,9 @@ free_template_vmid() {
   [ -n "$id" ] || die "no free template VMID in TEMPLATE_VMIDS ($TEMPLATE_VMIDS); add one"
   if vm_exists "$id"; then
     is_ours "$id" || die "VMID $id exists and is not a mayfly guest"
+    if ! is_template "$id" && vm_running "$id"; then
+      die "VMID $id is running and not a template yet (a build in progress?); stop it first if it is stale"
+    fi
     for f in "$PVE_ETC"/qemu-server/*.conf "$PVE_ETC"/lxc/*.conf; do
       [ -e "$f" ] && [ "$(basename "$f" .conf)" != "$id" ] || continue
       grep -q "base-$id-disk" "$f" && die "template $id still has clones ($(basename "$f" .conf))"
@@ -1073,7 +1145,8 @@ template_build() {
       echo "    encoding: b64"
       echo "    content: $(tar -C "$pdir" -czf - . | base64 -w0)"
       echo "runcmd:"
-      echo "  - [bash, -c, 'CACHE_IP=$CACHE_IP /root/provision.sh > /var/log/mayfly-provision.log 2>&1 && poweroff || touch /var/log/mayfly-provision.failed']"
+      # The host waits for the done marker and shuts the VM down; a VM that stops without it is no template.
+      echo "  - [bash, -c, 'CACHE_IP=$CACHE_IP /root/provision.sh > /var/log/mayfly-provision.log 2>&1 && touch /var/log/mayfly-provision.done || touch /var/log/mayfly-provision.failed']"
     } >"$snippet"
   )
 
@@ -1093,26 +1166,38 @@ template_build() {
   write_firewall "$id"
   qm start "$id" >/dev/null
 
-  local waited=0
-  while vm_running "$id"; do
+  local waited=0 provisioned=no
+  while [ "$provisioned" = no ]; do
+    vm_exists "$id" || die "template VM $id is gone (destroyed from outside?); nothing was built"
+    vm_running "$id" || die "template VM $id stopped before provisioning finished; nothing was built (see /var/log/mayfly-provision.log in its disk, or build again)"
     if [ "$waited" -ge 5400 ]; then
-      die "template VM $id still running after 90 min; see 'qm terminal $id' or /var/log/mayfly-provision.log inside"
+      die "template VM $id still provisioning after 90 min; see 'qm terminal $id' or /var/log/mayfly-provision.log inside"
     fi
     nap 30
     waited=$((waited + 30))
-    # provision.sh failed: stop now instead of waiting out the 90 minutes.
-    if [ $((waited % 120)) = 0 ] &&
-      qm guest exec "$id" --timeout 20 -- test -e /var/log/mayfly-provision.failed 2>/dev/null |
-        jq -e '.exitcode == 0' >/dev/null 2>&1; then
+    if guest_file_exists "$id" /var/log/mayfly-provision.done; then
+      provisioned=yes
+    elif guest_file_exists "$id" /var/log/mayfly-provision.failed; then
       qm guest exec "$id" --timeout 20 -- tail -n 30 /var/log/mayfly-provision.log 2>/dev/null | jq -r '."out-data" // empty' >&2 || true
       die "provisioning failed in template VM $id (log above; VM left running for a look, 'mayfly template build' again replaces it)"
     fi
   done
+  step "provisioned; shutting down VM $id"
+  qm guest exec "$id" --timeout 20 -- sh -c 'rm -f /var/log/mayfly-provision.done; sync' >/dev/null 2>&1 || true
+  qm shutdown "$id" --timeout 300 >/dev/null || qm stop "$id" >/dev/null || die "could not stop template VM $id"
+  vm_exists "$id" && ! vm_running "$id" || die "template VM $id did not stop cleanly; nothing was built"
   rm -f "$snippet"
-  qm set "$id" --delete cicustom --name "${NAME_PREFIX}template-$profile-$stamp" >/dev/null
-  qm template "$id" >/dev/null
+  qm set "$id" --delete cicustom --name "${NAME_PREFIX}template-$profile-$stamp" >/dev/null ||
+    die "could not rename template VM $id"
+  qm template "$id" >/dev/null || die "qm template $id failed; VM $id is not a template"
+  is_template "$id" || die "VM $id is not a template after qm template"
   done_ "template $id ready (${NAME_PREFIX}template-$profile-$stamp)"
   hint "next: mayfly template canary $id, watch a job, then mayfly template promote $id"
+}
+
+# True when <path> exists in VM <id>, asked through the guest agent.
+guest_file_exists() {
+  qm guest exec "$1" --timeout 20 -- test -e "$2" 2>/dev/null | jq -e '.exitcode == 0' >/dev/null 2>&1
 }
 
 # Container template: an unprivileged LXC container (nesting and keyctl on, for Docker) from the
@@ -1161,9 +1246,11 @@ template_build_ct() {
     timeout 20 lxc-attach -n "$id" -- tail -n 30 /var/log/mayfly-provision.log >&2 || true
     die "provisioning failed in container $id (log above; left running for a look, 'mayfly template build --lxc' again replaces it)"
   fi
-  pct stop "$id" >/dev/null
-  pct set "$id" --hostname "${NAME_PREFIX}template-$profile-$stamp" >/dev/null
-  pct template "$id" >/dev/null
+  vm_exists "$id" || die "container $id is gone (destroyed from outside?); nothing was built"
+  pct stop "$id" >/dev/null || die "could not stop container $id"
+  pct set "$id" --hostname "${NAME_PREFIX}template-$profile-$stamp" >/dev/null || die "could not rename container $id"
+  pct template "$id" >/dev/null || die "pct template $id failed; container $id is not a template"
+  is_template "$id" || die "container $id is not a template after pct template"
   done_ "container template $id ready (${NAME_PREFIX}template-$profile-$stamp)"
   hint "next: mayfly template canary $id, watch a job, then mayfly template promote $id"
 }

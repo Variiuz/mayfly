@@ -93,6 +93,12 @@ f="$t/snippets/mayfly-9002.yaml"
 ok "snippet is 0600" '[ "$(stat -c %a "$f")" = 600 ]'
 ok "snippet has the JIT config and job env" 'grep -q "content: JITCONFIG" "$f" && grep -q "^      TOKEN=t$" "$f"'
 ok "snippet starts mayfly-job" 'grep -q "mayfly-job.service" "$f"'
+write_snippet 9002 ci-s1 JITCONFIG extra polara-ci
+ok "polara-ci layout: its jit path and job unit" 'grep -q "path: /etc/polara-ci/jit" "$f" && grep -q "path: /etc/polara-ci/job.env" "$f" && grep -q "polara-ci-job.service" "$f" && ! grep -q /etc/mayfly "$f"'
+guest qm 9091 'name: ci-template-20261101\ntags: polara-ci\ntemplate: 1\n'
+guest qm 9092 'description: profile polara\nname: ci-template-polara-20261110\ntags: mayfly\ntemplate: 1\n'
+ok "template_layout: polara-ci template without a profile" '[ "$(template_layout 9091)" = polara-ci ]'
+ok "template_layout: mayfly template" '[ "$(template_layout 9092)" = mayfly ]'
 
 # ---- firewall
 printf 'ORG=acme\nGATEWAY=10.66.0.1\nALLOW_OUT="10.1.2.3 10.9.0.0/16"\nCACHE_IP=10.66.0.5\nBLOCK_NETS="10.0.0.0/8"\n' >"$t/conf/pool.env"
@@ -124,6 +130,17 @@ ok "not ours: wrong name" '! is_ours 9004'
 ok "not ours: wrong tag" '! is_ours 9005'
 ok "not ours: outside the VMID range" '! is_ours 100'
 LEGACY_TAGS=""
+
+# ---- GitHub's view of a slot
+RUNNER_PREFIX=ci-blake
+GH_RUNNERS=$'ci-blake-s1-100 online false\nci-blake-s2-200 offline false\nci-blake-s3-300 online true\nci-blake-p1-1-400 online false\nci-blake-p1-2-401 offline false'
+guest qm 9011 'description: runner ci-blake-s1-100, template 9098\nname: ci-s1\n'
+guest qm 9012 'description: runner ci-blake-s2-200, template 9097\nname: ci-s2\n'
+guest qm 9013 'description: runner ci-blake-s3-300, template 9098\nname: ci-s3\n'
+guest qm 9014 'description: runner ci-blake-s4-500, template 9098\nname: ci-s4\n'
+ok "github_state: online, offline, busy, none" '[ "$(github_state s1 9011 vm)" = online ] && [ "$(github_state s2 9012 vm)" = offline ] && [ "$(github_state s3 9013 vm)" = busy ] && [ "$(github_state s4 9014 vm)" = none ]'
+ok "github_state: pod counts online runners" '[ "$(github_state p1 9041 pod)" = 1/2 ] && [ "$(github_state p9 9049 pod)" = none ]'
+GH_RUNNERS=""
 
 # ---- containers
 vcpu=2 ram=4 disk=20
@@ -166,6 +183,11 @@ ok "no colour when not a terminal" '[ "$TTY" = 0 ] && [ -z "$C_GRN" ]'
 ok "warn: prefixed off a terminal" '[ "$(warn x)" = "warning: x" ]'
 ok "item: label column, counts warnings" 'CHECK_WARN=0; out=$(item warn storage "70% used"; echo "$CHECK_WARN"); [ "$out" = "$(printf "warn storage   70%% used\n1")" ]'
 ok "paint pads plain text" '[ "$(paint busy 6 busy=BLU)|" = "busy  |" ]'
+BUILD_LOCK="$t/build.lock"
+exec 8>>"$BUILD_LOCK"; flock -n 8
+(cmd_template build) >"$t/lock.out" 2>&1; rc=$?
+ok "template build refuses while another build holds the lock" '[ "$rc" = 1 ] && grep -q "another template build is running" "$t/lock.out"'
+exec 8>&-
 ok "help lists the commands" 'cmd_help | grep -q "template build" && cmd_help | grep -q "enable"'
 ok "version" '[[ "$(bash "$here/mayfly.sh" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
 ok "unknown command fails" '! bash "$here/mayfly.sh" nope >/dev/null 2>&1'

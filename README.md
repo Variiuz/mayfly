@@ -55,7 +55,9 @@ again; configuration, slots and running jobs are kept.
    runs-on: [self-hosted, linux]
    ```
 
-`mayfly help` lists all commands. Logs: `journalctl -u 'mayfly-slot@*' -f`.
+`mayfly status` lists each slot's service, guest, job and the state of its runner on GitHub
+(`online`, `busy`, `offline`, `none`). `mayfly help` lists all commands. Logs:
+`journalctl -u 'mayfly-slot@*' -f`.
 
 ## Job lifecycle
 
@@ -204,6 +206,9 @@ ct-1  9051  small  2  4  20  no  current  kind=lxc
 `mayfly template canary <vmid>` points slots marked `next` at it. `mayfly template promote <vmid>`
 switches all slots at their next job. The previous template is kept for rollback with
 `mayfly template promote <old>`.
+
+Templates built by polara-ci (no `profile` description) expect the job files in `/etc/polara-ci`.
+Mayfly writes them there for such templates, and `mayfly check`, `canary` and `promote` warn about them.
 
 The template disk size is `TEMPLATE_DISK` GB. Set it to the largest slot disk: clones keep the template
 size and are resized only when `disk_gb` is larger, because growing a disk makes ext4 in the guest
