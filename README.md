@@ -238,7 +238,8 @@ release PR tags the version and attaches `mayfly-<version>.tar.gz`, the binary o
 curl -fsSL https://github.com/variiuz/mayfly/releases/download/v0.1.0/install.sh | bash
 ```
 
-To install from a checkout, which needs `cargo` on the host to build the binary:
+To install from a checkout (the binary is built with `cargo` when the host has it, otherwise the released
+binary of the checkout's version is downloaded and checked against `SHA256SUMS`):
 `scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/install.sh`.
 
 Tests run without Proxmox: `cargo test` and `bash tests/run.sh`. `bash tests/parity.sh` checks that the

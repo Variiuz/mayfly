@@ -63,7 +63,19 @@ if [ ! -f "$bin" ]; then
     (cd "$src" && cargo build --release --locked) || die "cargo build failed"
     bin=$src/target/release/mayfly
   else
-    die "no mayfly binary next to install.sh; use a release"
+    # No cargo (a normal Proxmox host): take the released binary of the version this checkout says.
+    command -v curl >/dev/null || die "no mayfly binary next to install.sh and no curl or cargo; use a release"
+    v=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' "$src/mayfly.sh")
+    step "no cargo here: downloading the released mayfly $v binary"
+    btmp=$(mktemp -d)
+    trap 'rm -rf "$btmp"' EXIT
+    curl -fsSL --retry 3 -o "$btmp/mayfly" "$REPO_URL/releases/download/v$v/mayfly-$v-x86_64-linux" &&
+      curl -fsSL --retry 3 -o "$btmp/SHA256SUMS" "$REPO_URL/releases/download/v$v/SHA256SUMS" ||
+      die "release v$v has no mayfly binary; use a release, or install cargo to build this checkout"
+    want=$(awk -v f="mayfly-$v-x86_64-linux" '$2 == f || $2 == "*" f { print $1 }' "$btmp/SHA256SUMS")
+    [ -n "$want" ] && [ "$(sha256sum "$btmp/mayfly" | awk '{print $1}')" = "$want" ] || die "checksum mismatch for mayfly-$v-x86_64-linux"
+    chmod 0755 "$btmp/mayfly"
+    bin=$btmp/mayfly
   fi
 fi
 new=$("$bin" version 2>/dev/null | awk 'NR == 1 && /^mayfly [0-9]/ { print $2 }' || true)
