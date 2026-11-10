@@ -20,6 +20,7 @@ set -euo pipefail
 
 MAYFLY_VERSION=0.1.1 # x-release-please-version
 CONF_DIR=${MAYFLY_CONF_DIR:-/etc/mayfly}
+BUILD_LOCK=${MAYFLY_BUILD_LOCK:-/run/lock/mayfly-template-build.lock}
 POOL_ENV=$CONF_DIR/pool.env
 SLOTS_CONF=$CONF_DIR/slots.conf
 ENV_DIR=$CONF_DIR/env
@@ -1023,6 +1024,10 @@ cmd_template() {
       shift
       local lxc=no profile=$PROFILE a
       for a in "$@"; do if [ "$a" = --lxc ]; then lxc=yes; else profile=$a; fi; done
+      # One build at a time: a second one would pick the same free VMID and destroy the first's VM.
+      mkdir -p "$(dirname "$BUILD_LOCK")"
+      exec 9>>"$BUILD_LOCK"
+      flock -n 9 || die "another template build is running (lock $BUILD_LOCK); wait for it to finish"
       if [ "$lxc" = yes ]; then template_build_ct "$profile"; else template_build "$profile"; fi ;;
     canary)
       [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template canary <template vmid>"
@@ -1079,6 +1084,9 @@ free_template_vmid() {
   [ -n "$id" ] || die "no free template VMID in TEMPLATE_VMIDS ($TEMPLATE_VMIDS); add one"
   if vm_exists "$id"; then
     is_ours "$id" || die "VMID $id exists and is not a mayfly guest"
+    if ! is_template "$id" && vm_running "$id"; then
+      die "VMID $id is running and not a template yet (a build in progress?); stop it first if it is stale"
+    fi
     for f in "$PVE_ETC"/qemu-server/*.conf "$PVE_ETC"/lxc/*.conf; do
       [ -e "$f" ] && [ "$(basename "$f" .conf)" != "$id" ] || continue
       grep -q "base-$id-disk" "$f" && die "template $id still has clones ($(basename "$f" .conf))"
@@ -1135,7 +1143,8 @@ template_build() {
       echo "    encoding: b64"
       echo "    content: $(tar -C "$pdir" -czf - . | base64 -w0)"
       echo "runcmd:"
-      echo "  - [bash, -c, 'CACHE_IP=$CACHE_IP /root/provision.sh > /var/log/mayfly-provision.log 2>&1 && poweroff || touch /var/log/mayfly-provision.failed']"
+      # The host waits for the done marker and shuts the VM down; a VM that stops without it is no template.
+      echo "  - [bash, -c, 'CACHE_IP=$CACHE_IP /root/provision.sh > /var/log/mayfly-provision.log 2>&1 && touch /var/log/mayfly-provision.done || touch /var/log/mayfly-provision.failed']"
     } >"$snippet"
   )
 
@@ -1155,26 +1164,38 @@ template_build() {
   write_firewall "$id"
   qm start "$id" >/dev/null
 
-  local waited=0
-  while vm_running "$id"; do
+  local waited=0 provisioned=no
+  while [ "$provisioned" = no ]; do
+    vm_exists "$id" || die "template VM $id is gone (destroyed from outside?); nothing was built"
+    vm_running "$id" || die "template VM $id stopped before provisioning finished; nothing was built (see /var/log/mayfly-provision.log in its disk, or build again)"
     if [ "$waited" -ge 5400 ]; then
-      die "template VM $id still running after 90 min; see 'qm terminal $id' or /var/log/mayfly-provision.log inside"
+      die "template VM $id still provisioning after 90 min; see 'qm terminal $id' or /var/log/mayfly-provision.log inside"
     fi
     nap 30
     waited=$((waited + 30))
-    # provision.sh failed: stop now instead of waiting out the 90 minutes.
-    if [ $((waited % 120)) = 0 ] &&
-      qm guest exec "$id" --timeout 20 -- test -e /var/log/mayfly-provision.failed 2>/dev/null |
-        jq -e '.exitcode == 0' >/dev/null 2>&1; then
+    if guest_file_exists "$id" /var/log/mayfly-provision.done; then
+      provisioned=yes
+    elif guest_file_exists "$id" /var/log/mayfly-provision.failed; then
       qm guest exec "$id" --timeout 20 -- tail -n 30 /var/log/mayfly-provision.log 2>/dev/null | jq -r '."out-data" // empty' >&2 || true
       die "provisioning failed in template VM $id (log above; VM left running for a look, 'mayfly template build' again replaces it)"
     fi
   done
+  step "provisioned; shutting down VM $id"
+  qm guest exec "$id" --timeout 20 -- sh -c 'rm -f /var/log/mayfly-provision.done; sync' >/dev/null 2>&1 || true
+  qm shutdown "$id" --timeout 300 >/dev/null || qm stop "$id" >/dev/null || die "could not stop template VM $id"
+  vm_exists "$id" && ! vm_running "$id" || die "template VM $id did not stop cleanly; nothing was built"
   rm -f "$snippet"
-  qm set "$id" --delete cicustom --name "${NAME_PREFIX}template-$profile-$stamp" >/dev/null
-  qm template "$id" >/dev/null
+  qm set "$id" --delete cicustom --name "${NAME_PREFIX}template-$profile-$stamp" >/dev/null ||
+    die "could not rename template VM $id"
+  qm template "$id" >/dev/null || die "qm template $id failed; VM $id is not a template"
+  is_template "$id" || die "VM $id is not a template after qm template"
   done_ "template $id ready (${NAME_PREFIX}template-$profile-$stamp)"
   hint "next: mayfly template canary $id, watch a job, then mayfly template promote $id"
+}
+
+# True when <path> exists in VM <id>, asked through the guest agent.
+guest_file_exists() {
+  qm guest exec "$1" --timeout 20 -- test -e "$2" 2>/dev/null | jq -e '.exitcode == 0' >/dev/null 2>&1
 }
 
 # Container template: an unprivileged LXC container (nesting and keyctl on, for Docker) from the
@@ -1223,9 +1244,11 @@ template_build_ct() {
     timeout 20 lxc-attach -n "$id" -- tail -n 30 /var/log/mayfly-provision.log >&2 || true
     die "provisioning failed in container $id (log above; left running for a look, 'mayfly template build --lxc' again replaces it)"
   fi
-  pct stop "$id" >/dev/null
-  pct set "$id" --hostname "${NAME_PREFIX}template-$profile-$stamp" >/dev/null
-  pct template "$id" >/dev/null
+  vm_exists "$id" || die "container $id is gone (destroyed from outside?); nothing was built"
+  pct stop "$id" >/dev/null || die "could not stop container $id"
+  pct set "$id" --hostname "${NAME_PREFIX}template-$profile-$stamp" >/dev/null || die "could not rename container $id"
+  pct template "$id" >/dev/null || die "pct template $id failed; container $id is not a template"
+  is_template "$id" || die "container $id is not a template after pct template"
   done_ "container template $id ready (${NAME_PREFIX}template-$profile-$stamp)"
   hint "next: mayfly template canary $id, watch a job, then mayfly template promote $id"
 }
