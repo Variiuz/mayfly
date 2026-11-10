@@ -60,6 +60,11 @@ again; configuration, slots and running jobs are kept.
 (`online`, `busy`, `offline`, `none`). `mayfly help` lists all commands. Logs:
 `journalctl -u 'mayfly-slot@*' -f`.
 
+`mayfly stats [hours]` counts, per slot over the last 24 hours (or `hours`), from that journal: guests
+destroyed, jobs run, guests replaced idle (`MAX_IDLE_HOURS`) or stuck (runner not online), jobs cut off
+(`MAX_JOB_HOURS`, the backstop, a full pool), errors (clone, start, GitHub registration) and the median
+life of a guest that ran a job. Pods count their VMs and errors only.
+
 ## Job lifecycle
 
 1. The slot requests a single-job (JIT) runner config from GitHub using the App. The App key stays on
@@ -245,6 +250,7 @@ latency breaks file-lock and timing tests, even with `DISK_CACHE=unsafe`.
 - Runners register with the base labels plus the slot's labels and are removed after their job.
 - `ACTIONS_RUNNER_INPUT_JITCONFIG` is not present in a job's environment.
 - `mayfly status` and thin pool usage stay stable over a day of jobs.
+- `mayfly stats` after a day shows no stuck guests and no errors.
 
 ## Updates
 

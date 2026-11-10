@@ -1434,6 +1434,7 @@ ${C_DIM}Run${C_0}
   enable [slot ...]                 start slots (all when none named) and the gc timer
   disable [slot ...]                stop slots; running jobs finish first
   status                            slots, guests, jobs, pool and RAM
+  stats [hours]                     jobs, idle and stuck guests, errors per slot (last 24 h)
 
 ${C_DIM}Other${C_0}
   gc                                stale runners, orphan guests, old snippets (the timer runs it)
