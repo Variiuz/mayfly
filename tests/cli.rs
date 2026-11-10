@@ -1094,6 +1094,31 @@ fn release_tarball(v: &str, mayfly: &str) -> Vec<u8> {
     b.into_inner().unwrap().finish().unwrap()
 }
 
+/// The JSON of the release list, newest first, with the installed version's release at the end.
+fn release_list(newer: &[(&str, &str)]) -> String {
+    let mut items: Vec<serde_json::Value> = newer
+        .iter()
+        .map(|(v, body)| {
+            serde_json::json!({
+                "tag_name": format!("v{v}"),
+                "body": body,
+                "html_url": format!("https://example.test/releases/tag/v{v}"),
+                "draft": false,
+                "prerelease": false
+            })
+        })
+        .collect();
+    items.push(serde_json::json!({
+        "tag_name": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "body": "### Bug Fixes\n",
+        "draft": false,
+        "prerelease": false
+    }));
+    serde_json::Value::Array(items).to_string()
+}
+
+const BREAKING_BODY: &str = "### ⚠ BREAKING CHANGES\n\n* the config moved\n";
+
 struct Release {
     port: u16,
     seen: Arc<Mutex<Vec<String>>>,
@@ -1102,6 +1127,12 @@ struct Release {
 impl Release {
     /// A server whose latest release is `v`; `sums` overrides the checksum line (to make it wrong).
     fn serve(v: &str, mayfly: &str, sums: Option<&str>) -> Release {
+        let list = release_list(&[(v, "### Bug Fixes\n\n* a fix\n")]);
+        Release::serve_with(v, mayfly, sums, Some(list))
+    }
+
+    /// Like `serve`, with the body of `/releases?per_page=100` (None: that route is a 404).
+    fn serve_with(v: &str, mayfly: &str, sums: Option<&str>, list: Option<String>) -> Release {
         let tgz = release_tarball(v, mayfly);
         let name = format!("mayfly-{v}.tar.gz");
         let sums = match sums {
@@ -1117,6 +1148,9 @@ impl Release {
             format!("{sums}  {name}\n").into_bytes(),
         );
         routes.insert(format!("/repo/releases/download/v{v}/{name}"), tgz);
+        if let Some(list) = list {
+            routes.insert("/api/releases?per_page=100".to_string(), list.into_bytes());
+        }
         let (port, seen) = fake_release_server(routes);
         Release { port, seen }
     }
@@ -1407,6 +1441,137 @@ fn the_timer_logs_plain_lines_and_skips_a_skipped_version() {
     assert_eq!(o.status.code(), Some(0), "{out}{err}");
     assert!(out.contains("update: mayfly 9.9.10 installed"), "{out}");
     assert!(!h.state().contains("skipped"));
+}
+
+#[test]
+fn auto_skips_a_breaking_target() {
+    let h = Host::new("auto-breaking", 0, "ORG=acme\n");
+    let list = release_list(&[("9.9.9", BREAKING_BODY)]);
+    let rel = Release::serve_with("9.9.9", &fake_mayfly("9.9.9", 0), None, Some(list));
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.contains(
+            "update: mayfly 9.9.9 needs a manual mayfly update (breaking: see release notes)\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("https://example.test/releases/tag/v9.9.9"),
+        "{out}"
+    );
+    assert_eq!(rel.downloads(), 0);
+    assert!(h.state().contains("last_result=breaking"), "{}", h.state());
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    assert!(!h.share().join("previous").exists());
+    no_temp_left(&h);
+}
+
+#[test]
+fn auto_skips_when_a_release_in_between_is_breaking() {
+    let h = Host::new("auto-between", 0, "ORG=acme\n");
+    let list = release_list(&[
+        ("9.9.9", "### Bug Fixes\n"),
+        ("9.9.8", BREAKING_BODY),
+        ("9.9.7", "### Features\n"),
+    ]);
+    let rel = Release::serve_with("9.9.9", &fake_mayfly("9.9.9", 0), None, Some(list));
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.contains(
+            "update: mayfly 9.9.9 needs a manual mayfly update (breaking: see release notes)"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("v9.9.8"), "{out}");
+    assert_eq!(rel.downloads(), 0);
+    assert!(h.state().contains("last_result=breaking"));
+    // The state names the version that waits (`mayfly status` prints it).
+    let state = h.state();
+    assert!(state.contains("breaking=9.9.9"), "{state}");
+}
+
+#[test]
+fn auto_ignores_breaking_drafts_and_older_releases() {
+    let h = Host::new("auto-ignored", 0, "ORG=acme\n");
+    let mut items: Vec<serde_json::Value> = serde_json::from_str(&release_list(&[
+        ("9.9.9", "### Bug Fixes\n"),
+        ("9.9.8", BREAKING_BODY),
+    ]))
+    .unwrap();
+    items[1]["draft"] = serde_json::json!(true);
+    // Breaking, but older than what is installed: not between the two versions.
+    items.push(serde_json::json!({
+        "tag_name": "v0.0.1", "body": BREAKING_BODY, "draft": false, "prerelease": false
+    }));
+    let list = serde_json::Value::Array(items).to_string();
+    let rel = Release::serve_with("9.9.9", &fake_mayfly("9.9.9", 0), None, Some(list));
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(out.contains("update: mayfly 9.9.9 installed"), "{out}");
+}
+
+#[test]
+fn plain_update_takes_a_breaking_release() {
+    let h = Host::new("plain-breaking", 0, "ORG=acme\n");
+    let list = release_list(&[("9.9.9", BREAKING_BODY)]);
+    let rel = Release::serve_with("9.9.9", &fake_mayfly("9.9.9", 0), None, Some(list));
+    let o = h.update(rel.port, &[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(out.contains("mayfly 9.9.9 installed"), "{out}");
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("9.9.9", 0));
+    assert!(h.state().contains("last_result=ok"));
+    assert!(!h.state().contains("breaking"));
+
+    let h = Host::new("version-breaking", 0, "ORG=acme\n");
+    let o = h.update(rel.port, &["--version", "9.9.9"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("9.9.9", 0));
+}
+
+#[test]
+fn check_mentions_a_breaking_release() {
+    let h = Host::new("check-breaking", 0, "ORG=acme\n");
+    let list = release_list(&[("9.9.9", BREAKING_BODY)]);
+    let rel = Release::serve_with("9.9.9", &fake_mayfly("9.9.9", 0), None, Some(list));
+    let o = h.update(rel.port, &["--check"]);
+    let (out, _) = text(&o);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        out.contains(
+            "mayfly 9.9.9 is available (installed {}); mayfly update installs it (breaking: run mayfly update by hand)\n"
+                .replace("{}", env!("CARGO_PKG_VERSION"))
+                .as_str()
+        ),
+        "{out}"
+    );
+    assert_eq!(rel.downloads(), 0);
+    assert_eq!(h.state(), "");
+}
+
+#[test]
+fn auto_skips_when_the_release_list_cannot_be_read() {
+    let h = Host::new("auto-no-list", 0, "ORG=acme\n");
+    let rel = Release::serve_with("9.9.9", &fake_mayfly("9.9.9", 0), None, None);
+    let o = h.update(rel.port, &["--auto"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.contains("update: cannot tell whether mayfly 9.9.9 is breaking"),
+        "{out}"
+    );
+    assert_eq!(rel.downloads(), 0);
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("0.0.1", 0));
+    assert!(!h.share().join("previous").exists());
+    // By hand it does not need the list.
+    let o = h.update(rel.port, &[]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(h.read(h.sbin().join("mayfly")), fake_mayfly("9.9.9", 0));
 }
 
 #[test]
