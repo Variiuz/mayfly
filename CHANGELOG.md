@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/Variiuz/mayfly/compare/v0.1.3...v0.2.0) (2026-11-10)
+
+
+### Features
+
+* **check:** warn about pool.env lines that are not plain KEY=value ([#5](https://github.com/Variiuz/mayfly/issues/5)) ([4740e40](https://github.com/Variiuz/mayfly/commit/4740e4073b2078df6475f2bdaadded8b812b7712))
+
 ## [0.1.3](https://github.com/Variiuz/mayfly/compare/v0.1.2...v0.1.3) (2026-11-10)
 
 
