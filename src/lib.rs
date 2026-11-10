@@ -1,7 +1,7 @@
 //! Mayfly: throwaway GitHub Actions runners on Proxmox VE.
 //!
 //! This crate owns `version`, `help`, `status`, `check`, `update`, `install`, `gc`, `enable`, `disable` and
-//! `template`, and `slot` for slots that run `engine=rust` (`kind=vm`, `lxc` and `pod`). Every other slot is forwarded to
+//! `template`, `stats`, and `slot` for slots that run `engine=rust` (`kind=vm`, `lxc` and `pod`). Every other slot is forwarded to
 //! `mayfly.sh` (see `forward`).
 
 pub mod cmd_check;
@@ -10,6 +10,7 @@ pub mod cmd_help;
 pub mod cmd_install;
 pub mod cmd_slot;
 pub mod cmd_slots;
+pub mod cmd_stats;
 pub mod cmd_status;
 pub mod cmd_template;
 pub mod cmd_update;
