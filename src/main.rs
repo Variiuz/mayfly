@@ -2,8 +2,10 @@ use mayfly::cmd_slots::Verb;
 use mayfly::config::Paths;
 use mayfly::out::{print_die, Out};
 use mayfly::pve::RealPve;
-use mayfly::{cmd_check, cmd_gc, cmd_help, cmd_slots, cmd_status, cmd_update, forward, Ctx};
-use std::io::Write;
+use mayfly::{
+    cmd_check, cmd_gc, cmd_help, cmd_install, cmd_slots, cmd_status, cmd_update, forward, Ctx,
+};
+use std::io::{IsTerminal, Write};
 use std::process::{Command, ExitCode};
 
 /// `hostname -s`.
@@ -30,6 +32,12 @@ fn main() -> ExitCode {
         Some("help" | "--help" | "-h") => {
             cmd_help::help(&paths, &out, &mut stdout);
             Ok(0)
+        }
+        Some("install") => {
+            // install.sh coloured on a terminal unless NO_COLOR is set, whatever TERM says.
+            let tty = std::io::stdout().is_terminal()
+                && std::env::var("NO_COLOR").map_or(true, |v| v.is_empty());
+            cmd_install::run(&paths, &args[1..], tty, &mut stdout)
         }
         Some("update") => cmd_update::run(&paths, &args[1..], &out, &mut stdout),
         Some(cmd @ ("status" | "check" | "gc" | "enable" | "disable")) => {

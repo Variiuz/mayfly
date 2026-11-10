@@ -1,11 +1,12 @@
 //! Mayfly: throwaway GitHub Actions runners on Proxmox VE.
 //!
-//! This crate owns `version`, `help`, `status`, `check`, `update`, `gc`, `enable` and `disable`. Every other
+//! This crate owns `version`, `help`, `status`, `check`, `update`, `install`, `gc`, `enable` and `disable`. Every other
 //! command (`slot`, `template`) is forwarded to `mayfly.sh` (see `forward`).
 
 pub mod cmd_check;
 pub mod cmd_gc;
 pub mod cmd_help;
+pub mod cmd_install;
 pub mod cmd_slots;
 pub mod cmd_status;
 pub mod cmd_update;

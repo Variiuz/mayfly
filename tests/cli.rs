@@ -1060,26 +1060,21 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
-/// A stand-in for the `mayfly` command: prints its version and passes or fails `check`.
+/// A stand-in for the `mayfly` command: prints its version, passes or fails `check`, and `install --from <dir>`
+/// copies the release files where MAYFLY_SBIN, MAYFLY_SHARE and MAYFLY_SYSTEMD_DIR say.
 fn fake_mayfly(version: &str, check_exit: i32) -> String {
     format!(
-        "#!/bin/sh\ncase \"$1\" in\n  version) echo \"mayfly {version}\" ;;\n  check) echo \"check says {check_exit}\"; exit {check_exit} ;;\nesac\n"
+        "#!/bin/sh\nset -e\ncase \"$1\" in\n  version) echo \"mayfly {version}\" ;;\n  check) echo \"check says {check_exit}\"; exit {check_exit} ;;\n  install)\n    here=$3\n    cp \"$here/mayfly\" \"$MAYFLY_SBIN/mayfly\"\n    cp \"$here/mayfly.sh\" \"$MAYFLY_SHARE/mayfly.sh\"\n    cp \"$here/mayfly-update.service\" \"$here/mayfly-update.timer\" \"$MAYFLY_SYSTEMD_DIR/\" ;;\nesac\n"
     )
 }
 
-/// The release tarball of version `v`: a fake command, mayfly.sh, the update units and an install.sh that
-/// copies them where MAYFLY_SBIN, MAYFLY_SHARE and MAYFLY_SYSTEMD_DIR say.
+/// The release tarball of version `v`: a fake command (see `fake_mayfly`), mayfly.sh and the update units.
 fn release_tarball(v: &str, mayfly: &str) -> Vec<u8> {
-    let install = "#!/bin/sh\nset -e\nhere=$(cd \"$(dirname \"$0\")\" && pwd)\n\
-        cp \"$here/mayfly\" \"$MAYFLY_SBIN/mayfly\"\n\
-        cp \"$here/mayfly.sh\" \"$MAYFLY_SHARE/mayfly.sh\"\n\
-        cp \"$here/mayfly-update.service\" \"$here/mayfly-update.timer\" \"$MAYFLY_SYSTEMD_DIR/\"\n";
     let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut b = tar::Builder::new(enc);
-    let files: [(&str, &str, u32); 5] = [
+    let files: [(&str, &str, u32); 4] = [
         ("mayfly", mayfly, 0o755),
         ("mayfly.sh", "new mayfly.sh\n", 0o755),
-        ("install.sh", install, 0o755),
         ("mayfly-update.service", "new update service\n", 0o644),
         ("mayfly-update.timer", "new update timer\n", 0o644),
     ];
@@ -1681,4 +1676,431 @@ fn update_refuses_bad_arguments() {
     let o = h.update(1, &["--check"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(text(&o).1.contains("cannot look up the release"));
+}
+
+// ------------------------------------------------------------------ install
+
+const UNIT_FILES: [&str; 5] = [
+    "mayfly-slot@.service",
+    "mayfly-gc.service",
+    "mayfly-gc.timer",
+    "mayfly-update.service",
+    "mayfly-update.timer",
+];
+const TEMPLATE_FILES: [&str; 5] = [
+    "provision.sh",
+    "ci-job.sh",
+    "pod-vm.sh",
+    "mayfly-job.service",
+    "template.env",
+];
+
+/// A release directory and a Proxmox host in a temporary directory: stubs for `id`, `qm`, `apt-get`,
+/// `pvesh`, `pvesm` and `systemctl` on PATH log their calls in `calls.log`; the snippet storage's content
+/// types are in `store` (`pvesm set` changes them).
+struct Install {
+    root: PathBuf,
+}
+
+impl Install {
+    fn new(name: &str) -> Install {
+        let i = Install { root: tmp(name) };
+        let src = i.src();
+        write(src.join("mayfly.sh"), "new mayfly.sh\n");
+        fs::set_permissions(src.join("mayfly.sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        for f in TEMPLATE_FILES {
+            write(src.join("template").join(f), &format!("template {f}\n"));
+        }
+        write(
+            src.join("profiles/default/provision.sh"),
+            "profile provision\n",
+        );
+        fs::set_permissions(
+            src.join("profiles/default/provision.sh"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        write(src.join("profiles/default/template.env"), "profile env\n");
+        fs::set_permissions(
+            src.join("profiles/default/template.env"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        for u in UNIT_FILES {
+            write(src.join(u), &format!("unit {u}\n"));
+        }
+        write(src.join("pool.env.example"), "APP_ID=\nORG=\n");
+        write(src.join("slots.conf.example"), "# slots\n");
+        let stub = |name: &str, body: &str| {
+            let p = i.root.join("bin").join(name);
+            write(&p, &format!("#!/bin/sh\n{body}\n"));
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stub("id", "echo 0");
+        stub("qm", "exit 0");
+        stub("apt-get", "echo \"apt-get $*\" >>\"$CALLS\"");
+        stub(
+            "pvesh",
+            "echo \"pvesh $*\" >>\"$CALLS\"\nprintf '{\"content\":\"%s\"}\\n' \"$(cat \"$STORE\")\"",
+        );
+        stub(
+            "pvesm",
+            "echo \"pvesm $*\" >>\"$CALLS\"\n[ \"$1\" != set ] || printf %s \"$4\" >\"$STORE\"",
+        );
+        stub("systemctl", "echo \"systemctl $*\" >>\"$CALLS\"");
+        i.store("iso,vztmpl");
+        i
+    }
+
+    fn src(&self) -> PathBuf {
+        self.root.join("src")
+    }
+    fn conf(&self) -> PathBuf {
+        self.root.join("conf")
+    }
+    fn share(&self) -> PathBuf {
+        self.root.join("share")
+    }
+    fn sbin(&self) -> PathBuf {
+        self.root.join("sbin")
+    }
+    fn units(&self) -> PathBuf {
+        self.root.join("units")
+    }
+    fn store(&self, content: &str) {
+        write(self.root.join("store"), content);
+    }
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(self.root.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+    fn clear_calls(&self) {
+        let _ = fs::remove_file(self.root.join("calls.log"));
+    }
+    fn read(&self, p: PathBuf) -> String {
+        fs::read_to_string(p).unwrap_or_else(|_| "<missing>".to_string())
+    }
+    fn mode(&self, p: PathBuf) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// `mayfly install <args>` from the release directory.
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        let mut c = self.command(args);
+        c.arg("--from").arg(self.src());
+        run_retry(&mut c)
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_mayfly"));
+        c.arg("install")
+            .args(args)
+            .env("MAYFLY_SHARE", self.share())
+            .env("MAYFLY_CONF_DIR", self.conf())
+            .env("MAYFLY_SBIN", self.sbin())
+            .env("MAYFLY_SYSTEMD_DIR", self.units())
+            .env("CALLS", self.root.join("calls.log"))
+            .env("STORE", self.root.join("store"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("NO_COLOR")
+            .env_remove("MAYFLY_REPO_URL")
+            .stdin(std::process::Stdio::null());
+        c
+    }
+
+    /// Names in a directory, sorted; nothing is left over from the atomic writes.
+    fn names(&self, dir: PathBuf) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+impl Drop for Install {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+const V: &str = env!("CARGO_PKG_VERSION");
+
+#[test]
+fn the_first_install_creates_the_files_and_enables_the_timers() {
+    let i = Install::new("install-first");
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    let c = i.conf().display().to_string();
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert_eq!(
+        out,
+        format!(
+            "\u{203a} installing Mayfly {V}\n\
+             \u{2713} storage local now holds snippets\n\
+             \u{2713} Mayfly {V} installed, created pool.env slots.conf in {c}\n\
+             \nNext\n\
+             \x20 1. GitHub App private key to {c}/app.pem (chmod 600)\n\
+             \x20 2. APP_ID and ORG (or REPO) in {c}/pool.env\n\
+             \x20 3. slots in {c}/slots.conf\n\
+             \x20 4. mayfly check\n\
+             \x20 5. mayfly template build, then mayfly template promote <vmid>\n\
+             \x20 6. mayfly enable\n\
+             \x20 Getting started: https://github.com/variiuz/mayfly#get-started\n"
+        )
+    );
+    assert_eq!(err, "");
+    assert_eq!(
+        i.calls(),
+        [
+            "apt-get install -y -q jq curl openssl",
+            "pvesh get /storage/local --output-format json",
+            "pvesm set local --content iso,vztmpl,snippets",
+            "systemctl daemon-reload",
+            "systemctl enable -q --now mayfly-update.timer",
+            "systemctl enable -q --now mayfly-gc.timer",
+        ]
+    );
+    for (d, m) in [
+        (i.conf(), 0o700),
+        (i.conf().join("env"), 0o700),
+        (i.conf().join("hooks.d"), 0o755),
+        (i.conf().join("profiles"), 0o755),
+        (i.share().join("profiles"), 0o755),
+        (i.share().join("profiles/default"), 0o755),
+    ] {
+        assert_eq!(i.mode(d.clone()), m, "{}", d.display());
+    }
+    // The binary is a copy of the one that ran, the rest comes from the release directory.
+    assert_eq!(
+        fs::read(i.sbin().join("mayfly")).unwrap(),
+        fs::read(env!("CARGO_BIN_EXE_mayfly")).unwrap()
+    );
+    assert_eq!(i.mode(i.sbin().join("mayfly")), 0o755);
+    assert_eq!(i.read(i.share().join("mayfly.sh")), "new mayfly.sh\n");
+    assert_eq!(i.mode(i.share().join("mayfly.sh")), 0o755);
+    for f in TEMPLATE_FILES {
+        assert_eq!(i.read(i.share().join(f)), format!("template {f}\n"));
+        assert_eq!(i.mode(i.share().join(f)), 0o644, "{f}");
+    }
+    assert_eq!(
+        i.read(i.share().join("profiles/default/provision.sh")),
+        "profile provision\n"
+    );
+    assert_eq!(
+        i.mode(i.share().join("profiles/default/provision.sh")),
+        0o755
+    );
+    assert_eq!(
+        i.mode(i.share().join("profiles/default/template.env")),
+        0o644
+    );
+    for u in UNIT_FILES {
+        assert_eq!(i.read(i.units().join(u)), format!("unit {u}\n"));
+        assert_eq!(i.mode(i.units().join(u)), 0o644, "{u}");
+    }
+    assert_eq!(i.read(i.conf().join("pool.env")), "APP_ID=\nORG=\n");
+    assert_eq!(i.mode(i.conf().join("pool.env")), 0o600);
+    assert_eq!(i.read(i.conf().join("slots.conf")), "# slots\n");
+    assert_eq!(i.mode(i.conf().join("slots.conf")), 0o644);
+    assert_eq!(i.names(i.sbin()), ["mayfly"]);
+    assert_eq!(i.names(i.units()).len(), 5);
+    assert_eq!(i.names(i.share()).len(), 7);
+}
+
+#[test]
+fn a_second_install_keeps_the_config_the_timers_and_your_profiles() {
+    let i = Install::new("install-second");
+    assert_eq!(i.run(&[]).status.code(), Some(0));
+    write(i.conf().join("pool.env"), "APP_ID=7\nORG=acme\n");
+    write(i.conf().join("slots.conf"), "a-1 9001 x 1 1 1 no current\n");
+    write(i.conf().join("app.pem"), "key\n");
+    write(i.conf().join("profiles/mine/provision.sh"), "mine\n");
+    // A profile that is no longer shipped goes, and a changed one is replaced.
+    write(i.share().join("profiles/gone/provision.sh"), "old\n");
+    write(i.share().join("profiles/default/provision.sh"), "stale\n");
+    write(i.share().join("mayfly.sh"), "stale\n");
+    i.clear_calls();
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert_eq!(
+        out,
+        format!("\u{203a} installing Mayfly {V} (was {V})\n\u{2713} Mayfly {V} installed\n")
+    );
+    assert_eq!(
+        i.calls(),
+        [
+            "apt-get install -y -q jq curl openssl",
+            "pvesh get /storage/local --output-format json",
+            "systemctl daemon-reload",
+        ]
+    );
+    assert_eq!(i.read(i.conf().join("pool.env")), "APP_ID=7\nORG=acme\n");
+    assert_eq!(
+        i.read(i.conf().join("slots.conf")),
+        "a-1 9001 x 1 1 1 no current\n"
+    );
+    assert_eq!(
+        i.read(i.conf().join("profiles/mine/provision.sh")),
+        "mine\n"
+    );
+    assert_eq!(i.names(i.share().join("profiles")), ["default"]);
+    assert_eq!(
+        i.read(i.share().join("profiles/default/provision.sh")),
+        "profile provision\n"
+    );
+    assert_eq!(i.read(i.share().join("mayfly.sh")), "new mayfly.sh\n");
+}
+
+#[test]
+fn no_timer_leaves_the_gc_timer_off() {
+    let i = Install::new("install-no-timer");
+    let o = i.run(&["--no-timer"]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.ends_with("! gc timer is off (--no-timer); mayfly enable starts it\n"),
+        "{out}"
+    );
+    let calls = i.calls();
+    assert!(calls.contains(&"systemctl disable -q --now mayfly-gc.timer".to_string()));
+    assert!(!calls.contains(&"systemctl enable -q --now mayfly-gc.timer".to_string()));
+    // The update timer is not the gc timer's business.
+    assert!(calls.contains(&"systemctl enable -q --now mayfly-update.timer".to_string()));
+    // Still a first install: the list of next steps is there.
+    assert!(out.contains("\nNext\n"), "{out}");
+}
+
+#[test]
+fn update_off_keeps_the_update_timer_off() {
+    let i = Install::new("install-update-off");
+    write(
+        i.conf().join("pool.env"),
+        "UPDATE=\"off\" # by hand\nAPP_ID=1\n",
+    );
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    let calls = i.calls();
+    assert!(
+        !calls.iter().any(|c| c.contains("mayfly-update.timer")),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"systemctl enable -q --now mayfly-gc.timer".to_string()));
+    // pool.env was there, so only slots.conf is created; APP_ID is set, so step 2 is not listed.
+    let c = i.conf().display().to_string();
+    assert!(
+        out.contains(&format!("installed, created slots.conf in {c}\n")),
+        "{out}"
+    );
+    assert!(!out.contains("APP_ID and ORG"), "{out}");
+    assert_eq!(
+        i.read(i.conf().join("pool.env")),
+        "UPDATE=\"off\" # by hand\nAPP_ID=1\n"
+    );
+}
+
+#[test]
+fn the_update_timer_is_enabled_when_its_units_are_new() {
+    let i = Install::new("install-update-timer");
+    assert_eq!(i.run(&[]).status.code(), Some(0));
+    fs::remove_file(i.units().join("mayfly-update.timer")).unwrap();
+    i.clear_calls();
+    assert_eq!(i.run(&[]).status.code(), Some(0));
+    assert_eq!(
+        i.calls(),
+        [
+            "apt-get install -y -q jq curl openssl",
+            "pvesh get /storage/local --output-format json",
+            "systemctl daemon-reload",
+            "systemctl enable -q --now mayfly-update.timer",
+        ]
+    );
+}
+
+#[test]
+fn snippets_content_is_added_once_to_the_snippet_storage() {
+    let i = Install::new("install-snippets");
+    write(
+        i.conf().join("pool.env"),
+        "SNIPPET_STORAGE=tank\nSNIPPET_STORAGE=fast\n",
+    );
+    i.store("images,rootdir");
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.contains("\u{2713} storage fast now holds snippets\n"),
+        "{out}"
+    );
+    let calls = i.calls();
+    assert!(calls.contains(&"pvesh get /storage/fast --output-format json".to_string()));
+    assert!(calls.contains(&"pvesm set fast --content images,rootdir,snippets".to_string()));
+    assert_eq!(i.read(i.root.join("store")), "images,rootdir,snippets");
+    i.clear_calls();
+    let o = i.run(&[]);
+    let (out, _) = text(&o);
+    assert!(!out.contains("snippets"), "{out}");
+    assert!(!i.calls().iter().any(|c| c.starts_with("pvesm")));
+}
+
+#[test]
+fn install_refuses_without_root_qm_or_files() {
+    let i = Install::new("install-refuse");
+    write(i.root.join("bin/id"), "#!/bin/sh\necho 1\n");
+    let o = i.run(&[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).1.contains("run as root"));
+    write(i.root.join("bin/id"), "#!/bin/sh\necho 0\n");
+    fs::set_permissions(i.root.join("bin/id"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(i.root.join("bin/qm")).unwrap();
+    let mut c = i.command(&[]);
+    c.env("PATH", i.root.join("bin")).arg("--from").arg(i.src());
+    let o = run_retry(&mut c);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).1.contains("not a Proxmox host (qm is missing)"));
+    write(i.root.join("bin/qm"), "#!/bin/sh\n");
+    fs::set_permissions(i.root.join("bin/qm"), fs::Permissions::from_mode(0o755)).unwrap();
+    // No --from and no mayfly.sh next to the binary, a directory without mayfly.sh, an unknown argument.
+    let o = run_retry(&mut i.command(&[]));
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        text(&o).1.contains("no mayfly.sh next to"),
+        "{:?}",
+        text(&o)
+    );
+    let o = run_retry(i.command(&[]).arg("--from").arg(i.root.join("bin")));
+    assert!(text(&o).1.contains("has no mayfly.sh"), "{:?}", text(&o));
+    let o = i.run(&["--frobnicate"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).1.contains("unknown argument --frobnicate"));
+    assert!(!i.sbin().exists() && !i.conf().exists());
+    assert!(i.calls().is_empty());
+}
+
+#[test]
+fn a_failing_command_stops_the_install_with_its_exit_code() {
+    let i = Install::new("install-fails");
+    write(
+        i.root.join("bin/pvesm"),
+        "#!/bin/sh\necho 'no such storage' >&2\nexit 7\n",
+    );
+    fs::set_permissions(i.root.join("bin/pvesm"), fs::Permissions::from_mode(0o755)).unwrap();
+    let o = i.run(&[]);
+    assert_eq!(o.status.code(), Some(7));
+    assert!(text(&o).1.contains("no such storage"));
+    // Nothing after the failed step ran.
+    assert!(!i.calls().iter().any(|c| c.starts_with("systemctl")));
 }

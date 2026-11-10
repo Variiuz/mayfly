@@ -3,6 +3,9 @@
 # one fixture (stubs for qm, pct, pvesm, pvesh, systemctl, ip, pve-firewall and a local GitHub) and
 # compares stdout, stderr and the exit code. gc, enable and disable run against stubs that record every
 # call: the recorded calls, the requests the fake GitHub saw and the files left behind are compared too.
+# install: the bash install.sh of 0.4.1 (tests/fixtures/install-0.4.1.sh) and `mayfly install` run against
+# the same stub root; stdout, stderr, the exit code, the stub calls and the tree they leave (paths, modes,
+# link targets, checksums) are compared.
 # Usage: bash tests/parity.sh [path to the mayfly binary]   (default target/release/mayfly)
 set -uo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -425,6 +428,99 @@ PRE=pre_active same_state "disable a-1, b-1 still active" disable a-1
 PRE=pre_no_slots same_state "enable without slots" enable
 PRE=pre_no_slots same_state "disable without slots" disable
 PRE=pre_no_slots same_state "enable a slot that is not there" enable a-1
+
+# ---- install: the bash install.sh of 0.4.1 against `mayfly install`
+# One release directory holds this checkout's files, the binary and the old install.sh (made to read
+# MAYFLY_CONF_DIR like the binary does; the 0.4.1 script has /etc/mayfly built in). Stubs for id, qm,
+# apt-get, pvesh, pvesm and systemctl log every call; `pvesm set` changes the storage's content types.
+w=$t/w
+mkdir -p "$w/bin" "$w/rel"
+stub() { printf '#!/bin/sh\n%s\n' "$2" >"$w/bin/$1"; chmod +x "$w/bin/$1"; }
+stub id 'echo 0'
+stub qm 'exit 0'
+stub apt-get 'echo "apt-get $*" >>"$CALLS"'
+stub pvesh 'echo "pvesh $*" >>"$CALLS"; printf "{\"content\":\"%s\"}\n" "$(cat "$STORE")"'
+stub pvesm 'echo "pvesm $*" >>"$CALLS"; [ "$1" != set ] || printf %s "$4" >"$STORE"'
+stub systemctl 'echo "systemctl $*" >>"$CALLS"'
+cp -r "$here/template" "$here/profiles" "$here/mayfly.sh" "$here"/mayfly-*.service "$here"/mayfly-*.timer \
+  "$here"/pool.env.example "$here"/slots.conf.example "$w/rel/"
+cp "$bin" "$w/rel/mayfly"
+sed 's#^conf=/etc/mayfly$#conf=${MAYFLY_CONF_DIR:-/etc/mayfly}#' "$here/tests/fixtures/install-0.4.1.sh" >"$w/rel/install.sh"
+grep -q '^conf=\${MAYFLY_CONF_DIR' "$w/rel/install.sh" || { echo "could not patch the old install.sh" >&2; exit 2; }
+root=$w/root
+instenv=("PATH=$w/bin:$PATH" "CALLS=$w/calls" "STORE=$w/store" "MAYFLY_SBIN=$root/sbin" "MAYFLY_SHARE=$root/share"
+  "MAYFLY_SYSTEMD_DIR=$root/units" "MAYFLY_CONF_DIR=$root/conf")
+
+# The host the install starts from; $1 is a function that changes it, $2... the command.
+inst_run() {
+  local p=$1 pre=$2
+  shift 2
+  rm -rf "$root"
+  mkdir -p "$root"
+  printf %s 'iso,vztmpl' >"$w/store"
+  [ -z "$pre" ] || "$pre"
+  : >"$w/calls"
+  env "${instenv[@]}" "$@" >"$p.out" 2>"$p.err" </dev/null
+  echo "$?" >"$p.rc"
+  {
+    echo "--- calls"
+    cat "$w/calls"
+    echo "--- storage"
+    cat "$w/store"
+    echo "--- tree"
+    (cd "$root" && find . -printf '%p %m %y %l\n' | sort)
+    echo "--- contents"
+    (cd "$root" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+  } >"$p.state"
+}
+
+same_install() {
+  local name=$1 pre=$2 ok=1 f
+  shift 2
+  inst_run "$t/xb" "$pre" bash "$w/rel/install.sh" "$@"
+  inst_run "$t/xr" "$pre" "$w/rel/mayfly" install --from "$w/rel" "$@"
+  n=$((n + 1))
+  for f in out err rc state; do cmp -s "$t/xb.$f" "$t/xr.$f" || ok=0; done
+  if [ "$ok" = 1 ]; then
+    echo "ok   $name (exit $(cat "$t/xb.rc"), $(wc -l <"$t/xb.out") lines, $(wc -l <"$t/xb.state") lines of state)"
+  else
+    echo "FAIL $name: bash exit $(cat "$t/xb.rc"), rust exit $(cat "$t/xr.rc")"
+    for f in out err rc state; do
+      diff -u --label "bash $f" --label "rust $f" "$t/xb.$f" "$t/xr.$f" | head -40
+    done
+    fails=$((fails + 1))
+  fi
+}
+
+# An installed host: a first install by the binary, then your own config and a stale share directory.
+pre_installed() {
+  env "${instenv[@]}" "$w/rel/mayfly" install --from "$w/rel" >/dev/null 2>&1 </dev/null
+  printf 'APP_ID=7\nORG=acme\n' >"$root/conf/pool.env"
+  echo 'a-1 9001 x 1 1 1 no current' >"$root/conf/slots.conf"
+  mkdir -p "$root/conf/profiles/mine" "$root/share/profiles/gone"
+  echo mine >"$root/conf/profiles/mine/provision.sh"
+  echo old >"$root/share/profiles/gone/provision.sh"
+  echo stale >"$root/share/profiles/default/provision.sh"
+  echo stale >"$root/share/mayfly.sh"
+}
+pre_no_update_units() {
+  pre_installed
+  rm "$root/units/mayfly-update.timer"
+}
+pre_pool_env() { # a pool.env that is already there, in a config directory that is 0700 like install makes it
+  install -d -m 0700 "$root/conf"
+  printf '%s\n' "$POOL_ENV_TEXT" >"$root/conf/pool.env"
+}
+pre_snippets_there() { printf %s 'iso,snippets,vztmpl' >"$w/store"; }
+
+same_install "install, first" ""
+same_install "install --no-timer, first" "" --no-timer
+same_install "install, second" pre_installed
+same_install "install --no-timer, second" pre_installed --no-timer
+same_install "install, second, update units new" pre_no_update_units
+POOL_ENV_TEXT='UPDATE="off" # by hand' same_install "install, UPDATE=off" pre_pool_env
+POOL_ENV_TEXT=$'APP_ID=3\nSNIPPET_STORAGE=tank\nUPDATE=patch' same_install "install, SNIPPET_STORAGE and APP_ID set" pre_pool_env
+same_install "install, snippets already there" pre_snippets_there
 
 echo
 echo "$((n - fails))/$n identical"

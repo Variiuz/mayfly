@@ -16,8 +16,8 @@ On the Proxmox host, as root:
 curl -fsSL https://github.com/variiuz/mayfly/releases/latest/download/install.sh | bash
 ```
 
-The installer downloads the latest release, verifies it against `SHA256SUMS`, installs `mayfly` and its
-units, and creates `/etc/mayfly`. It does not start any unit or touch any guest. To update, run it
+The installer downloads the latest release, verifies it against `SHA256SUMS` and runs its
+`mayfly install`, which installs `mayfly` and its units and creates `/etc/mayfly`. It does not start any unit or touch any guest. To update, run it
 again; configuration, slots and running jobs are kept.
 
 ## Setup
@@ -240,7 +240,7 @@ latency breaks file-lock and timing tests, even with `DISK_CACHE=unsafe`.
 
 `mayfly update` installs the latest release: it downloads `mayfly-<version>.tar.gz` and `SHA256SUMS`
 from the GitHub release (no token), checks the checksum, runs the new `mayfly version`, saves the
-installed files in `/usr/local/share/mayfly/previous/` and runs the release's `install.sh`. Running slots
+installed files in `/usr/local/share/mayfly/previous/` and runs the new `mayfly install --from <release>`. Running slots
 are not restarted; they use the new command from their next job. Then it runs the new `mayfly check`: if
 the old one passed and the new one fails, everything is restored, the version is skipped and the exit code is 1.
 
@@ -266,7 +266,7 @@ update to `mayfly update` by hand (`--check` says so too). It also waits when th
 version it removed. `mayfly status` ends with the installed version and the last attempt.
 
 Tests and other installs can move the paths: `MAYFLY_SBIN`, `MAYFLY_SHARE`, `MAYFLY_SYSTEMD_DIR`,
-`MAYFLY_STATE_DIR`, `MAYFLY_TMP` (default `/var/tmp`), `MAYFLY_RELEASE_API` and `MAYFLY_REPO_URL`.
+`MAYFLY_CONF_DIR`, `MAYFLY_STATE_DIR`, `MAYFLY_TMP` (default `/var/tmp`), `MAYFLY_RELEASE_API` and `MAYFLY_REPO_URL`.
 
 ## Releases
 
@@ -281,10 +281,14 @@ curl -fsSL https://github.com/variiuz/mayfly/releases/download/v0.1.0/install.sh
 To install from a checkout (the binary is built with `cargo` when the host has it, otherwise the released
 binary of the checkout's version is downloaded and checked against `SHA256SUMS`):
 `scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/install.sh`.
+`install.sh` only finds and checks the files; `mayfly install [--no-timer] [--from <dir>]` does the rest
+(`<dir>` is a release or checkout directory with `mayfly.sh`; by default the directory of the binary).
 
 Tests run without Proxmox: `cargo test` and `bash tests/run.sh`. `bash tests/parity.sh` checks that the
 binary and `mayfly.sh` print the same for `version`, `help`, `status`, `check`, `gc`, `enable` and `disable`
-(for the last three it also compares the commands the stubs recorded and the files left behind).
+(for the last three it also compares the commands the stubs recorded and the files left behind). It also
+runs the 0.4.1 `install.sh` (`tests/fixtures/install-0.4.1.sh`) and `mayfly install` against the same stub
+root and compares what they print, the calls and the resulting files.
 
 ## License
 
