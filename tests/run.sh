@@ -294,8 +294,8 @@ echo "systemd-run \$*" >>"$t/systemd-run.log"
 STUB
 chmod +x "$t/bin/systemd-run"
 : >"$t/systemctl.log"
-(unset INVOCATION_ID; cmd_template build polara --lxc) >/dev/null 2>&1; rc=$?
-ok "template build runs detached in mayfly-template-build, with --foreground" '[ "$rc" = 0 ] && grep -q -- "--unit=mayfly-template-build .*template build polara --lxc --foreground$" "$t/systemd-run.log"'
+(unset INVOCATION_ID; cmd_template build ci --lxc) >/dev/null 2>&1; rc=$?
+ok "template build runs detached in mayfly-template-build, with --foreground" '[ "$rc" = 0 ] && grep -q -- "--unit=mayfly-template-build .*template build ci --lxc --foreground$" "$t/systemd-run.log"'
 ok "template build passes the config dir to the unit" 'grep -q -- "--setenv=MAYFLY_CONF_DIR=$t/conf" "$t/systemd-run.log"'
 rm -f "$t/bin/systemd-run"
 # ---- provision.sh: template.env values reach the profile's provision.sh (a child bash)

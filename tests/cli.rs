@@ -903,7 +903,7 @@ fn a_missing_script_is_a_clear_error() {
     );
 }
 
-// ------------------------------------------------------------------ GitHub column, polara-ci templates
+// ------------------------------------------------------------------ GitHub column, foreign templates
 
 #[test]
 fn status_github_column() {
@@ -969,7 +969,7 @@ fn status_colours_the_github_column() {
 }
 
 #[test]
-fn check_warns_about_polara_ci_templates() {
+fn check_flags_templates_mayfly_did_not_build() {
     let dir = tmp("key6");
     let (key, _) = make_key(&dir, false);
     let gh = fake_github(200);
@@ -978,7 +978,7 @@ fn check_warns_about_polara_ci_templates() {
     env.push_str("NEXT_TEMPLATE_VMID=9099\n");
     write(&f.paths.pool_env, &env);
     f.guest("qemu-server", "9099");
-    // 9098 has no "description: profile", 9099 has one; a container template is never flagged.
+    // 9098 has no "description: profile", 9099 has one.
     let pve = pve
         .answer("qm config 9098", "name: ci-template\ntemplate: 1\n")
         .answer(
@@ -993,7 +993,7 @@ fn check_warns_about_polara_ci_templates() {
         .unwrap();
     assert_eq!(
         lines[at + 1],
-        "warn template  9098 was built by polara-ci; jobs get its /etc/polara-ci paths. Rebuild: mayfly template build"
+        "bad  template  9098 was not built by mayfly template build; its jobs may never start. Build one and promote it"
     );
     assert_eq!(lines[at + 2], "ok   profile   default");
     // Both templates built here: no warning.
@@ -1002,7 +1002,7 @@ fn check_warns_about_polara_ci_templates() {
         "name: ci-template\ndescription: profile default\ntemplate: 1\n",
     );
     let (_, out) = f.run_check(&pve).unwrap();
-    assert!(!out.contains("polara-ci"), "{out}");
+    assert!(!out.contains("not built by mayfly"), "{out}");
 }
 
 // ------------------------------------------------------------------ mayfly update
