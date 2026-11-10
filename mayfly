@@ -824,6 +824,89 @@ paint() {
   printf '%s%-*s%s' "$c" "$width" "$text" "${c:+$C_0}"
 }
 
+# pool.env as the next Mayfly reads it: plain text, never run as shell. Accepted: blank lines, # comment
+# lines, [export ]KEY=value with the value bare (no spaces or shell syntax, optionally followed by
+# " # comment"), in one pair of "..." (no $, backtick or backslash) or in one pair of '...'.
+# pool_env_value <text after the =>: the reason it is refused, or nothing.
+pool_env_value() {
+  local v=$1 inner rest tok
+  local re_dq='^"([^"]*)"(.*)$' re_sq="^'([^']*)'(.*)\$" re_tok='^([^[:space:]]*)(.*)$' re_end='^([[:space:]]+#.*|[[:space:]]*)$'
+  case $v in
+    \"*)
+      [[ $v =~ $re_dq ]] || { echo 'unterminated double quote'; return 0; }
+      inner=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
+      case $inner in *\$*|*\`*|*\\*) echo '$, backtick or backslash inside double quotes'; return 0 ;; esac
+      [[ $rest =~ $re_end ]] || echo 'text after the closing quote'
+      ;;
+    \'*)
+      [[ $v =~ $re_sq ]] || { echo 'unterminated single quote'; return 0; }
+      rest=${BASH_REMATCH[2]}
+      [[ $rest =~ $re_end ]] || echo 'text after the closing quote'
+      ;;
+    *)
+      case $v in *\\) echo 'line continuation'; return 0 ;; esac
+      [[ $v =~ $re_tok ]]
+      tok=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
+      case $tok in
+        *\$*|*\`*) echo 'variable or command substitution'; return 0 ;;
+        *\\*) echo 'backslash in an unquoted value'; return 0 ;;
+        *\"*|*\'*) echo 'quote inside an unquoted value'; return 0 ;;
+        *\;*|*\&*|*\|*) echo 'more than one command on a line'; return 0 ;;
+        *\<*|*\>*|*\(*|*\)*) echo 'shell syntax in an unquoted value'; return 0 ;;
+        \~*|*:\~*) echo '~ is not expanded'; return 0 ;;
+      esac
+      if ! [[ $rest =~ $re_end ]]; then
+        case $rest in
+          *\;*|*\&*|*\|*) echo 'more than one command on a line' ;;
+          *) if [[ $rest =~ ^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*= ]]; then echo 'more than one assignment on a line'
+             else echo 'spaces in an unquoted value (quote it)'; fi ;;
+        esac
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# One "<line number><TAB><reason>" per line of $POOL_ENV that the next Mayfly would refuse.
+pool_env_scan() {
+  local n=0 line text key why
+  [ -r "$POOL_ENV" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    why=""
+    if [[ $line == *$'\r' ]]; then
+      why='carriage return (Windows line ending)'
+    else
+      text=${line#"${line%%[![:space:]]*}"}
+      if [ -z "$text" ] || [[ $text == "#"* ]]; then continue; fi
+      if [[ $text =~ ^export[[:space:]]+(.*)$ ]]; then text=${BASH_REMATCH[1]}; fi
+      if [[ $text =~ ^[A-Za-z_][A-Za-z0-9_]*=(.*)$ ]]; then
+        why=$(pool_env_value "${BASH_REMATCH[1]}")
+      else
+        key=${text%%=*}
+        if [[ $text != *=* ]]; then why='not a KEY=value assignment'
+        elif [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*[[:space:]]+$ ]]; then why='space before ='
+        elif [[ $key =~ ^[^[:space:]]+$ ]]; then why='KEY is letters, digits and _, not starting with a digit'
+        else why='not a KEY=value assignment'; fi
+      fi
+    fi
+    if [ -n "$why" ]; then printf '%d\t%s\n' "$n" "$why"; fi
+  done <"$POOL_ENV"
+}
+
+# `mayfly check`: a warning per pool.env line the next Mayfly would refuse (this one still sources the
+# file, so nothing changes yet). Five lines at most, then a count.
+check_pool_env() {
+  local bad b
+  mapfile -t bad < <(pool_env_scan)
+  [ ${#bad[@]} -gt 0 ] || return 0
+  for b in "${bad[@]:0:5}"; do
+    item warn pool.env "line ${b%%$'\t'*}: ${b#*$'\t'}; the next Mayfly reads pool.env as plain KEY=value"
+  done
+  if [ ${#bad[@]} -gt 5 ]; then item warn pool.env "and $((${#bad[@]} - 5)) more lines that are not plain KEY=value"; fi
+  return 0
+}
+
 cmd_check() {
   local jwt token count fw app name line vmid envspec extra e kind p n
   load_env
@@ -836,6 +919,7 @@ cmd_check() {
     die "App $app cannot list the runners of $SCOPE; check its permissions"
   unset token
   item ok GitHub "App $app, $count runners in ${SCOPE#*/}"
+  check_pool_env
   if pvesm status --storage "$STORAGE" >/dev/null 2>&1; then
     p=$(pool_percent)
     if [ "$p" -ge "$MAX_POOL_PERCENT" ]; then item warn storage "$STORAGE ${p}% used, over the ${MAX_POOL_PERCENT}% limit: no new VMs"
