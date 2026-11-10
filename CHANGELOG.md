@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/Variiuz/mayfly/compare/v0.7.0...v0.8.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* a host whose current template was not built by Mayfly stops starting jobs. Build and promote a Mayfly template before updating.
+
+### Bug Fixes
+
+* clear errors for a missing lxc image and a failed old-template removal ([#32](https://github.com/Variiuz/mayfly/issues/32)) ([157aa48](https://github.com/Variiuz/mayfly/commit/157aa488fc48cc532d43a99c5048bf7a9d0a3e7a))
+* drop the polara-ci template fallback ([#14](https://github.com/Variiuz/mayfly/issues/14)) ([e7cebf9](https://github.com/Variiuz/mayfly/commit/e7cebf9b46c341a8bafb859e0ea24e93cd2cf144))
+
 ## [0.7.0](https://github.com/Variiuz/mayfly/compare/v0.6.0...v0.7.0) (2026-11-10)
 
 
