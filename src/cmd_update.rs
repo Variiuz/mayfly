@@ -93,6 +93,8 @@ pub struct State {
     pub last_result: String,
     /// A version that failed `mayfly check` and was rolled back; the timer does not try it again.
     pub skipped: String,
+    /// The release the timer left alone because it is breaking (with `last_result=breaking`).
+    pub breaking: String,
 }
 
 pub fn state_path(paths: &Paths) -> String {
@@ -111,6 +113,7 @@ impl State {
                 "last_attempt" => s.last_attempt = v.trim().to_string(),
                 "last_result" => s.last_result = v.trim().to_string(),
                 "skipped" => s.skipped = v.trim().to_string(),
+                "breaking" => s.breaking = v.trim().to_string(),
                 _ => {}
             }
         }
@@ -125,6 +128,9 @@ impl State {
         );
         if !self.skipped.is_empty() {
             text.push_str(&format!("skipped={}\n", self.skipped));
+        }
+        if !self.breaking.is_empty() {
+            text.push_str(&format!("breaking={}\n", self.breaking));
         }
         let path = state_path(paths);
         let tmp = format!("{path}.tmp");
@@ -141,9 +147,19 @@ enum Skip {
 
 /// Notes an attempt in the state file. A state file that cannot be written is a warning, not a failure.
 fn record(paths: &Paths, result: &str, skip: Skip) {
+    save(paths, result, skip, "");
+}
+
+/// The timer found `version` breaking and left it alone.
+fn record_breaking(paths: &Paths, version: &str) {
+    save(paths, "breaking", Skip::Keep, version);
+}
+
+fn save(paths: &Paths, result: &str, skip: Skip, breaking: &str) {
     let mut s = State::read(paths);
     s.last_attempt = utc(now());
     s.last_result = result.to_string();
+    s.breaking = breaking.to_string();
     match skip {
         Skip::Keep => {}
         Skip::Clear => s.skipped.clear(),
@@ -159,6 +175,13 @@ pub fn status_text(paths: &Paths) -> String {
     let s = State::read(paths);
     if s.last_attempt.is_empty() {
         format!("{}, no update run yet", crate::VERSION)
+    } else if s.last_result == "breaking" && !s.breaking.is_empty() {
+        format!(
+            "{}, last {} breaking {} waits",
+            crate::VERSION,
+            s.last_attempt,
+            s.breaking
+        )
     } else {
         format!(
             "{}, last {} {}",
@@ -311,6 +334,82 @@ fn lookup(api: &str, version: Option<&str>) -> R<String> {
         return die(format!("{url}: the release tag \"{tag}\" is not v<x.y.z>"));
     }
     Ok(v.to_string())
+}
+
+/// A release whose notes have a release-please `BREAKING CHANGES` heading.
+struct Breaking {
+    version: String,
+    url: String,
+}
+
+/// True when a line of the release body is a markdown heading naming BREAKING CHANGES.
+fn has_breaking_section(body: &str) -> bool {
+    body.lines().any(|l| {
+        let l = l.trim_start();
+        l.starts_with('#') && l.contains("BREAKING CHANGES")
+    })
+}
+
+/// The oldest breaking release in `(current, target]`, from the release list (newest first, paged).
+/// Drafts and pre-releases do not count. Err when the list cannot be read.
+fn first_breaking(
+    api: &str,
+    repo: &str,
+    current: (u64, u64, u64),
+    target: (u64, u64, u64),
+) -> Result<Option<Breaking>, String> {
+    let mut found: Vec<((u64, u64, u64), Breaking)> = Vec::new();
+    for page in 1..=20 {
+        let url = if page == 1 {
+            format!("{api}/releases?per_page=100")
+        } else {
+            format!("{api}/releases?per_page=100&page={page}")
+        };
+        let mut body = fetch(&url, 30, true).map_err(|e| format!("{url}: {e}"))?;
+        let json: serde_json::Value = body
+            .read_json()
+            .map_err(|e| format!("unreadable answer from {url}: {e}"))?;
+        let list = json
+            .as_array()
+            .ok_or_else(|| format!("{url}: not a list of releases"))?;
+        let mut past = list.is_empty() || list.len() < 100;
+        for r in list {
+            let flag = |k: &str| r.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            if flag("draft") || flag("prerelease") {
+                continue;
+            }
+            let tag = r.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+            let version = tag.strip_prefix('v').unwrap_or(tag);
+            let Some(v) = parse_version(version) else {
+                continue;
+            };
+            if v <= current {
+                past = true;
+            } else if v <= target
+                && r.get("body")
+                    .and_then(|b| b.as_str())
+                    .is_some_and(has_breaking_section)
+            {
+                let link = r.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
+                let link = if link.is_empty() {
+                    format!("{repo}/releases/tag/v{version}")
+                } else {
+                    link.to_string()
+                };
+                found.push((
+                    v,
+                    Breaking {
+                        version: version.to_string(),
+                        url: link,
+                    },
+                ));
+            }
+        }
+        if past {
+            break;
+        }
+    }
+    Ok(found.into_iter().min_by_key(|f| f.0).map(|f| f.1))
 }
 
 fn download(url: &str, dest: &Path) -> R<()> {
@@ -590,11 +689,16 @@ fn update(paths: &Paths, o: &Opts, out: &Out, w: &mut dyn Write) -> R<i32> {
         return Ok(0);
     }
     if o.check {
+        // Best effort: when the release list cannot be read the line just stays plain.
+        let note = match first_breaking(api, repo, cv, tv) {
+            Ok(Some(_)) => " (breaking: run mayfly update by hand)",
+            _ => "",
+        };
         say(
             w,
             auto,
             &format!(
-                "mayfly {target} is available (installed {current}); mayfly update installs it"
+                "mayfly {target} is available (installed {current}); mayfly update installs it{note}"
             ),
         );
         return Ok(0);
@@ -617,6 +721,39 @@ fn update(paths: &Paths, o: &Opts, out: &Out, w: &mut dyn Write) -> R<i32> {
             &format!("mayfly {target} is skipped: it failed mayfly check here and was rolled back; mayfly update --version {target} tries it again"),
         );
         return Ok(0);
+    }
+
+    // The timer never takes a breaking release, the target or any one it skips over.
+    if auto {
+        match first_breaking(api, repo, cv, tv) {
+            Ok(None) => {}
+            Ok(Some(b)) => {
+                say(
+                    w,
+                    auto,
+                    &format!(
+                        "mayfly {target} needs a manual mayfly update (breaking: see release notes)"
+                    ),
+                );
+                say(
+                    w,
+                    auto,
+                    &format!("  first breaking release {}: {}", b.version, b.url),
+                );
+                record_breaking(paths, &target);
+                return Ok(0);
+            }
+            Err(e) => {
+                say(
+                    w,
+                    auto,
+                    &format!(
+                        "cannot tell whether mayfly {target} is breaking ({e}); not updating, mayfly update takes it by hand"
+                    ),
+                );
+                return Ok(0);
+            }
+        }
     }
 
     say(w, auto, &format!("updating mayfly {current} to {target}"));

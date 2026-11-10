@@ -255,8 +255,12 @@ the timer switches it on. `UPDATE` in `pool.env` sets what `--auto` does: `auto`
 release, `patch` only a newer patch of the installed `major.minor`, `off` nothing (also keeps the timer
 from being switched on). `mayfly update` by hand ignores `UPDATE`. `journalctl -u mayfly-update` has the log.
 
+`--auto` never installs a release whose notes have a `BREAKING CHANGES` section, nor one with such a
+release between it and the installed version; it logs that, records `last_result=breaking` and leaves the
+update to `mayfly update` by hand (`--check` says so too). It also waits when the release list cannot be read.
+
 `/var/lib/mayfly/update.state` holds `last_attempt`, `last_result` (`ok`, `up-to-date`, `rolled-back`,
-`failed`) and `skipped=<version>`. A skipped version is not installed again by the timer or by a plain
+`failed`, `breaking`) and `skipped=<version>`. A skipped version is not installed again by the timer or by a plain
 `mayfly update`; `mayfly update --version <version>` forces it. `mayfly update --rollback` skips the
 version it removed. `mayfly status` ends with the installed version and the last attempt.
 
