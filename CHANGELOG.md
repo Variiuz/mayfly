@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/Variiuz/mayfly/compare/v0.4.1...v0.5.0) (2026-11-10)
+
+
+### Features
+
+* mayfly install in rust; install.sh only fetches and verifies ([#26](https://github.com/Variiuz/mayfly/issues/26)) ([48ae0de](https://github.com/Variiuz/mayfly/commit/48ae0de9a759ae2d5a53fb0ca6b5548699452921))
+* rust gc, enable and disable ([#23](https://github.com/Variiuz/mayfly/issues/23)) ([326478e](https://github.com/Variiuz/mayfly/commit/326478ef1d0181ae782ba91a183927c77359940e))
+
+
+### Bug Fixes
+
+* **pod:** back off when a pod never gets ready ([#24](https://github.com/Variiuz/mayfly/issues/24)) ([b82ae57](https://github.com/Variiuz/mayfly/commit/b82ae57ea907ec11aca9953756a818cfb5644df7))
+
 ## [0.4.1](https://github.com/Variiuz/mayfly/compare/v0.4.0...v0.4.1) (2026-11-10)
 
 
