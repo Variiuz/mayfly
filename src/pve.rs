@@ -132,6 +132,87 @@ pub trait Pve {
         r.stdout.trim_end_matches('\n').to_string()
     }
 
+    /// `systemctl is-active -q <unit>`: true when the unit is active.
+    fn unit_active(&self, unit: &str) -> bool {
+        self.run("systemctl", &["is-active", "-q", unit]).code == 0
+    }
+
+    /// Runs a program that talks to the terminal (stdin, stdout and stderr stay ours); its exit code.
+    fn run_loud(&self, prog: &str, args: &[&str]) -> i32 {
+        self.run(prog, args).code
+    }
+
+    /// Runs a program with its stdout discarded and its stderr left on ours (`cmd >/dev/null`).
+    fn run_stderr(&self, prog: &str, args: &[&str]) -> i32 {
+        self.run(prog, args).code
+    }
+
+    /// Runs `prog` once per argument list, all at the same time (`cmd &` ... `wait`), with stdio as in
+    /// `run_loud`; the exit codes in the order given. The fake runs them one after the other.
+    fn run_loud_parallel(&self, prog: &str, arg_sets: &[Vec<String>]) -> Vec<i32> {
+        arg_sets
+            .iter()
+            .map(|a| {
+                let args: Vec<&str> = a.iter().map(String::as_str).collect();
+                self.run_loud(prog, &args)
+            })
+            .collect()
+    }
+
+    /// Stops a guest (failures ignored) and destroys it with its disks, like bash `destroy_vm` after its
+    /// checks. `--purge` also drops it from backup jobs, replication and HA. The exit code of the destroy.
+    fn destroy_guest(&self, kind: GuestKind, id: &str) -> i32 {
+        match kind {
+            GuestKind::Ct => {
+                self.run("pct", &["stop", id, "--skiplock", "1"]);
+                self.run_stderr(
+                    "pct",
+                    &[
+                        "destroy",
+                        id,
+                        "--purge",
+                        "1",
+                        "--destroy-unreferenced-disks",
+                        "1",
+                        "--force",
+                        "1",
+                    ],
+                )
+            }
+            GuestKind::Vm => {
+                self.run("qm", &["stop", id, "--skiplock", "1", "--timeout", "30"]);
+                self.run_stderr(
+                    "qm",
+                    &[
+                        "destroy",
+                        id,
+                        "--purge",
+                        "1",
+                        "--destroy-unreferenced-disks",
+                        "1",
+                        "--skiplock",
+                        "1",
+                    ],
+                )
+            }
+        }
+    }
+
+    /// The VM's qemu process is alive: its pid file names a live process whose command line has `-id <id> `.
+    fn qemu_running(&self, _id: &str) -> bool {
+        false
+    }
+
+    /// Bash `vm_running`: a container is running when `lxc-info` says RUNNING; anything else is looked up
+    /// as a qemu process.
+    fn guest_running(&self, kind: Option<GuestKind>, id: &str) -> bool {
+        if kind == Some(GuestKind::Ct) {
+            let r = self.run("lxc-info", &["-n", id, "-sH"]);
+            return r.stdout.trim_end_matches('\n') == "RUNNING";
+        }
+        self.qemu_running(id)
+    }
+
     /// Percent of the storage in use, rounded down; 100 when it reports no size. None when `pvesh` fails.
     fn pool_percent(&self, node: &str, storage: &str) -> Option<i64> {
         let path = format!("/nodes/{node}/storage/{storage}/status");
@@ -203,6 +284,49 @@ impl Pve for RealPve {
         }
     }
 
+    fn run_loud(&self, prog: &str, args: &[&str]) -> i32 {
+        match Command::new(prog).args(args).status() {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(_) => 127,
+        }
+    }
+
+    fn run_stderr(&self, prog: &str, args: &[&str]) -> i32 {
+        match Command::new(prog).args(args).stdout(Stdio::null()).status() {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(_) => 127,
+        }
+    }
+
+    fn run_loud_parallel(&self, prog: &str, arg_sets: &[Vec<String>]) -> Vec<i32> {
+        let children: Vec<Option<std::process::Child>> = arg_sets
+            .iter()
+            .map(|a| Command::new(prog).args(a).spawn().ok())
+            .collect();
+        children
+            .into_iter()
+            .map(|c| match c {
+                Some(mut child) => child.wait().ok().and_then(|s| s.code()).unwrap_or(1),
+                None => 127,
+            })
+            .collect()
+    }
+
+    fn qemu_running(&self, id: &str) -> bool {
+        let Ok(pid) = fs::read_to_string(format!("/var/run/qemu-server/{id}.pid")) else {
+            return false;
+        };
+        let pid = pid.trim_end_matches('\n');
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let text: String = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+        text.contains(&format!("-id {id} "))
+    }
+
     fn has_command(&self, name: &str) -> bool {
         let Some(path) = std::env::var_os("PATH") else {
             return false;
@@ -221,6 +345,7 @@ impl Pve for RealPve {
 pub struct FakePve {
     answers: HashMap<String, (i32, String)>,
     commands: Vec<String>,
+    running_qemu: Vec<String>,
     calls: RefCell<Vec<String>>,
 }
 
@@ -245,6 +370,12 @@ impl FakePve {
     /// `command -v name` finds it.
     pub fn with_command(mut self, name: &str) -> FakePve {
         self.commands.push(name.to_string());
+        self
+    }
+
+    /// The VM's qemu process is alive.
+    pub fn with_running_qemu(mut self, id: &str) -> FakePve {
+        self.running_qemu.push(id.to_string());
         self
     }
 
@@ -274,5 +405,9 @@ impl Pve for FakePve {
 
     fn has_command(&self, name: &str) -> bool {
         self.commands.iter().any(|c| c == name)
+    }
+
+    fn qemu_running(&self, id: &str) -> bool {
+        self.running_qemu.iter().any(|i| i == id)
     }
 }

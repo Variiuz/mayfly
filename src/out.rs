@@ -99,6 +99,15 @@ impl Out {
         }
     }
 
+    /// `done_`: a green tick on a terminal, the bare text otherwise.
+    pub fn done(&self, w: &mut dyn Write, msg: &str) {
+        if self.tty {
+            let _ = writeln!(w, "{}✓{} {}", self.grn(), self.reset(), msg);
+        } else {
+            let _ = writeln!(w, "{msg}");
+        }
+    }
+
     /// `warn`: `!` on a terminal, `warning:` prefix otherwise.
     pub fn warn(&self, w: &mut dyn Write, msg: &str) {
         if self.tty {

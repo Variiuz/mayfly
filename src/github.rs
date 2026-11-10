@@ -89,6 +89,36 @@ impl GitHub {
         Err(last)
     }
 
+    /// `DELETE <path>`; the answer has no body that matters. Retried like `call`.
+    pub fn delete(&self, bearer: &str, path: &str) -> Result<(), String> {
+        let url = format!("{}{}", self.api_url, path);
+        let auth = format!("Bearer {bearer}");
+        let mut last = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let sent = self
+                .agent
+                .delete(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("Authorization", &auth)
+                .call();
+            match sent {
+                Ok(_) => return Ok(()),
+                Err(ureq::Error::StatusCode(code)) => {
+                    last = format!("{path}: HTTP {code}");
+                    if !(code == 408 || code == 429 || code >= 500) {
+                        break;
+                    }
+                }
+                Err(e) => last = format!("{path}: {e}"),
+            }
+        }
+        Err(last)
+    }
+
     /// `GET /app`: the App's slug.
     pub fn app_slug(&self, jwt: &str) -> Result<String, String> {
         let v = self.call(jwt, false, "/app")?;
@@ -197,4 +227,92 @@ pub fn jwt_from_file(app_id: &str, key_path: &str) -> R<String> {
         Err(_) => return die(format!("{key_path} is not readable")),
     };
     make_jwt(app_id, &pem, now())
+}
+
+/// One runner as `gc` reads it: the four fields of `jq -r '"\(.id) \(.name) \(.status) \(.busy)"'`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerRec {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub busy: String,
+}
+
+/// What `gc` needs from GitHub; tests use a fake.
+pub trait RunnerApi {
+    /// An installation token.
+    fn install_token(&self) -> Result<String, String>;
+    /// Page `page` (1, 2, ...) of the runners of the scope, 100 at a time. Empty at the end and when
+    /// GitHub cannot be asked.
+    fn runners_page(&self, token: &str, page: u32) -> Vec<RunnerRec>;
+    /// Removes a registration; a failure is ignored.
+    fn delete_runner(&self, token: &str, id: &str);
+}
+
+/// A JSON field as jq prints it in a string: strings raw, anything else as JSON, `null` when missing.
+fn field_text(r: &Value, key: &str) -> String {
+    match r.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+/// The real GitHub, asked as the App.
+pub struct AppRunners {
+    gh: GitHub,
+    app_id: String,
+    key_path: String,
+    installation_id: String,
+    scope: String,
+}
+
+impl AppRunners {
+    pub fn new(
+        api_url: &str,
+        app_id: &str,
+        key_path: &str,
+        installation_id: &str,
+        scope: &str,
+    ) -> AppRunners {
+        AppRunners {
+            gh: GitHub::new(api_url),
+            app_id: app_id.to_string(),
+            key_path: key_path.to_string(),
+            installation_id: installation_id.to_string(),
+            scope: scope.to_string(),
+        }
+    }
+}
+
+impl RunnerApi for AppRunners {
+    fn install_token(&self) -> Result<String, String> {
+        let jwt = jwt_from_file(&self.app_id, &self.key_path).map_err(|d| d.0)?;
+        self.gh
+            .install_token(&jwt, &self.installation_id, &self.scope)
+    }
+
+    fn runners_page(&self, token: &str, page: u32) -> Vec<RunnerRec> {
+        let path = format!("/{}/actions/runners?per_page=100&page={page}", self.scope);
+        let Ok(v) = self.gh.call(token, false, &path) else {
+            return vec![];
+        };
+        let Some(list) = v.get("runners").and_then(Value::as_array) else {
+            return vec![];
+        };
+        list.iter()
+            .map(|r| RunnerRec {
+                id: field_text(r, "id"),
+                name: field_text(r, "name"),
+                status: field_text(r, "status"),
+                busy: field_text(r, "busy"),
+            })
+            .collect()
+    }
+
+    fn delete_runner(&self, token: &str, id: &str) {
+        let _ = self
+            .gh
+            .delete(token, &format!("/{}/actions/runners/{id}", self.scope));
+    }
 }
