@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/Variiuz/mayfly/compare/v0.3.0...v0.4.0) (2026-11-10)
+
+
+### Features
+
+* mayfly update and a daily update timer ([#18](https://github.com/Variiuz/mayfly/issues/18)) ([c148eb7](https://github.com/Variiuz/mayfly/commit/c148eb7f214f366684a3fa0324d3c8e6fe68c000))
+* **template:** run builds in their own systemd unit ([#17](https://github.com/Variiuz/mayfly/issues/17)) ([c302027](https://github.com/Variiuz/mayfly/commit/c3020274040debd2d28f4a0351e0de08ab9c0125))
+
 ## [0.3.0](https://github.com/Variiuz/mayfly/compare/v0.2.0...v0.3.0) (2026-11-10)
 
 
