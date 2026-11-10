@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/Variiuz/mayfly/compare/v0.1.2...v0.1.3) (2026-11-10)
+
+
+### Bug Fixes
+
+* **template:** export template.env so the profile's provision.sh sees it ([#11](https://github.com/Variiuz/mayfly/issues/11)) ([16ba093](https://github.com/Variiuz/mayfly/commit/16ba093b5f0c5b6e07043d710e61f331a345dc2b))
+
 ## [0.1.2](https://github.com/Variiuz/mayfly/compare/v0.1.1...v0.1.2) (2026-11-10)
 
 
