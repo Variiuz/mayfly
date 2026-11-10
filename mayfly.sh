@@ -23,6 +23,7 @@ set -euo pipefail
 MAYFLY_VERSION=0.2.0 # x-release-please-version
 CONF_DIR=${MAYFLY_CONF_DIR:-/etc/mayfly}
 BUILD_LOCK=${MAYFLY_BUILD_LOCK:-/run/lock/mayfly-template-build.lock}
+REGISTER_MINUTES=10 # a job guest's runner has to be online on GitHub within this time
 POOL_ENV=$CONF_DIR/pool.env
 SLOTS_CONF=$CONF_DIR/slots.conf
 ENV_DIR=$CONF_DIR/env
@@ -206,6 +207,13 @@ jit_config() {
     '{name: $name, runner_group_id: $gid, work_folder: "_work",
       labels: ((($base | split(",")) + ($labels | split(","))) | map(select(. != "")) | unique)}')
   gh_api "$token" POST "/$SCOPE/actions/runners/generate-jitconfig" -d "$body"
+}
+
+# True when runner <id> is online on GitHub.
+runner_online() {
+  local token=$1 id=$2
+  [ -n "$id" ] || return 1
+  gh_api "$token" GET "/$SCOPE/actions/runners/$id" 2>/dev/null | jq -e '.status == "online"' >/dev/null 2>&1
 }
 
 delete_runner() {
@@ -482,7 +490,7 @@ on_term() {
 }
 
 cmd_slot() {
-  local name=$1 line vmid labels vcpu ram disk envspec which extra tpl token resp jit runner_id host started kind
+  local name=$1 line vmid labels vcpu ram disk envspec which extra tpl token resp jit runner_id host started kind online stuck=0 t
   load_env
   line=$(slot_line "$name")
   [ -n "$line" ] || die "no slot $name in $SLOTS_CONF"
@@ -592,8 +600,23 @@ cmd_slot() {
     # so no job lands on an old VM; stop it once its job has run MAX_JOB_HOURS; and stop it when
     # the slot is stopping and the VM has no job. The guest is only asked once it is MAX_IDLE_HOURS old.
     job_since=""
+    online=no
     while vm_running "$vmid"; do
       now=$(date +%s)
+      # A guest whose runner never comes online (a template whose job unit waits for another file,
+      # no network, a broken runner) would hold the slot for MAX_IDLE_HOURS: replace it instead.
+      if [ "$online" = no ] && [ $((now - started)) -ge 60 ] && [ $(( (now - started) % 60 )) -lt 30 ]; then
+        if t=$(install_token 2>/dev/null) && runner_online "$t" "$runner_id"; then
+          online=yes; stuck=0
+        elif [ $((now - started)) -ge $((REGISTER_MINUTES * 60)) ] && ! job_active "$vmid"; then
+          stuck=$(( ${stuck:-0} + 1 ))
+          log "slot $name: runner $runner_name not online after $REGISTER_MINUTES min; replacing $kind $vmid (check its template: mayfly check)"
+          run_hook vm-stuck "$name" "$vmid" "$runner_name"
+          unset t
+          break
+        fi
+        unset t
+      fi
       if [ -z "$job_since" ] && [ $((now - started)) -ge $((MAX_IDLE_HOURS * 3600)) ]; then
         rc=0; secs=$(job_seconds "$vmid") || rc=$?
         if [ "$rc" = 0 ]; then
@@ -627,6 +650,10 @@ cmd_slot() {
     unset token
     log "slot $name: VM $vmid gone after $(( ($(date +%s) - started) / 60 )) min"
     run_hook vm-gone "$name" "$vmid" "$(( ($(date +%s) - started) / 60 ))"
+    # Guests that never got online again and again: back off instead of cloning every few minutes.
+    if [ "${stuck:-0}" -gt 0 ] && [ "$online" = no ] && [ "$stopping" = 0 ]; then
+      nap $(( stuck * 120 < 1800 ? stuck * 120 : 1800 ))
+    fi
   done
 }
 

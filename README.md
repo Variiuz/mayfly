@@ -68,6 +68,8 @@ again; configuration, slots and running jobs are kept.
    started. The snippet is deleted once the VM is running.
 3. In the guest, `mayfly-job` reads and deletes the config, runs the job as `runner` (no sudo) and
    powers off.
+   If the runner is not online on GitHub within 10 minutes, the slot replaces the guest, runs the
+   `vm-stuck` hook and backs off (2 min per repeat, at most 30 min).
 4. The slot destroys the VM and its disk, removes the runner registration if it still exists, and
    starts the next clone.
 
@@ -120,6 +122,7 @@ Executables in `HOOK_DIR` (`/etc/mayfly/hooks.d`) are called with:
 
 - `vm-up <slot> <vmid> <runner>`
 - `vm-gone <slot> <vmid> <minutes>`
+- `vm-stuck <slot> <vmid> <runner>` (the runner was not online on GitHub within 10 min)
 - `pod-up <slot> <vmid> <containers>`
 - `pod-gone <slot> <vmid> <minutes>`
 
