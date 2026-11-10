@@ -18,7 +18,8 @@ pub fn help(paths: &Paths, out: &Out, w: &mut dyn Write) {
 
 {d}Set up{z}
   check                             App key, storage, network, template; changes nothing
-  template build [profile] [--lxc]  build a template (VM, or LXC container with --lxc)
+  template build [profile] [--lxc]  build a template (VM, or LXC container with --lxc); runs in
+                                    unit mayfly-template-build, --foreground to wait for it
   template canary <vmid>            slots marked \"next\" clone it
   template promote <vmid>           every slot clones it from its next job on
   template list

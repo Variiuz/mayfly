@@ -147,7 +147,7 @@ gh_api() { case "$3" in */runners/1) echo '{"status":"online"}' ;; */runners/2) 
 ok "runner_online: online, offline, unknown, no id" 'runner_online tok 1 && ! runner_online tok 2 && ! runner_online tok 3 && ! runner_online tok ""'
 unset -f gh_api
 # shellcheck source=/dev/null
-. <(sed -n '/^gh_api() {/,/^}/p' "$here/mayfly")
+. <(sed -n '/^gh_api() {/,/^}/p' "$here/mayfly.sh")
 
 # ---- containers
 vcpu=2 ram=4 disk=20
@@ -287,6 +287,16 @@ exec 8>>"$BUILD_LOCK"; flock -n 8
 (cmd_template build) >"$t/lock.out" 2>&1; rc=$?
 ok "template build refuses while another build holds the lock" '[ "$rc" = 1 ] && grep -q "another template build is running" "$t/lock.out"'
 exec 8>&-
+cat >"$t/bin/systemd-run" <<STUB
+#!/bin/sh
+echo "systemd-run \$*" >>"$t/systemd-run.log"
+STUB
+chmod +x "$t/bin/systemd-run"
+: >"$t/systemctl.log"
+(unset INVOCATION_ID; cmd_template build polara --lxc) >/dev/null 2>&1; rc=$?
+ok "template build runs detached in mayfly-template-build, with --foreground" '[ "$rc" = 0 ] && grep -q -- "--unit=mayfly-template-build .*template build polara --lxc --foreground$" "$t/systemd-run.log"'
+ok "template build passes the config dir to the unit" 'grep -q -- "--setenv=MAYFLY_CONF_DIR=$t/conf" "$t/systemd-run.log"'
+rm -f "$t/bin/systemd-run"
 # ---- provision.sh: template.env values reach the profile's provision.sh (a child bash)
 mkdir -p "$t/prov/profile"
 echo 'CORE_X=core' >"$t/prov/template.env"
