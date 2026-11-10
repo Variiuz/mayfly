@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/Variiuz/mayfly/compare/v0.1.0...v0.1.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* run jobs on polara-ci templates and show GitHub runner state in status ([#6](https://github.com/Variiuz/mayfly/issues/6)) ([b897484](https://github.com/Variiuz/mayfly/commit/b8974843e6018f6d80cb5503e8d1bfe1af2f8313))
+
 ## 0.1.0 (2026-11-10)
 
 
