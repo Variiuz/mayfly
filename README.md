@@ -94,7 +94,7 @@ again; configuration, slots and running jobs are kept.
 
 ```
 # name   vmid  labels  vcpu  ram_gb  disk_gb  env      template  [key=value ...]
-build-1  9002  linux   8     16      60       sccache  current
+build-1  9002  linux   8     16      60       cache    current
 small-1  9011  small   2     4       30       no       current   max_job_hours=1
 pods-1   9041  small   12    36      120      no       current   kind=pod containers=6
 ```
@@ -225,8 +225,8 @@ runs at a time. `--foreground` runs it in the terminal instead.
 switches all slots at their next job. The previous template is kept for rollback with
 `mayfly template promote <old>`.
 
-Templates built by polara-ci (no `profile` description) expect the job files in `/etc/polara-ci`.
-Mayfly writes them there for such templates, and `mayfly check`, `canary` and `promote` warn about them.
+`canary` and `promote` accept only templates built by `mayfly template build` (description
+`profile <name>`); `mayfly check` reports a current or next template that was not.
 
 The template disk size is `TEMPLATE_DISK` GB. Set it to the largest slot disk: clones keep the template
 size and are resized only when `disk_gb` is larger, because growing a disk makes ext4 in the guest

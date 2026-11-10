@@ -244,12 +244,9 @@ guest_config() {
   esac
 }
 
-# Name of the job files in a VM template: mayfly (/etc/mayfly/jit, mayfly-job.service) for
-# templates mayfly built (description "profile <name>"), polara-ci for templates built by
-# polara-ci, whose job unit waits for /etc/polara-ci/jit.
-template_layout() {
-  if guest_config "$1" | grep -q '^description: profile'; then echo mayfly; else echo polara-ci; fi
-}
+# True for templates `mayfly template build` made (description "profile <name>"). Others may run a
+# job unit that waits for a different file than /etc/mayfly/jit, so no runner would start.
+built_by_mayfly() { guest_config "$1" | grep -q '^description: profile'; }
 
 # The node a VMID belongs to anywhere in the cluster (empty when unused). qm only sees this node.
 vmid_node() { jq -r --arg id "$1" '.ids[$id].node // empty' "$PVE_ETC/.vmlist" 2>/dev/null; }
@@ -413,7 +410,7 @@ write_firewall() {
 # cloud-init user-data for one job VM. Holds the one-use JIT config, so 0600 and deleted
 # as soon as the VM has started (Proxmox has built its cloud-init drive by then).
 write_snippet() {
-  local id=$1 host=$2 jit=$3 envspec=$4 d=${5:-mayfly} f lines
+  local id=$1 host=$2 jit=$3 envspec=$4 f lines
   f="$SNIPPET_DIR/mayfly-$id.yaml"
   lines=$(job_env "$envspec")
   (
@@ -422,18 +419,18 @@ write_snippet() {
       echo "#cloud-config"
       echo "hostname: $host"
       echo "write_files:"
-      echo "  - path: /etc/$d/jit"
+      echo "  - path: /etc/mayfly/jit"
       echo "    permissions: '0600'"
       echo "    content: $jit"
       if [ -n "$lines" ]; then
-        echo "  - path: /etc/$d/job.env"
+        echo "  - path: /etc/mayfly/job.env"
         echo "    permissions: '0600'"
         echo "    content: |"
         sed 's/^/      /' <<<"$lines"
       fi
       # Also start the job from cloud-final, so a template whose unit did not start at boot still works.
       echo "runcmd:"
-      echo "  - [systemctl, start, --no-block, $d-job.service]"
+      echo "  - [systemctl, start, --no-block, mayfly-job.service]"
     } >"$f"
   )
 }
@@ -563,7 +560,7 @@ cmd_slot() {
       fi
       unset jit
     else
-      write_snippet "$vmid" "$host" "$jit" "$envspec" "$(template_layout "$tpl")"
+      write_snippet "$vmid" "$host" "$jit" "$envspec"
       unset jit
       if ! qm clone "$tpl" "$vmid" --name "$host" >/dev/null ||
          ! qm set "$vmid" --cores "$vcpu" --memory $((ram * 1024)) --balloon 0 --onboot 0 ${CPU_TYPE:+--cpu "$CPU_TYPE"} \
@@ -1026,8 +1023,8 @@ cmd_check() {
   if [ -n "$TEMPLATE_VMID" ] && is_template "$TEMPLATE_VMID"; then item ok template "$TEMPLATE_VMID"
   else item warn template "none yet: mayfly template build, then mayfly template promote <vmid>"; fi
   for e in $TEMPLATE_VMID $NEXT_TEMPLATE_VMID; do
-    if is_template "$e" && [ "$(guest_kind "$e")" = vm ] && [ "$(template_layout "$e")" != mayfly ]; then
-      item warn template "$e was built by polara-ci; jobs get its /etc/polara-ci paths. Rebuild: mayfly template build"
+    if is_template "$e" && ! built_by_mayfly "$e"; then
+      item bad template "$e was not built by mayfly template build; its jobs may never start. Build one and promote it"
     fi
   done
   if find_profile "$PROFILE" >/dev/null; then item ok profile "$PROFILE"
@@ -1130,10 +1127,9 @@ set_pool_value() {
   fi
 }
 
-legacy_template_note() {
-  [ "$(guest_kind "$1")" = vm ] && [ "$(template_layout "$1")" != mayfly ] || return 0
-  warn "template $1 was built by polara-ci: its jobs get the /etc/polara-ci paths it expects"
-  hint "rebuild it with mayfly template build when convenient"
+# Refuses a template mayfly did not build (see built_by_mayfly).
+require_mayfly_template() {
+  built_by_mayfly "$1" || die "template $1 was not built by mayfly template build; its jobs may never start"
 }
 
 # Starts `template build <args> --foreground` in the transient unit BUILD_UNIT and returns.
@@ -1180,7 +1176,7 @@ cmd_template() {
       if [ "$lxc" = yes ]; then template_build_ct "$profile"; else template_build "$profile"; fi ;;
     canary)
       [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template canary <template vmid>"
-      legacy_template_note "$2"
+      require_mayfly_template "$2"
       if [ "$(guest_kind "$2")" = ct ]; then
         set_pool_value NEXT_LXC_TEMPLATE_VMID "$2"; done_ "lxc slots marked next now clone $2"
       else
@@ -1189,7 +1185,7 @@ cmd_template() {
       hint "when their jobs pass: mayfly template promote $2" ;;
     promote)
       [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template promote <template vmid>"
-      legacy_template_note "$2"
+      require_mayfly_template "$2"
       if [ "$(guest_kind "$2")" = ct ]; then
         set_pool_value LXC_TEMPLATE_VMID "$2"; set_pool_value NEXT_LXC_TEMPLATE_VMID ""
         done_ "every lxc slot clones $2 from its next job on"
