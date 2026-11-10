@@ -2111,7 +2111,7 @@ fn status_shows_the_engine_only_while_a_slot_runs_rust() {
         "SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB\n"
     ));
 
-    // One slot on rust: a column for all of them; pods and containers are bash whatever they ask.
+    // One slot on rust: a column for all of them; pods and containers run on rust too.
     write(
         &f.paths.slots_conf,
         "build-1 9002 linux 8 16 60 no current engine=rust\n\
@@ -2126,11 +2126,11 @@ fn status_shows_the_engine_only_while_a_slot_runs_rust() {
         "SLOT       VMID   KIND ENGINE LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB"
     );
     assert!(rows[1].starts_with("build-1    9002   vm   rust   linux                  8c/16G  "));
-    assert!(rows[2].starts_with("pods-1     9041   pod  bash   small                  12c/36G "));
-    assert!(rows[3].starts_with("ct-1       9051   lxc  bash   small                  2c/4G   "));
+    assert!(rows[2].starts_with("pods-1     9041   pod  rust   small                  12c/36G "));
+    assert!(rows[3].starts_with("ct-1       9051   lxc  rust   small                  2c/4G   "));
     assert!(rows[4].starts_with("off-1      9052   vm   bash   small                  1c/1G   "));
 
-    // SLOT_ENGINE in pool.env is the default of the vm slots.
+    // SLOT_ENGINE in pool.env is the default of every slot.
     let (f, pve) = status_fixture("SLOT_ENGINE=rust\n");
     let (_, out) = f.run_status(&pve);
     let rows: Vec<&str> = out.lines().take(5).collect();
@@ -2139,7 +2139,7 @@ fn status_shows_the_engine_only_while_a_slot_runs_rust() {
         "{out}"
     );
     assert!(
-        rows[2].starts_with("pods-1     9041   pod  bash   "),
+        rows[2].starts_with("pods-1     9041   pod  rust   "),
         "{out}"
     );
     assert!(

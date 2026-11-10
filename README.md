@@ -112,10 +112,9 @@ pods-1   9041  small   12    36      120      no       current   kind=pod contai
 ### Slot engine (temporary)
 
 While the slot loop moves from Bash to Rust, `engine=rust|bash` on a slot (else `SLOT_ENGINE` in
-`pool.env`, default `bash`) picks the loop that runs it. Only `kind=vm` slots have a Rust loop; pod and
-LXC slots run on Bash whatever the setting and log a line saying so. Both loops make the same calls and
-log the same lines. Put one slot on `engine=rust`, restart it (`systemctl restart mayfly-slot@<name>`
-drains first), watch it for a day, then set `SLOT_ENGINE=rust`. `mayfly status` adds an `ENGINE` column
+`pool.env`, default `bash`) picks the loop that runs it. Slots of every kind (`vm`, `lxc`, `pod`) have a
+Rust loop. Both loops make the same calls and log the same lines. Put one slot on `engine=rust`, restart
+it (`systemctl restart mayfly-slot@<name>` drains first), watch it for a day, then set `SLOT_ENGINE=rust`. `mayfly status` adds an `ENGINE` column
 while any slot runs Rust. The switch goes away once every kind has moved.
 
 ### Profiles

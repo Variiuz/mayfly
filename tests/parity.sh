@@ -9,9 +9,11 @@
 # template list, canary, promote and build are compared like gc (a VM build to the end, with a stub qm that
 # answers the guest agent and a stand-in qemu process; MAYFLY_TEST_NAP=0 and MAYFLY_QEMU_RUN_DIR keep it
 # fast and local).
-# slot: one kind=vm slot runs on bash and on Rust (engine=rust in slots.conf, which bash ignores) through one job
-# cycle (the VM powers itself off) and a second VM that a TERM drains; stubs record every qm, pvesh and pvesm
-# call and the cloud-init snippet and firewall file at `qm start`, a fake GitHub records its requests (the
+# slot: one slot of each kind (vm, lxc, pod) runs on bash and on Rust (engine=rust in slots.conf, which bash
+# ignores). A vm or lxc slot goes through one job cycle (the guest powers itself off) and a second guest that a
+# TERM drains; a pod through one VM that is recycled when its template changes and a second one that a TERM
+# drains. Stubs record every qm, pct, lxc-attach, pvesh and pvesm call, the cloud-init snippet and firewall file
+# at `qm start` / `pct start` and what was handed to a container or pod, a fake GitHub records its requests (the
 # JIT body included), hooks record their arguments. The calls, files, requests, output and exit code are compared.
 # Usage: bash tests/parity.sh [path to the mayfly binary]   (default target/release/mayfly)
 set -uo pipefail
@@ -679,7 +681,8 @@ esac
 STUB
 cat >"$s/bin/qm" <<'STUB'
 #!/bin/sh
-echo "qm $*" >>"$CALLS"
+# A pod's `mayfly-pod put` carries a JIT config on its command line (as in bash): the log has none.
+echo "qm $*" | sed 's/JITSECRET-[0-9]*/<jit>/g' >>"$CALLS"
 etc=$MAYFLY_PVE_ETC/qemu-server
 case "$1" in
   config) cat "$etc/$2.conf" 2>/dev/null || exit 2 ;;
@@ -705,7 +708,74 @@ case "$1" in
       rm -f "$MAYFLY_QEMU_RUN_DIR/$2.pid"
     fi ;;
   destroy) rm -f "$etc/$2.conf" ;;
-  guest) echo '{"exitcode":3}' ;;
+  guest)
+    case "$*" in
+      *"/usr/local/sbin/mayfly-pod "*)
+        # The pod script in the VM: qm guest exec <id> --timeout 30 -- /usr/local/sbin/mayfly-pod <cmd> [args]
+        while [ "$1" != "--" ]; do shift; done
+        sub=$3
+        shift 3
+        case "$sub" in
+          want)
+            # Two idle containers on the first look, none after.
+            m=$(cat "$CAP/want.n" 2>/dev/null || echo 0)
+            echo $((m + 1)) >"$CAP/want.n"
+            if [ "$m" = 0 ]; then printf '%s\n' '{"exitcode":0,"out-data":"2\n"}'; else printf '%s\n' '{"exitcode":0,"out-data":"0\n"}'; fi ;;
+          busy) printf '%s\n' '{"exitcode":0,"out-data":"0\n"}' ;;
+          put)
+            # The first config is taken, the second refused.
+            m=$(cat "$CAP/put.n" 2>/dev/null || echo 0)
+            m=$((m + 1))
+            echo "$m" >"$CAP/put.n"
+            echo "$*" >"$CAP/put-$m"
+            if [ "$m" = 2 ]; then echo '{"exitcode":1}'; else echo '{"exitcode":0}'; fi ;;
+          *) echo '{"exitcode":0}' ;;
+        esac ;;
+      *) echo '{"exitcode":3}' ;;
+    esac ;;
+esac
+exit 0
+STUB
+cat >"$s/bin/pct" <<'STUB'
+#!/bin/sh
+echo "pct $*" >>"$CALLS"
+etc=$MAYFLY_PVE_ETC/lxc
+case "$1" in
+  config) cat "$etc/$2.conf" 2>/dev/null || exit 2 ;;
+  clone) printf 'hostname: %s\ntags: mayfly\nrootfs: local-lvm:vm-%s-disk-0,size=8G\n' "$5" "$3" >"$etc/$3.conf" ;;
+  start)
+    # What the container starts from: the firewall file, and whether a cloud-init snippet is there (it must not be).
+    n=$(cat "$CAP/n" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" >"$CAP/n"
+    cp "$MAYFLY_PVE_FW_DIR/$2.fw" "$CAP/fw-$n.fw" 2>/dev/null
+    ls "$GSNIP" >"$CAP/snip-$n.ls"
+    touch "$CTRUN/$2.running" ;;
+  stop) rm -f "$CTRUN/$2.running" ;;
+  destroy) rm -f "$etc/$2.conf" ;;
+esac
+exit 0
+STUB
+cat >"$s/bin/lxc-info" <<'STUB'
+#!/bin/sh
+if [ -e "$CTRUN/$2.running" ]; then echo RUNNING; else echo STOPPED; fi
+STUB
+cat >"$s/bin/lxc-attach" <<'STUB'
+#!/bin/sh
+# lxc-attach -n <id> -- <command...>; what comes in on stdin is saved (it is the JIT config and the job env).
+echo "lxc-attach $*" >>"$CALLS"
+shift 3
+n=$(cat "$CAP/n" 2>/dev/null || echo 0)
+case "$1" in
+  systemctl) case "$2" in is-system-running) echo running ;; esac ;;
+  sh)
+    case "$3" in
+      *'cat >/etc/mayfly/jit'*) cat >"$CAP/ct-jit-$n" ;;
+      *'cat >/etc/mayfly/job.env'*) cat >"$CAP/ct-env-$n" ;;
+      # No job (3, not 1: lxc-attach itself fails with 1).
+      *pgrep*) exit 3 ;;
+    esac ;;
+  pgrep) exit 1 ;;
 esac
 exit 0
 STUB
@@ -718,11 +788,17 @@ case "$2" in
     n=$((n + 1))
     echo "$n" >"$CAP/pvesh.n"
     case "$n" in
-      # Capacity (1), the first VM's second pass (2): its job is over and it powers off.
+      # Capacity (1), the first guest's second pass (2): a VM or container has run its job and powers off; a
+      # pod gets a new template in pool.env and is recycled.
       2)
-        kill "$(cat "$MAYFLY_QEMU_RUN_DIR/9002.pid")" 2>/dev/null
-        rm -f "$MAYFLY_QEMU_RUN_DIR/9002.pid" ;;
-      # Capacity of the second VM (3), its second pass (4): the unit is stopped.
+        case "$KIND" in
+          lxc) rm -f "$CTRUN/$GID.running" ;;
+          pod) sed -i 's/^TEMPLATE_VMID=9098$/TEMPLATE_VMID=9099/' "$MAYFLY_CONF_DIR/pool.env" ;;
+          *)
+            kill "$(cat "$MAYFLY_QEMU_RUN_DIR/$GID.pid")" 2>/dev/null
+            rm -f "$MAYFLY_QEMU_RUN_DIR/$GID.pid" ;;
+        esac ;;
+      # Capacity of the second guest (3), its second pass (4; a pod's fourth look at the pool): the unit is stopped.
       4)
         for _ in $(seq 50); do [ -s "$PIDFILE" ] && break; sleep 0.1; done
         kill -TERM "$(cat "$PIDFILE")" ;;
@@ -800,9 +876,13 @@ for _ in $(seq 50); do [ -s "$t/sport" ] && break; sleep 0.1; done
 
 slot_reset() {
   kill_qemu
-  rm -rf "$s/pve" "$s/fw" "$s/snip" "$s/cap" "$s/qemu" "$s/conf" "$s/mayfly.pid"
-  mkdir -p "$s/pve/qemu-server" "$s/fw" "$s/snip" "$s/cap" "$s/qemu" "$s/conf/hooks.d" "$s/conf/env"
+  rm -rf "$s/pve" "$s/fw" "$s/snip" "$s/cap" "$s/qemu" "$s/conf" "$s/ct" "$s/share" "$s/mayfly.pid"
+  mkdir -p "$s/pve/qemu-server" "$s/pve/lxc" "$s/fw" "$s/snip" "$s/cap" "$s/qemu" "$s/ct" "$s/share" "$s/conf/hooks.d" "$s/conf/env"
   printf 'name: ci-template\ntags: mayfly\ndescription: profile default\ntemplate: 1\n' >"$s/pve/qemu-server/9098.conf"
+  # The next template of the pod (pool.env moves to it), the container template, and the pod script.
+  cp "$s/pve/qemu-server/9098.conf" "$s/pve/qemu-server/9099.conf"
+  printf 'hostname: ci-ct-template\ntags: mayfly\ntemplate: 1\n' >"$s/pve/lxc/9099.conf"
+  printf '#!/bin/sh\necho pod\n' >"$s/share/pod-vm.sh"
   cat >"$s/conf/pool.env" <<ENV
 APP_ID=12345
 ORG=acme
@@ -810,13 +890,14 @@ KEY_PATH=$t/app.pem
 API_URL=http://127.0.0.1:$(cat "$t/sport")
 RUNNER_PREFIX=mf
 TEMPLATE_VMID=9098
+LXC_TEMPLATE_VMID=9099
 GATEWAY=10.0.0.1
 CACHE_IP=10.0.0.5
 HOOK_DIR=$s/conf/hooks.d
 MIN_FREE_RAM_GB=0
 ENV
   # engine=rust is for the Rust binary; bash reads the slot and ignores the key.
-  echo 'a-1 9002 linux,gpu 8 1 60 cache,missing current engine=rust' >"$s/conf/slots.conf"
+  echo "$SLOT_LINE" >"$s/conf/slots.conf"
   printf 'A=1\nB=two\n# comment\nnot a line\n' >"$s/conf/env/cache.env"
   printf '#!/bin/sh\necho "hook $*" >>"$CALLS"\n' >"$s/conf/hooks.d/10-rec"
   printf '#!/bin/sh\necho "hook-fail $*" >>"$CALLS"\nexit 1\n' >"$s/conf/hooks.d/20-fail"
@@ -835,7 +916,7 @@ slot_run() {
   slot_reset
   env -u INVOCATION_ID "PATH=$s/bin:$PATH" "CALLS=$s/calls" "CAP=$s/cap" "GSNIP=$s/snip" "PIDFILE=$s/mayfly.pid" \
     "MAYFLY_TEST_NAP=0" "MAYFLY_QEMU_RUN_DIR=$s/qemu" "MAYFLY_CONF_DIR=$s/conf" "MAYFLY_PVE_ETC=$s/pve" \
-    "MAYFLY_PVE_FW_DIR=$s/fw" "$@" >"$p.out" 2>"$p.err" </dev/null &
+    "MAYFLY_PVE_FW_DIR=$s/fw" "MAYFLY_SHARE=$s/share" "GID=$SLOT_GID" "KIND=$SLOT_KIND" "CTRUN=$s/ct" "$@" >"$p.out" 2>"$p.err" </dev/null &
   pid=$!
   echo "$pid" >"$s/mayfly.pid"
   for _ in $(seq 600); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
@@ -855,14 +936,16 @@ slot_run() {
     echo "--- github"
     cat "$p.gh"
     echo "--- what each VM started from"
-    for f in "$s"/cap/snippet-* "$s"/cap/fw-*; do
+    for f in "$s"/cap/snippet-* "$s"/cap/fw-* "$s"/cap/snip-* "$s"/cap/ct-* "$s"/cap/put-*; do
       [ -e "$f" ] || continue
       echo "== ${f#"$s"/cap/}"
       cat "$f"
     done
     echo "--- files left"
-    (cd "$s" && ls fw snip pve/qemu-server)
+    (cd "$s" && ls fw snip pve/qemu-server pve/lxc ct)
   } >"$p.state"
+  # The runner names in what a pod was handed carry the time.
+  sed -i -E 's/[0-9]{10}/EPOCH/g' "$p.state"
 }
 
 same_slot() {
@@ -874,9 +957,9 @@ same_slot() {
   for f in out err rc state; do cmp -s "$t/lb.$f" "$t/lr.$f" || ok=0; done
   # The JIT config is only ever in the snippet.
   if grep -q JITSECRET "$t/lr.out" "$t/lr.err" "$t/lr.calls" "$t/lr.gh"; then ok=0; echo "the JIT config leaked"; fi
-  if [ "$(cat "$t/lr.rc")" != 0 ] || ! grep -q 'gone after' "$t/lr.out" || [ "$(grep -c 'qm start' "$t/lr.calls")" != 2 ]; then
+  if [ "$(cat "$t/lr.rc")" != 0 ] || ! grep -q 'gone after' "$t/lr.out" || [ "$(grep -c "^$SLOT_START " "$t/lr.calls")" != 2 ]; then
     ok=0
-    echo "the run did not go through two VMs and a drain:"
+    echo "the run did not go through two guests and a drain:"
     cat "$t/lr.out" "$t/lr.err"
   fi
   if [ "$ok" = 1 ]; then
@@ -890,7 +973,18 @@ same_slot() {
   fi
 }
 
+SLOT_GID=9002 SLOT_KIND=vm SLOT_START="qm start"
+SLOT_LINE='a-1 9002 linux,gpu 8 1 60 cache,missing current engine=rust'
 same_slot "slot, one job cycle and a drain (kind=vm)" slot a-1
+
+SLOT_GID=9051 SLOT_KIND=lxc SLOT_START="pct start"
+SLOT_LINE='a-1 9051 linux,gpu 2 4 20 cache,missing current kind=lxc engine=rust'
+same_slot "slot, one job cycle and a drain (kind=lxc)" slot a-1
+
+# A pod: its VM is recycled when pool.env names a new template, and drained on the TERM.
+SLOT_GID=9041 SLOT_KIND=pod SLOT_START="qm start"
+SLOT_LINE='a-1 9041 linux 8 8 60 cache,missing current kind=pod containers=4 engine=rust'
+same_slot "slot, a recycled and a drained pod (kind=pod)" slot a-1
 
 echo
 echo "$((n - fails))/$n identical"

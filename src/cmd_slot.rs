@@ -1,10 +1,11 @@
-//! `mayfly slot <name>` for `kind=vm` slots: the loop behind `mayfly-slot@<name>.service`, which runs one
-//! throwaway VM per job. It does what the `cmd_slot` of `mayfly.sh` does, step for step: the same `qm`
-//! and `pvesh` calls with the same flags in the same order, the same cloud-init snippet and firewall
-//! file, the same hooks, log lines, waits and limits.
+//! `mayfly slot <name>`: the loop behind `mayfly-slot@<name>.service`. `kind=vm` runs one throwaway VM per
+//! job, `kind=lxc` one throwaway container (`lxc`), `kind=pod` one long-lived VM that runs containers
+//! (`pod`). It does what the `cmd_slot` of `mayfly.sh` does, step for step: the same `qm`, `pct`, `lxc-attach`
+//! and `pvesh` calls with the same flags in the same order, the same files, hooks, log lines, waits and
+//! limits.
 //!
 //! Which loop runs is chosen per slot (`route`): `engine=rust` in `slots.conf`, else `SLOT_ENGINE` in
-//! `pool.env` (default `bash`). A slot of another kind always runs `mayfly.sh`.
+//! `pool.env` (default `bash`).
 //!
 //! The JIT runner config reaches only the 0600 cloud-init snippet: not a command line, not a log line.
 
@@ -20,6 +21,9 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+mod lxc;
+mod pod;
 
 /// A guest's runner has to be online on GitHub within this many minutes.
 const REGISTER_MINUTES: i64 = 10;
@@ -56,10 +60,10 @@ pub fn engine_setting(extra: &str, pool: &str) -> (Engine, Option<String>) {
     }
 }
 
-/// The engine that really runs a slot of this kind: only `kind=vm` has a Rust loop so far.
+/// The engine that really runs a slot of this kind: `vm`, `lxc` and `pod` have a Rust loop.
 pub fn engine_for_kind(kind: &str, extra: &str, pool: &str) -> Engine {
     match engine_setting(extra, pool) {
-        (Engine::Rust, _) if kind == "vm" => Engine::Rust,
+        (Engine::Rust, _) if matches!(kind, "vm" | "lxc" | "pod") => Engine::Rust,
         _ => Engine::Bash,
     }
 }
@@ -104,12 +108,7 @@ pub fn route(paths: &config::Paths, name: &str) -> Route {
         };
     }
     match (engine, kind.as_str()) {
-        (Engine::Rust, "vm") => Route::Rust,
-        (Engine::Rust, k @ ("pod" | "lxc")) => Route::Bash {
-            note: Some(format!(
-                "slot {name}: engine=rust does not cover kind={k} yet; running it on bash"
-            )),
-        },
+        (Engine::Rust, "vm" | "pod" | "lxc") => Route::Rust,
         _ => Route::Bash { note: None },
     }
 }
@@ -193,6 +192,7 @@ pub fn run_with(
         ew,
         name: name.to_string(),
         slot: config::Slot::default(),
+        kind: "vm".to_string(),
         stopping: false,
         stuck: 0,
         ticks: 0,
@@ -225,6 +225,8 @@ struct Loop<'a> {
     ew: &'a mut dyn Write,
     name: String,
     slot: config::Slot,
+    /// `kind=` of the slot: vm, lxc or pod.
+    kind: String,
     /// `stopping` of bash: set by the first TERM or INT.
     stopping: bool,
     /// Guests in a row whose runner never came online.
@@ -237,6 +239,7 @@ struct Loop<'a> {
 struct Applied {
     template: String,
     net0: String,
+    ct_net0: String,
 }
 
 impl Loop<'_> {
@@ -279,6 +282,10 @@ impl Loop<'_> {
     /// An idle VM goes at once; a VM in a job finishes it (systemd waits, TimeoutStopSec).
     fn on_term(&mut self) {
         self.stopping = true;
+        // A pod only stops taking jobs: its containers finish theirs (`on_term_pod`).
+        if self.kind == "pod" {
+            return;
+        }
         let id = self.slot.vmid.clone();
         if self.running(&id) && self.job_idle(&id) {
             if self.kind(&id) == Some(GuestKind::Ct) {
@@ -418,23 +425,37 @@ impl Loop<'_> {
             v => format!(",tag={v}"),
         };
         let net0 = format!("virtio,bridge={}{tag},firewall={fw}", c.get("BRIDGE"));
-        Ok(Applied { template, net0 })
+        let ct_net0 = format!(
+            "name=eth0,bridge={}{tag},ip=dhcp,firewall={fw}",
+            c.get("BRIDGE")
+        );
+        Ok(Applied {
+            template,
+            net0,
+            ct_net0,
+        })
     }
 
-    /// bash `slot_template`: the slot's `template=`, else current (or next for a canary slot).
+    /// bash `slot_template`: the slot's `template=`, else current (or next for a canary slot). A `kind=lxc`
+    /// slot uses the container templates.
     fn slot_template(&self, c: &Config, own: &str) -> String {
         if !own.is_empty() {
             return own.to_string();
         }
+        let (cur, nxt) = if self.kind == "lxc" {
+            ("LXC_TEMPLATE_VMID", "NEXT_LXC_TEMPLATE_VMID")
+        } else {
+            ("TEMPLATE_VMID", "NEXT_TEMPLATE_VMID")
+        };
         if self.slot.which == "next" {
-            let next = c.get("NEXT_TEMPLATE_VMID");
+            let next = c.get(nxt);
             if next.is_empty() {
-                c.get("TEMPLATE_VMID").to_string()
+                c.get(cur).to_string()
             } else {
                 next.to_string()
             }
         } else {
-            c.get("TEMPLATE_VMID").to_string()
+            c.get(cur).to_string()
         }
     }
 
@@ -619,9 +640,14 @@ impl Loop<'_> {
 
     /// Disk size in whole GB of a VM's scsi0 (None when unknown), as bash `disk_gb`.
     fn disk_gb(&self, id: &str) -> Option<i64> {
-        let cfg = self.cx.pve.run("qm", &["config", id]).stdout;
+        self.size_gb("qm", "scsi0:", id)
+    }
+
+    /// The `size=` of the config line starting with `key` (`qm config` / `pct config`), in whole GB.
+    fn size_gb(&self, prog: &str, key: &str, id: &str) -> Option<i64> {
+        let cfg = self.cx.pve.run(prog, &["config", id]).stdout;
         for line in cfg.split('\n') {
-            let Some(rest) = line.strip_prefix("scsi0:") else {
+            let Some(rest) = line.strip_prefix(key) else {
                 continue;
             };
             // `.*[,:]size=\([0-9]*[MGT]\).*`: the last `,size=` or `:size=` followed by digits and a unit.
@@ -686,8 +712,9 @@ impl Loop<'_> {
         ) == 0
     }
 
-    /// Clone, size and configure the job VM; false at the first step that fails.
-    fn create_vm(&self, c: &Config, a: &Applied, tpl: &str, host: &str, runner: &str) -> bool {
+    /// Clone, size and configure the job VM; false at the first step that fails. `desc` is the VM's
+    /// description.
+    fn create_vm(&self, c: &Config, a: &Applied, tpl: &str, host: &str, desc: &str) -> bool {
         let s = &self.slot;
         let pve = self.cx.pve;
         let id = s.vmid.as_str();
@@ -698,7 +725,6 @@ impl Loop<'_> {
             return false;
         };
         let memory = (ram * 1024).to_string();
-        let desc = format!("runner {runner}, template {tpl}");
         let cicustom = format!(
             "user={}:snippets/mayfly-{id}.yaml",
             c.get("SNIPPET_STORAGE")
@@ -722,7 +748,7 @@ impl Loop<'_> {
             "--tags",
             c.get("TAG"),
             "--description",
-            desc.as_str(),
+            desc,
             "--net0",
             a.net0.as_str(),
             "--ipconfig0",
@@ -749,14 +775,10 @@ impl Loop<'_> {
         }
         self.apply_slot(&mut c)?;
         let kind = slot_opt("kind", &self.slot.extra, "vm");
-        if kind != "vm" {
-            return match kind.as_str() {
-                "pod" | "lxc" => die(format!(
-                    "slot {name}: kind={kind} runs on the bash loop (mayfly.sh), not here"
-                )),
-                _ => die(format!("slot {name}: kind={kind} (vm, pod or lxc)")),
-            };
+        if !matches!(kind.as_str(), "vm" | "pod" | "lxc") {
+            return die(format!("slot {name}: kind={kind} (vm, pod or lxc)"));
         }
+        self.kind = kind;
         let vmid = self.slot.vmid.clone();
         let (min, max) = (c.number("VMID_MIN"), c.number("VMID_MAX"));
         let in_range = match (vmid.trim().parse::<i64>(), min, max) {
@@ -782,6 +804,9 @@ impl Loop<'_> {
             ));
             self.nap(600);
             return Ok(1);
+        }
+        if self.kind == "pod" {
+            return self.pod_loop(&mut c);
         }
         while !self.stopping() {
             match self.iteration(&mut c)? {
@@ -852,48 +877,93 @@ impl Loop<'_> {
         };
         let runner_id = jit.runner_id;
 
-        let layout = template_layout(self.cx, &tpl);
-        self.write_snippet(c, &vmid, &host, &jit.encoded, layout)?;
-        drop(jit.encoded);
-        if !self.create_vm(c, &applied, &tpl, &host, &runner_name) {
-            self.log(&format!(
-                "slot {name}: could not create VM {vmid} from template {tpl}"
-            ));
-            self.remove_snippet(c, &vmid);
-            if self.kind(&vmid).is_some() {
+        let lxc = self.kind == "lxc";
+        let desc = format!("runner {runner_name}, template {tpl}");
+        if lxc {
+            let jit = jit.encoded;
+            if !self.ct_create(c, &applied, &tpl, &host, &desc) {
+                self.log(&format!(
+                    "slot {name}: could not create container {vmid} from template {tpl}"
+                ));
+                if self.kind(&vmid).is_some() {
+                    let code = self.destroy(c, &vmid)?;
+                    if code != 0 {
+                        return Ok(Flow::Exit(code));
+                    }
+                }
+                self.delete_runner(c, &token, &runner_id);
+                self.nap(120);
+                return Ok(Flow::Next);
+            }
+            self.write_firewall(c, &vmid)?;
+            if self.stopping() {
                 let code = self.destroy(c, &vmid)?;
                 if code != 0 {
                     return Ok(Flow::Exit(code));
                 }
+                self.delete_runner(c, &token, &runner_id);
+                return Ok(Flow::Done);
             }
-            self.delete_runner(c, &token, &runner_id);
-            self.nap(120);
-            return Ok(Flow::Next);
-        }
-        self.write_firewall(c, &vmid)?;
-        if self.stopping() {
-            self.remove_snippet(c, &vmid);
-            let code = self.destroy(c, &vmid)?;
-            if code != 0 {
-                return Ok(Flow::Exit(code));
+            let delivered = self.cx.pve.run_stderr("pct", &["start", &vmid]) == 0
+                && self.ct_deliver(&vmid, &jit);
+            drop(jit);
+            if !delivered {
+                self.log(&format!(
+                    "slot {name}: container {vmid} did not start or did not take the runner config"
+                ));
+                let code = self.destroy(c, &vmid)?;
+                if code != 0 {
+                    return Ok(Flow::Exit(code));
+                }
+                self.delete_runner(c, &token, &runner_id);
+                self.nap(120);
+                return Ok(Flow::Next);
             }
-            self.delete_runner(c, &token, &runner_id);
-            return Ok(Flow::Done);
-        }
-        if self.cx.pve.run_stderr("qm", &["start", &vmid]) != 0 {
-            self.log(&format!("slot {name}: VM {vmid} did not start"));
-            let code = self.destroy(c, &vmid)?;
-            if code != 0 {
-                return Ok(Flow::Exit(code));
+        } else {
+            let layout = template_layout(self.cx, &tpl);
+            self.write_snippet(c, &vmid, &host, &jit.encoded, layout)?;
+            drop(jit.encoded);
+            if !self.create_vm(c, &applied, &tpl, &host, &desc) {
+                self.log(&format!(
+                    "slot {name}: could not create VM {vmid} from template {tpl}"
+                ));
+                self.remove_snippet(c, &vmid);
+                if self.kind(&vmid).is_some() {
+                    let code = self.destroy(c, &vmid)?;
+                    if code != 0 {
+                        return Ok(Flow::Exit(code));
+                    }
+                }
+                self.delete_runner(c, &token, &runner_id);
+                self.nap(120);
+                return Ok(Flow::Next);
             }
-            self.delete_runner(c, &token, &runner_id);
-            self.nap(120);
-            return Ok(Flow::Next);
+            self.write_firewall(c, &vmid)?;
+            if self.stopping() {
+                self.remove_snippet(c, &vmid);
+                let code = self.destroy(c, &vmid)?;
+                if code != 0 {
+                    return Ok(Flow::Exit(code));
+                }
+                self.delete_runner(c, &token, &runner_id);
+                return Ok(Flow::Done);
+            }
+            if self.cx.pve.run_stderr("qm", &["start", &vmid]) != 0 {
+                self.log(&format!("slot {name}: VM {vmid} did not start"));
+                let code = self.destroy(c, &vmid)?;
+                if code != 0 {
+                    return Ok(Flow::Exit(code));
+                }
+                self.delete_runner(c, &token, &runner_id);
+                self.nap(120);
+                return Ok(Flow::Next);
+            }
         }
         self.remove_snippet(c, &vmid);
         let started = (self.now)();
         self.log(&format!(
-            "slot {name}: vm {vmid} up as {runner_name} (template {tpl})"
+            "slot {name}: {} {vmid} up as {runner_name} (template {tpl})",
+            self.kind
         ));
         self.run_hook(c, &["vm-up", &name, &vmid, &runner_name]);
 
@@ -924,7 +994,8 @@ impl Loop<'_> {
                 } else if now - started >= REGISTER_MINUTES * 60 && !self.job_active(&vmid) {
                     self.stuck += 1;
                     self.log(&format!(
-                        "slot {name}: runner {runner_name} not online after {REGISTER_MINUTES} min; replacing vm {vmid} (check its template: mayfly check)"
+                        "slot {name}: runner {runner_name} not online after {REGISTER_MINUTES} min; replacing {} {vmid} (check its template: mayfly check)",
+                        self.kind
                     ));
                     self.run_hook(c, &["vm-stuck", &name, &vmid, &runner_name]);
                     break;
@@ -1050,10 +1121,12 @@ mod tests {
     }
 
     #[test]
-    fn only_vm_slots_run_on_rust() {
+    fn vm_lxc_and_pod_slots_run_on_rust() {
         assert_eq!(engine_for_kind("vm", "engine=rust", ""), Engine::Rust);
-        assert_eq!(engine_for_kind("pod", "engine=rust", "rust"), Engine::Bash);
-        assert_eq!(engine_for_kind("lxc", "", "rust"), Engine::Bash);
+        assert_eq!(engine_for_kind("pod", "engine=rust", "rust"), Engine::Rust);
+        assert_eq!(engine_for_kind("lxc", "", "rust"), Engine::Rust);
+        assert_eq!(engine_for_kind("pod", "", ""), Engine::Bash);
+        assert_eq!(engine_for_kind("zzz", "engine=rust", ""), Engine::Bash);
         assert_eq!(engine_for_kind("vm", "", ""), Engine::Bash);
         assert_eq!(engine_for_kind("vm", "engine=x", "rust"), Engine::Bash);
     }
