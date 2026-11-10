@@ -1,6 +1,7 @@
 //! The GitHub App: a signed JWT, the installation, an installation token and the calls `check` makes.
 //! A token only ever goes in a request header, never in a command line or a log.
 
+use crate::config::Config;
 use crate::out::{die, R};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{json, Value};
@@ -314,5 +315,139 @@ impl RunnerApi for AppRunners {
         let _ = self
             .gh
             .delete(token, &format!("/{}/actions/runners/{id}", self.scope));
+    }
+}
+
+// ------------------------------------------------------------------ the slot loop's calls
+
+/// The answer of `generate-jitconfig`. Never logged, never in a command line.
+pub struct Jit {
+    /// `encoded_jit_config`: the one-use runner config.
+    pub encoded: String,
+    /// `runner.id`, "" when the answer has none.
+    pub runner_id: String,
+}
+
+/// What a slot needs from GitHub; tests use a fake. Every call gets the current pool.env settings, which
+/// the slot loop reads again before each job.
+pub trait SlotApi {
+    /// An installation token.
+    fn install_token(&self, c: &Config) -> Result<String, String>;
+    /// Registers a single-job runner: the body is `jit_body`.
+    fn jit_config(&self, c: &Config, token: &str, name: &str, labels: &str) -> Result<Jit, String>;
+    /// True when runner `id` is online on GitHub.
+    fn runner_online(&self, c: &Config, token: &str, id: &str) -> bool;
+    /// Removes a registration; a failure is ignored.
+    fn delete_runner(&self, c: &Config, token: &str, id: &str);
+}
+
+/// The body of `generate-jitconfig`, byte for byte what bash builds with `jq -nc`: keys in this order, the
+/// labels of `base` and `labels` without empty ones, sorted and unique. `group_id` is the number of
+/// `RUNNER_GROUP_ID`; an Err when it is not valid JSON (jq `--argjson` refuses it too).
+pub fn jit_body(name: &str, group_id: &str, base: &str, labels: &str) -> Result<String, String> {
+    let gid: Value = serde_json::from_str(group_id)
+        .map_err(|_| format!("RUNNER_GROUP_ID={group_id} is not a number"))?;
+    let mut all: Vec<&str> = base
+        .split(',')
+        .chain(labels.split(','))
+        .filter(|l| !l.is_empty())
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    Ok(format!(
+        "{{\"name\":{},\"runner_group_id\":{},\"work_folder\":\"_work\",\"labels\":{}}}",
+        Value::String(name.to_string()),
+        gid,
+        serde_json::to_string(&all).map_err(|e| e.to_string())?
+    ))
+}
+
+impl GitHub {
+    /// `POST <path>` with a JSON body, retried like `call`.
+    fn post_json(&self, bearer: &str, path: &str, body: &str) -> Result<Value, String> {
+        let url = format!("{}{}", self.api_url, path);
+        let auth = format!("Bearer {bearer}");
+        let mut last = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            let sent = self
+                .agent
+                .post(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .send(body);
+            match sent {
+                Ok(mut resp) => {
+                    return resp
+                        .body_mut()
+                        .read_json::<Value>()
+                        .map_err(|e| format!("unreadable answer from {path}: {e}"))
+                }
+                Err(ureq::Error::StatusCode(code)) => {
+                    last = format!("{path}: HTTP {code}");
+                    if !(code == 408 || code == 429 || code >= 500) {
+                        break;
+                    }
+                }
+                Err(e) => last = format!("{path}: {e}"),
+            }
+        }
+        Err(last)
+    }
+}
+
+/// The real GitHub for a slot, asked as the App.
+pub struct AppSlot;
+
+impl SlotApi for AppSlot {
+    fn install_token(&self, c: &Config) -> Result<String, String> {
+        let jwt = jwt_from_file(c.get("APP_ID"), c.get("KEY_PATH")).map_err(|d| d.0)?;
+        GitHub::new(c.get("API_URL")).install_token(&jwt, c.get("INSTALLATION_ID"), &c.scope)
+    }
+
+    fn jit_config(&self, c: &Config, token: &str, name: &str, labels: &str) -> Result<Jit, String> {
+        let body = jit_body(
+            name,
+            c.get("RUNNER_GROUP_ID"),
+            c.get("RUNNER_LABELS_BASE"),
+            labels,
+        )?;
+        let path = format!("/{}/actions/runners/generate-jitconfig", c.scope);
+        let v = GitHub::new(c.get("API_URL")).post_json(token, &path, &body)?;
+        let encoded = match v.get("encoded_jit_config") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err("no encoded_jit_config in the answer".to_string()),
+        };
+        let runner_id = match v.get("runner").and_then(|r| r.get("id")) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        Ok(Jit { encoded, runner_id })
+    }
+
+    fn runner_online(&self, c: &Config, token: &str, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        let path = format!("/{}/actions/runners/{id}", c.scope);
+        GitHub::new(c.get("API_URL"))
+            .call(token, false, &path)
+            .ok()
+            .and_then(|v| {
+                v.get("status")
+                    .and_then(Value::as_str)
+                    .map(|s| s == "online")
+            })
+            .unwrap_or(false)
+    }
+
+    fn delete_runner(&self, c: &Config, token: &str, id: &str) {
+        let _ = GitHub::new(c.get("API_URL"))
+            .delete(token, &format!("/{}/actions/runners/{id}", c.scope));
     }
 }

@@ -68,7 +68,16 @@ pub trait Pve {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v >= 0.0)
             .unwrap_or(secs as f64);
-        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+        // Slices, so that a TERM or INT the slot loop has not handled yet ends the wait early (bash `wait`
+        // returns when a trapped signal arrives).
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || crate::cmd_slot::term_pending() {
+                break;
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(100)));
+        }
     }
 
     /// `pvesm path <volid>`: stdout, empty on failure.
@@ -167,6 +176,12 @@ pub trait Pve {
 
     /// Runs a program that talks to the terminal (stdin, stdout and stderr stay ours); its exit code.
     fn run_loud(&self, prog: &str, args: &[&str]) -> i32 {
+        self.run(prog, args).code
+    }
+
+    /// Runs a program with stdin, stdout and stderr all discarded (`cmd </dev/null >/dev/null 2>&1`): its
+    /// exit code. Nothing is read from it, so a child it leaves running cannot hold this call up.
+    fn run_null(&self, prog: &str, args: &[&str]) -> i32 {
         self.run(prog, args).code
     }
 
@@ -365,6 +380,19 @@ impl Pve for RealPve {
         }
     }
 
+    fn run_null(&self, prog: &str, args: &[&str]) -> i32 {
+        match Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(_) => 127,
+        }
+    }
+
     fn run_stderr(&self, prog: &str, args: &[&str]) -> i32 {
         match Command::new(prog).args(args).stdout(Stdio::null()).status() {
             Ok(s) => s.code().unwrap_or(1),
@@ -552,6 +580,11 @@ impl Pve for FakePve {
     }
 
     fn nap(&self, secs: u64) {
-        self.calls.borrow_mut().push(format!("sleep {secs}"));
+        let line = format!("sleep {secs}");
+        self.calls.borrow_mut().push(line.clone());
+        // `on_call("sleep 30", ...)` lets a test move its clock or send a signal during a wait.
+        if let Some(f) = self.hooks.get(&line) {
+            f();
+        }
     }
 }
