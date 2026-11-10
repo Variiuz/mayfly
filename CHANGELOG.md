@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.3](https://github.com/Variiuz/mayfly/compare/v0.1.2...v0.1.3) (2026-11-10)
+
+
+### Bug Fixes
+
+* **template:** export template.env so the profile's provision.sh sees it ([#11](https://github.com/Variiuz/mayfly/issues/11)) ([16ba093](https://github.com/Variiuz/mayfly/commit/16ba093b5f0c5b6e07043d710e61f331a345dc2b))
+
+## [0.1.2](https://github.com/Variiuz/mayfly/compare/v0.1.1...v0.1.2) (2026-11-10)
+
+
+### Bug Fixes
+
+* **template:** lock builds and only report a template that was really built ([#8](https://github.com/Variiuz/mayfly/issues/8)) ([d71c1ce](https://github.com/Variiuz/mayfly/commit/d71c1cea0e3b0a9a3e4024879ee8bfb6beb607c9))
+
+## [0.1.1](https://github.com/Variiuz/mayfly/compare/v0.1.0...v0.1.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* run jobs on polara-ci templates and show GitHub runner state in status ([#6](https://github.com/Variiuz/mayfly/issues/6)) ([b897484](https://github.com/Variiuz/mayfly/commit/b8974843e6018f6d80cb5503e8d1bfe1af2f8313))
+
 ## 0.1.0 (2026-11-10)
 
 
