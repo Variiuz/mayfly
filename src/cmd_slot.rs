@@ -9,7 +9,6 @@
 //!
 //! The JIT runner config reaches only the 0600 cloud-init snippet: not a command line, not a log line.
 
-use crate::cmd_check::template_layout;
 use crate::cmd_status::free_ram_gb;
 use crate::config::{self, parse_pool_env, slot_opt, Config, Slots};
 use crate::github::{AppSlot, SlotApi};
@@ -540,17 +539,17 @@ impl Loop<'_> {
 
     /// cloud-init user-data for one job VM. It holds the one-use JIT config, so it is 0600 and goes as soon
     /// as the VM has started.
-    fn write_snippet(&mut self, c: &Config, id: &str, host: &str, jit: &str, d: &str) -> R<()> {
+    fn write_snippet(&mut self, c: &Config, id: &str, host: &str, jit: &str) -> R<()> {
         let lines = self.job_env(&self.slot.envspec.clone())?;
         let mut t = String::new();
         t += "#cloud-config\n";
         t += &format!("hostname: {host}\n");
         t += "write_files:\n";
-        t += &format!("  - path: /etc/{d}/jit\n");
+        t += "  - path: /etc/mayfly/jit\n";
         t += "    permissions: '0600'\n";
         t += &format!("    content: {jit}\n");
         if !lines.is_empty() {
-            t += &format!("  - path: /etc/{d}/job.env\n");
+            t += "  - path: /etc/mayfly/job.env\n";
             t += "    permissions: '0600'\n";
             t += "    content: |\n";
             for l in lines.split('\n') {
@@ -559,7 +558,7 @@ impl Loop<'_> {
         }
         // Also start the job from cloud-final, so a template whose unit did not start at boot still works.
         t += "runcmd:\n";
-        t += &format!("  - [systemctl, start, --no-block, {d}-job.service]\n");
+        t += "  - [systemctl, start, --no-block, mayfly-job.service]\n";
         let f = format!("{}/mayfly-{id}.yaml", c.snippet_dir);
         let written = fs::OpenOptions::new()
             .write(true)
@@ -920,8 +919,7 @@ impl Loop<'_> {
                 return Ok(Flow::Next);
             }
         } else {
-            let layout = template_layout(self.cx, &tpl);
-            self.write_snippet(c, &vmid, &host, &jit.encoded, layout)?;
+            self.write_snippet(c, &vmid, &host, &jit.encoded)?;
             drop(jit.encoded);
             if !self.create_vm(c, &applied, &tpl, &host, &desc) {
                 self.log(&format!(

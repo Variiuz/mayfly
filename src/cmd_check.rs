@@ -4,7 +4,7 @@ use crate::cmd_slot::engine_setting;
 use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{self, GitHub};
 use crate::out::{die, Kind, Out, R};
-use crate::pve::{guest_kind, vmid_node, GuestKind};
+use crate::pve::{guest_kind, vmid_node};
 use crate::Ctx;
 use std::fs;
 use std::io::Write;
@@ -35,17 +35,11 @@ fn is_template(cx: &Ctx, id: &str) -> bool {
         .is_some_and(|cfg| cfg.lines().any(|l| l.starts_with("template: 1")))
 }
 
-/// The job files of a VM template: `mayfly` for templates Mayfly built (description `profile <name>`),
-/// else `polara-ci`.
-pub fn template_layout(cx: &Ctx, id: &str) -> &'static str {
-    let built_here = guest_kind(&cx.paths.pve_etc, id)
+/// `built_by_mayfly`: a template `mayfly template build` made (description `profile <name>`).
+pub fn built_by_mayfly(cx: &Ctx, id: &str) -> bool {
+    guest_kind(&cx.paths.pve_etc, id)
         .and_then(|k| cx.pve.guest_config(k, id))
-        .is_some_and(|cfg| cfg.lines().any(|l| l.starts_with("description: profile")));
-    if built_here {
-        "mayfly"
-    } else {
-        "polara-ci"
-    }
+        .is_some_and(|cfg| cfg.lines().any(|l| l.starts_with("description: profile")))
 }
 
 /// The folder of a template profile: /etc/mayfly/profiles/<name> first, then the shipped ones.
@@ -236,16 +230,13 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         .split_whitespace()
         .chain(c.get("NEXT_TEMPLATE_VMID").split_whitespace())
     {
-        if is_template(cx, id)
-            && guest_kind(&cx.paths.pve_etc, id) == Some(GuestKind::Vm)
-            && template_layout(cx, id) != "mayfly"
-        {
+        if is_template(cx, id) && !built_by_mayfly(cx, id) {
             t.item(
                 w,
-                Kind::Warn,
+                Kind::Bad,
                 "template",
                 &format!(
-                    "{id} was built by polara-ci; jobs get its /etc/polara-ci paths. Rebuild: mayfly template build"
+                    "{id} was not built by mayfly template build; its jobs may never start. Build one and promote it"
                 ),
             );
         }

@@ -233,17 +233,15 @@ impl Run<'_> {
         }
     }
 
-    fn legacy_template_note(&mut self, id: &str) {
-        if self.kind(id) != Some(GuestKind::Vm)
-            || cmd_check::template_layout(self.cx, id) == "mayfly"
-        {
-            return;
+    /// Refuses a template mayfly did not build (see `built_by_mayfly`).
+    fn require_mayfly_template(&self, id: &str) -> R<()> {
+        if cmd_check::built_by_mayfly(self.cx, id) {
+            Ok(())
+        } else {
+            die(format!(
+                "template {id} was not built by mayfly template build; its jobs may never start"
+            ))
         }
-        self.out.warn(
-            self.w,
-            &format!("template {id} was built by polara-ci: its jobs get the /etc/polara-ci paths it expects"),
-        );
-        self.hint("rebuild it with mayfly template build when convenient");
     }
 
     fn set_value(&self, key: &str, value: &str) -> R<()> {
@@ -252,7 +250,7 @@ impl Run<'_> {
     }
 
     fn canary(&mut self, id: &str) -> R<i32> {
-        self.legacy_template_note(id);
+        self.require_mayfly_template(id)?;
         if self.kind(id) == Some(GuestKind::Ct) {
             self.set_value("NEXT_LXC_TEMPLATE_VMID", id)?;
             self.done(&format!("lxc slots marked next now clone {id}"));
@@ -267,7 +265,7 @@ impl Run<'_> {
     }
 
     fn promote(&mut self, id: &str) -> R<i32> {
-        self.legacy_template_note(id);
+        self.require_mayfly_template(id)?;
         if self.kind(id) == Some(GuestKind::Ct) {
             self.set_value("LXC_TEMPLATE_VMID", id)?;
             self.set_value("NEXT_LXC_TEMPLATE_VMID", "")?;

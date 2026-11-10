@@ -542,7 +542,7 @@ pre_tpl() {
   printf 'IMAGE_URL=http://img.test/x/disk.img\nTEMPLATE_VMIDS="9094 9095 9096 9054"\nTEMPLATE_VMID=9094\n# keep me\nNEXT_TEMPLATE_VMID=9096\nLXC_TEMPLATE_VMID=9054\n' >>"$g/conf/pool.env"
   guest qemu-server 9094 'name: ci-template-old\ntags: mayfly\ndescription: profile default\ntemplate: 1\n'
   guest qemu-server 9096 'name: ci-template-poly\ntags: mayfly\ntemplate: 1\n'
-  guest lxc 9054 'hostname: ci-ct-template\ntags: mayfly\ntemplate: 1\n'
+  guest lxc 9054 'hostname: ci-ct-template\ndescription: profile default\ntags: mayfly\ntemplate: 1\n'
 }
 pre_badsums() { pre_tpl; echo "0000000000000000000000000000000000000000000000000000000000000000  disk.img" >"$g/sums"; }
 pre_held() {
@@ -553,10 +553,10 @@ pre_held() {
 
 PRE=pre_tpl same_state "template list" template list
 PRE=pre_tpl same_state "template canary, a mayfly template" template canary 9094
-PRE=pre_tpl same_state "template canary, a polara-ci template" template canary 9096
+PRE=pre_tpl same_state "template canary, a template mayfly did not build" template canary 9096
 PRE=pre_tpl same_state "template canary, a container template" template canary 9054
 PRE=pre_tpl same_state "template promote, a mayfly template" template promote 9094
-PRE=pre_tpl same_state "template promote, a polara-ci template" template promote 9096
+PRE=pre_tpl same_state "template promote, a template mayfly did not build" template promote 9096
 PRE=pre_tpl same_state "template promote, a container template" template promote 9054
 PRE=pre_tpl same_state "template canary, not a template" template canary 9002
 PRE=pre_tpl same_state "template canary, no vmid" template canary

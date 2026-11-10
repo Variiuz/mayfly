@@ -96,12 +96,10 @@ f="$t/snippets/mayfly-9002.yaml"
 ok "snippet is 0600" '[ "$(stat -c %a "$f")" = 600 ]'
 ok "snippet has the JIT config and job env" 'grep -q "content: JITCONFIG" "$f" && grep -q "^      TOKEN=t$" "$f"'
 ok "snippet starts mayfly-job" 'grep -q "mayfly-job.service" "$f"'
-write_snippet 9002 ci-s1 JITCONFIG extra polara-ci
-ok "polara-ci layout: its jit path and job unit" 'grep -q "path: /etc/polara-ci/jit" "$f" && grep -q "path: /etc/polara-ci/job.env" "$f" && grep -q "polara-ci-job.service" "$f" && ! grep -q /etc/mayfly "$f"'
-guest qm 9091 'name: ci-template-20261101\ntags: polara-ci\ntemplate: 1\n'
-guest qm 9092 'description: profile polara\nname: ci-template-polara-20261110\ntags: mayfly\ntemplate: 1\n'
-ok "template_layout: polara-ci template without a profile" '[ "$(template_layout 9091)" = polara-ci ]'
-ok "template_layout: mayfly template" '[ "$(template_layout 9092)" = mayfly ]'
+guest qm 9091 'name: ci-template-20261101\ntags: oldtool\ntemplate: 1\n'
+guest qm 9092 'description: profile default\nname: ci-template-default-20261110\ntags: mayfly\ntemplate: 1\n'
+ok "built_by_mayfly: template without a profile description" '! built_by_mayfly 9091'
+ok "built_by_mayfly: mayfly template" 'built_by_mayfly 9092'
 
 # ---- firewall
 printf 'ORG=acme\nGATEWAY=10.66.0.1\nALLOW_OUT="10.1.2.3 10.9.0.0/16"\nCACHE_IP=10.66.0.5\nBLOCK_NETS="10.0.0.0/8"\n' >"$t/conf/pool.env"
@@ -135,12 +133,12 @@ ok "not ours: outside the VMID range" '! is_ours 100'
 LEGACY_TAGS=""
 
 # ---- GitHub's view of a slot
-RUNNER_PREFIX=ci-blake
-GH_RUNNERS=$'ci-blake-s1-100 online false\nci-blake-s2-200 offline false\nci-blake-s3-300 online true\nci-blake-p1-1-400 online false\nci-blake-p1-2-401 offline false'
-guest qm 9011 'description: runner ci-blake-s1-100, template 9098\nname: ci-s1\n'
-guest qm 9012 'description: runner ci-blake-s2-200, template 9097\nname: ci-s2\n'
-guest qm 9013 'description: runner ci-blake-s3-300, template 9098\nname: ci-s3\n'
-guest qm 9014 'description: runner ci-blake-s4-500, template 9098\nname: ci-s4\n'
+RUNNER_PREFIX=ci-pve1
+GH_RUNNERS=$'ci-pve1-s1-100 online false\nci-pve1-s2-200 offline false\nci-pve1-s3-300 online true\nci-pve1-p1-1-400 online false\nci-pve1-p1-2-401 offline false'
+guest qm 9011 'description: runner ci-pve1-s1-100, template 9098\nname: ci-s1\n'
+guest qm 9012 'description: runner ci-pve1-s2-200, template 9097\nname: ci-s2\n'
+guest qm 9013 'description: runner ci-pve1-s3-300, template 9098\nname: ci-s3\n'
+guest qm 9014 'description: runner ci-pve1-s4-500, template 9098\nname: ci-s4\n'
 ok "github_state: online, offline, busy, none" '[ "$(github_state s1 9011 vm)" = online ] && [ "$(github_state s2 9012 vm)" = offline ] && [ "$(github_state s3 9013 vm)" = busy ] && [ "$(github_state s4 9014 vm)" = none ]'
 ok "github_state: pod counts online runners" '[ "$(github_state p1 9041 pod)" = 1/2 ] && [ "$(github_state p9 9049 pod)" = none ]'
 GH_RUNNERS=""
@@ -178,7 +176,7 @@ ok "lxc canary slot clones NEXT_LXC_TEMPLATE_VMID" '[ "$(slot_template)" = 9095 
 kind=vm which=current
 ok "vm slot still clones TEMPLATE_VMID" '[ "$(slot_template)" = 9098 ]'
 ok "CT_NET0 for containers" '[ "$CT_NET0" = "name=eth0,bridge=vmbr0,ip=dhcp,firewall=1" ]'
-guest pct 9097 'hostname: ci-template-default-1\ntags: mayfly\ntemplate: 1\n'
+guest pct 9097 'description: profile default\nhostname: ci-template-default-1\ntags: mayfly\ntemplate: 1\n'
 (cmd_template promote 9097 >/dev/null)
 ok "promote a container template sets LXC_TEMPLATE_VMID only" 'grep -q "^LXC_TEMPLATE_VMID=9097$" "$t/conf/pool.env" && grep -q "^TEMPLATE_VMID=9098$" "$t/conf/pool.env"'
 
@@ -296,8 +294,8 @@ echo "systemd-run \$*" >>"$t/systemd-run.log"
 STUB
 chmod +x "$t/bin/systemd-run"
 : >"$t/systemctl.log"
-(unset INVOCATION_ID; cmd_template build polara --lxc) >/dev/null 2>&1; rc=$?
-ok "template build runs detached in mayfly-template-build, with --foreground" '[ "$rc" = 0 ] && grep -q -- "--unit=mayfly-template-build .*template build polara --lxc --foreground$" "$t/systemd-run.log"'
+(unset INVOCATION_ID; cmd_template build ci --lxc) >/dev/null 2>&1; rc=$?
+ok "template build runs detached in mayfly-template-build, with --foreground" '[ "$rc" = 0 ] && grep -q -- "--unit=mayfly-template-build .*template build ci --lxc --foreground$" "$t/systemd-run.log"'
 ok "template build passes the config dir to the unit" 'grep -q -- "--setenv=MAYFLY_CONF_DIR=$t/conf" "$t/systemd-run.log"'
 rm -f "$t/bin/systemd-run"
 # ---- provision.sh: template.env values reach the profile's provision.sh (a child bash)
