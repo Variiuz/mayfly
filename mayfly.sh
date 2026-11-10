@@ -1165,7 +1165,8 @@ cmd_template() {
       exec 9>>"$BUILD_LOCK"
       flock -n 9 || die "another template build is running (lock $BUILD_LOCK); follow it: journalctl -fu $BUILD_UNIT"
       # A build takes 20 to 40 min: run it in its own unit, so a closed SSH session doesn't kill it.
-      if [ "$fg" = no ] && command -v systemd-run >/dev/null; then
+      # Already in a unit (INVOCATION_ID, e.g. systemd-run by hand): build right here.
+      if [ "$fg" = no ] && [ -z "${INVOCATION_ID:-}" ] && command -v systemd-run >/dev/null; then
         exec 9>&-
         build_detached "${args[@]}"
         return

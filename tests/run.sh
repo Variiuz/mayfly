@@ -293,7 +293,7 @@ echo "systemd-run \$*" >>"$t/systemd-run.log"
 STUB
 chmod +x "$t/bin/systemd-run"
 : >"$t/systemctl.log"
-(cmd_template build polara --lxc) >/dev/null 2>&1; rc=$?
+(unset INVOCATION_ID; cmd_template build polara --lxc) >/dev/null 2>&1; rc=$?
 ok "template build runs detached in mayfly-template-build, with --foreground" '[ "$rc" = 0 ] && grep -q -- "--unit=mayfly-template-build .*template build polara --lxc --foreground$" "$t/systemd-run.log"'
 ok "template build passes the config dir to the unit" 'grep -q -- "--setenv=MAYFLY_CONF_DIR=$t/conf" "$t/systemd-run.log"'
 rm -f "$t/bin/systemd-run"
