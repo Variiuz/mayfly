@@ -2,17 +2,20 @@
 # Runs once inside a fresh Ubuntu cloud VM (cloud-init runcmd from `mayfly template build`), or with
 # MAYFLY_GUEST=lxc inside a fresh container (`mayfly template build --lxc`), and turns it into a CI template: the GitHub runner, Docker, the one-job service, then the profile's own
 # provision.sh (toolchains, libraries), then the profile's pre-pulled images, then the seal.
-# On success the VM powers off and the host converts it into a template. On failure it stays up
+# On success the host shuts the VM down and converts it into a template. On failure it stays up
 # with the log in /var/log/mayfly-provision.log.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
-# Core settings, then the profile's (which may override them).
+# Core settings, then the profile's (which may override them). Exported, so the profile's own
+# provision.sh, which runs in a child bash, sees them too.
+set -a
 # shellcheck source=/dev/null
 . /root/template.env
 mkdir -p /root/profile
 tar -xzf /root/profile.tgz -C /root/profile
 # shellcheck source=/dev/null
 [ ! -e /root/profile/template.env ] || . /root/profile/template.env
+set +a
 INSTALL_DOCKER=${INSTALL_DOCKER:-yes}
 INSTALL_GH=${INSTALL_GH:-yes}
 PREPULL_IMAGES=${PREPULL_IMAGES:-}

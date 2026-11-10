@@ -188,6 +188,13 @@ exec 8>>"$BUILD_LOCK"; flock -n 8
 (cmd_template build) >"$t/lock.out" 2>&1; rc=$?
 ok "template build refuses while another build holds the lock" '[ "$rc" = 1 ] && grep -q "another template build is running" "$t/lock.out"'
 exec 8>&-
+# ---- provision.sh: template.env values reach the profile's provision.sh (a child bash)
+mkdir -p "$t/prov/profile"
+echo 'CORE_X=core' >"$t/prov/template.env"
+echo 'PROFILE_X=profile' >"$t/prov/profile/template.env"
+tar -C "$t/prov/profile" -czf "$t/prov/profile.tgz" .
+sed -n '/^set -a$/,/^set +a$/p' "$here/template/provision.sh" | sed "s|/root/|$t/prov/|g" >"$t/prov/env.sh"
+ok "provision.sh exports core and profile template.env" '[ "$(bash -c ". \"$t/prov/env.sh\"; bash -c \"echo \\\$CORE_X-\\\$PROFILE_X\"")" = core-profile ]'
 ok "help lists the commands" 'cmd_help | grep -q "template build" && cmd_help | grep -q "enable"'
 ok "version" '[[ "$(bash "$here/mayfly" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
 ok "unknown command fails" '! bash "$here/mayfly" nope >/dev/null 2>&1'
