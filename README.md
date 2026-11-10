@@ -159,6 +159,8 @@ whole pod; each container is limited to `vcpu/N` CPUs and `ram/N` GB.
   responded for 5 min, after `POD_MAX_AGE_HOURS` (24, plus 0 to 3.5 h offset by VMID), and when its
   template changes. Draining lets running jobs finish within `MAX_JOB_HOURS`; `systemctl stop` drains
   as well.
+- A pod that is not ready within 30 min is replaced; each repeat waits longer before the next clone
+  (2 min per repeat, at most 30 min).
 
 To move back from pods to VMs, restore the VM slots in `slots.conf`, `mayfly enable` them and
 `mayfly disable` the pod slots.
