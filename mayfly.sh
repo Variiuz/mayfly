@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mayfly.sh: throwaway CI runners on a Proxmox host, one VM (or LXC container) per job.
 # Installed to /usr/local/share/mayfly by install.sh and run as root by the mayfly binary, which owns
-# version, help, status, check, update, gc, enable and disable and hands slot and template to this script.
+# version, help, status, check, update, gc, enable, disable and template and hands slot to this script.
 # It also runs on its own (and then does all of them). See README.md.
 #
 #   mayfly slot <name>               loop behind mayfly-slot@<name>.service (kind=vm, pod or lxc)
@@ -170,7 +170,8 @@ slot_line() { awk -v n="$1" '$1 !~ /^#/ && $1 == n { print; exit }' "$SLOTS_CONF
 slot_opt() { local k; for k in $2; do [[ $k == "$1="* ]] && { echo "${k#*=}"; return; }; done; echo "${3:-}"; }
 slot_names() { awk '$1 !~ /^#/ && NF { print $1 }' "$SLOTS_CONF"; }
 
-nap() { sleep "$1" & wait $! || true; }
+# MAYFLY_TEST_NAP=<seconds> replaces every wait (tests only: the template build polls for minutes).
+nap() { sleep "${MAYFLY_TEST_NAP:-$1}" & wait $! || true; }
 
 # ------------------------------------------------------------------ GitHub App
 
@@ -259,7 +260,7 @@ vm_running() {
     [ "$(lxc-info -n "$1" -sH 2>/dev/null)" = RUNNING ]
     return
   fi
-  pid=$(cat "/var/run/qemu-server/$1.pid" 2>/dev/null) || return 1
+  pid=$(cat "${MAYFLY_QEMU_RUN_DIR:-/var/run/qemu-server}/$1.pid" 2>/dev/null) || return 1
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "-id $1 "
 }
 
@@ -1139,7 +1140,7 @@ legacy_template_note() {
 build_detached() {
   local self env=() v
   self=$(readlink -f "${BASH_SOURCE[0]}")
-  for v in MAYFLY_CONF_DIR MAYFLY_SHARE MAYFLY_PVE_ETC MAYFLY_PVE_FW_DIR MAYFLY_BUILD_LOCK NO_COLOR; do
+  for v in MAYFLY_CONF_DIR MAYFLY_SHARE MAYFLY_PVE_ETC MAYFLY_PVE_FW_DIR MAYFLY_BUILD_LOCK MAYFLY_STATE_DIR NO_COLOR; do
     [ -z "${!v:-}" ] || env+=("--setenv=$v=${!v}")
   done
   systemctl is-active -q "$BUILD_UNIT" 2>/dev/null && die "$BUILD_UNIT is already running; follow it: journalctl -fu $BUILD_UNIT"
@@ -1255,7 +1256,7 @@ template_build() {
   id=$(free_template_vmid) || exit 1
 
   stamp=$(date -u +%Y%m%d)
-  dir=/var/lib/mayfly/images
+  dir=${MAYFLY_STATE_DIR:-/var/lib/mayfly}/images
   mkdir -p "$dir"
   img="$dir/$(basename "$IMAGE_URL")"
   # Ubuntu and Debian publish SHA256SUMS / SHA512SUMS next to their cloud images.

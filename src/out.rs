@@ -108,6 +108,24 @@ impl Out {
         }
     }
 
+    /// `step`: a blue arrow on a terminal, the bare text otherwise.
+    pub fn step(&self, w: &mut dyn Write, msg: &str) {
+        if self.tty {
+            let _ = writeln!(w, "{}›{} {}", self.blu(), self.reset(), msg);
+        } else {
+            let _ = writeln!(w, "{msg}");
+        }
+    }
+
+    /// `hint`: indented, dim on a terminal.
+    pub fn hint(&self, w: &mut dyn Write, msg: &str) {
+        if self.tty {
+            let _ = writeln!(w, "  {}{}{}", self.dim(), msg, self.reset());
+        } else {
+            let _ = writeln!(w, "  {msg}");
+        }
+    }
+
     /// `warn`: `!` on a terminal, `warning:` prefix otherwise.
     pub fn warn(&self, w: &mut dyn Write, msg: &str) {
         if self.tty {

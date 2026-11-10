@@ -2,7 +2,7 @@
 //! trait, so commands can be tested against a recording fake.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -48,6 +48,28 @@ pub trait Pve {
     fn run(&self, prog: &str, args: &[&str]) -> RunOut;
     /// `command -v name`.
     fn has_command(&self, name: &str) -> bool;
+
+    /// Like `run`, but the program's stderr stays ours (`$(cmd)` without `2>/dev/null`).
+    fn run_keep_err(&self, prog: &str, args: &[&str]) -> RunOut {
+        self.run(prog, args)
+    }
+
+    /// Runs a program and returns its exit code and its raw stdout (a tarball is not text).
+    fn run_bytes(&self, prog: &str, args: &[&str]) -> (i32, Vec<u8>) {
+        let r = self.run(prog, args);
+        (r.code, r.stdout.into_bytes())
+    }
+
+    /// bash `nap`: waits `secs` seconds. `MAYFLY_TEST_NAP` (seconds, may be 0) replaces every wait, so
+    /// that a script run in a test does not take minutes.
+    fn nap(&self, secs: u64) {
+        let secs = std::env::var("MAYFLY_TEST_NAP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(secs as f64);
+        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    }
 
     /// `pvesm path <volid>`: stdout, empty on failure.
     fn pvesm_path(&self, volid: &str) -> String {
@@ -135,6 +157,12 @@ pub trait Pve {
     /// `systemctl is-active -q <unit>`: true when the unit is active.
     fn unit_active(&self, unit: &str) -> bool {
         self.run("systemctl", &["is-active", "-q", unit]).code == 0
+    }
+
+    /// Runs a program with `input` on its stdin, its stdout discarded and its stderr left on ours
+    /// (`echo ... | cmd >/dev/null`). Its exit code.
+    fn run_stdin(&self, prog: &str, args: &[&str], _input: &str) -> i32 {
+        self.run(prog, args).code
     }
 
     /// Runs a program that talks to the terminal (stdin, stdout and stderr stay ours); its exit code.
@@ -284,6 +312,52 @@ impl Pve for RealPve {
         }
     }
 
+    fn run_keep_err(&self, prog: &str, args: &[&str]) -> RunOut {
+        match Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+        {
+            Ok(o) => RunOut {
+                code: o.status.code().unwrap_or(1),
+                stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+            },
+            Err(_) => RunOut {
+                code: 127,
+                stdout: String::new(),
+            },
+        }
+    }
+
+    fn run_bytes(&self, prog: &str, args: &[&str]) -> (i32, Vec<u8>) {
+        match Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+        {
+            Ok(o) => (o.status.code().unwrap_or(1), o.stdout),
+            Err(_) => (127, Vec::new()),
+        }
+    }
+
+    fn run_stdin(&self, prog: &str, args: &[&str], input: &str) -> i32 {
+        use std::io::Write;
+        let Ok(mut child) = Command::new(prog)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+        else {
+            return 127;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        child.wait().ok().and_then(|s| s.code()).unwrap_or(1)
+    }
+
     fn run_loud(&self, prog: &str, args: &[&str]) -> i32 {
         match Command::new(prog).args(args).status() {
             Ok(s) => s.code().unwrap_or(1),
@@ -313,7 +387,12 @@ impl Pve for RealPve {
     }
 
     fn qemu_running(&self, id: &str) -> bool {
-        let Ok(pid) = fs::read_to_string(format!("/var/run/qemu-server/{id}.pid")) else {
+        // `MAYFLY_QEMU_RUN_DIR` moves the pid files (tests only), like bash `vm_running`.
+        let dir = match std::env::var("MAYFLY_QEMU_RUN_DIR") {
+            Ok(d) if !d.is_empty() => d,
+            _ => "/var/run/qemu-server".to_string(),
+        };
+        let Ok(pid) = fs::read_to_string(format!("{dir}/{id}.pid")) else {
             return false;
         };
         let pid = pid.trim_end_matches('\n');
@@ -347,6 +426,13 @@ pub struct FakePve {
     commands: Vec<String>,
     running_qemu: Vec<String>,
     calls: RefCell<Vec<String>>,
+    stdins: RefCell<Vec<String>>,
+    /// Scripted answers: each call of the command line takes the next one; the last one repeats.
+    seqs: RefCell<HashMap<String, VecDeque<(i32, String)>>>,
+    /// Run on every call of the command line (a test deletes a file, say).
+    hooks: HashMap<String, Box<dyn Fn()>>,
+    /// Scripted answers of `qemu_running`, one per question; the last one repeats.
+    qemu_states: RefCell<HashMap<String, VecDeque<bool>>>,
 }
 
 impl FakePve {
@@ -356,6 +442,7 @@ impl FakePve {
 
     /// The command line succeeds and prints `stdout`.
     pub fn answer(mut self, line: &str, stdout: &str) -> FakePve {
+        self.seqs.get_mut().remove(line);
         self.answers
             .insert(line.to_string(), (0, stdout.to_string()));
         self
@@ -363,7 +450,23 @@ impl FakePve {
 
     /// The command line exits with `code` and prints nothing.
     pub fn fail(mut self, line: &str, code: i32) -> FakePve {
+        self.seqs.get_mut().remove(line);
         self.answers.insert(line.to_string(), (code, String::new()));
+        self
+    }
+
+    /// The command line answers `(code, stdout)` once each, in order; the last answer repeats.
+    pub fn sequence(self, line: &str, answers: &[(i32, &str)]) -> FakePve {
+        self.seqs.borrow_mut().insert(
+            line.to_string(),
+            answers.iter().map(|(c, o)| (*c, o.to_string())).collect(),
+        );
+        self
+    }
+
+    /// `f` runs on every call of the command line, before it answers.
+    pub fn on_call(mut self, line: &str, f: impl Fn() + 'static) -> FakePve {
+        self.hooks.insert(line.to_string(), Box::new(f));
         self
     }
 
@@ -379,8 +482,21 @@ impl FakePve {
         self
     }
 
+    /// Whether the VM's qemu process is alive, per question: `[true, true, false]` is two yeses, then no.
+    pub fn with_qemu_states(self, id: &str, states: &[bool]) -> FakePve {
+        self.qemu_states
+            .borrow_mut()
+            .insert(id.to_string(), states.iter().copied().collect());
+        self
+    }
+
     pub fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
+    }
+
+    /// What was fed to the stdin of `run_stdin` calls, in order.
+    pub fn stdins(&self) -> Vec<String> {
+        self.stdins.borrow().clone()
     }
 }
 
@@ -391,6 +507,18 @@ impl Pve for FakePve {
             .collect::<Vec<_>>()
             .join(" ");
         self.calls.borrow_mut().push(line.clone());
+        if let Some(f) = self.hooks.get(&line) {
+            f();
+        }
+        if let Some(q) = self.seqs.borrow_mut().get_mut(&line) {
+            let (code, out) = if q.len() > 1 {
+                q.pop_front()
+            } else {
+                q.front().cloned()
+            }
+            .unwrap_or((127, String::new()));
+            return RunOut { code, stdout: out };
+        }
         match self.answers.get(&line) {
             Some((code, out)) => RunOut {
                 code: *code,
@@ -403,11 +531,27 @@ impl Pve for FakePve {
         }
     }
 
+    fn run_stdin(&self, prog: &str, args: &[&str], input: &str) -> i32 {
+        self.stdins.borrow_mut().push(input.to_string());
+        self.run(prog, args).code
+    }
+
     fn has_command(&self, name: &str) -> bool {
         self.commands.iter().any(|c| c == name)
     }
 
     fn qemu_running(&self, id: &str) -> bool {
+        if let Some(q) = self.qemu_states.borrow_mut().get_mut(id) {
+            return if q.len() > 1 {
+                q.pop_front().unwrap_or(false)
+            } else {
+                q.front().copied().unwrap_or(false)
+            };
+        }
         self.running_qemu.iter().any(|i| i == id)
+    }
+
+    fn nap(&self, secs: u64) {
+        self.calls.borrow_mut().push(format!("sleep {secs}"));
     }
 }
