@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/Variiuz/mayfly/compare/v0.5.0...v0.6.0) (2026-11-10)
+
+
+### Features
+
+* rust slot loop for vm slots behind engine=rust ([#29](https://github.com/Variiuz/mayfly/issues/29)) ([c42ef03](https://github.com/Variiuz/mayfly/commit/c42ef03f71fb73efb236444c6d9d6a95ee1e8fdd))
+* rust template build, canary, promote and list ([#27](https://github.com/Variiuz/mayfly/issues/27)) ([e8c1e44](https://github.com/Variiuz/mayfly/commit/e8c1e44cbe8ef9978d5de06b403365fb76f064b1))
+
 ## [0.5.0](https://github.com/Variiuz/mayfly/compare/v0.4.1...v0.5.0) (2026-11-10)
 
 
