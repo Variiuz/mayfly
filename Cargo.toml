@@ -1,0 +1,18 @@
+[package]
+name = "mayfly"
+version = "0.1.0"
+edition = "2021"
+description = "Throwaway GitHub Actions runners on Proxmox VE"
+license = "MIT"
+repository = "https://github.com/Variiuz/mayfly"
+publish = false
+
+[dependencies]
+jsonwebtoken = "9"
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true

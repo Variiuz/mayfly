@@ -41,7 +41,7 @@ fails=0 n=0
 ok() { n=$((n + 1)); if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 
 # shellcheck source=/dev/null
-. "$here/mayfly"
+. "$here/mayfly.sh"
 set +e
 
 # ---- load_env
@@ -167,8 +167,8 @@ ok "warn: prefixed off a terminal" '[ "$(warn x)" = "warning: x" ]'
 ok "item: label column, counts warnings" 'CHECK_WARN=0; out=$(item warn storage "70% used"; echo "$CHECK_WARN"); [ "$out" = "$(printf "warn storage   70%% used\n1")" ]'
 ok "paint pads plain text" '[ "$(paint busy 6 busy=BLU)|" = "busy  |" ]'
 ok "help lists the commands" 'cmd_help | grep -q "template build" && cmd_help | grep -q "enable"'
-ok "version" '[[ "$(bash "$here/mayfly" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
-ok "unknown command fails" '! bash "$here/mayfly" nope >/dev/null 2>&1'
+ok "version" '[[ "$(bash "$here/mayfly.sh" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
+ok "unknown command fails" '! bash "$here/mayfly.sh" nope >/dev/null 2>&1'
 cat >"$t/bin/systemctl" <<STUB
 #!/bin/sh
 echo "systemctl \$*" >>"$t/systemctl.log"

@@ -3,7 +3,9 @@
 #   curl -fsSL https://github.com/variiuz/mayfly/releases/latest/download/install.sh | bash
 #   bash install.sh [--no-timer]                     (from a release tarball or a checkout)
 # Without the files next to it, it downloads the release it belongs to (checked against SHA256SUMS).
-# Installs the command, the units, the template files and the shipped profiles. Creates
+# From a checkout it builds the binary with cargo when there is none next to it.
+# Installs the command (the mayfly binary, and mayfly.sh which it hands most commands to), the units,
+# the template files and the shipped profiles. Creates
 # /etc/mayfly/{pool.env,slots.conf} only when missing. Starts no slot and touches no VM.
 # The gc timer is switched on by the first install only; later installs keep it as it is.
 # --no-timer leaves it off (while another tool still runs slots in the same VMID range).
@@ -27,7 +29,7 @@ command -v qm >/dev/null || die "not a Proxmox host (qm is missing)"
 
 src=""
 [ -z "${BASH_SOURCE[0]:-}" ] || [ ! -f "${BASH_SOURCE[0]}" ] || src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [ -z "$src" ] || [ ! -f "$src/mayfly" ]; then
+if [ -z "$src" ] || [ ! -f "$src/mayfly.sh" ]; then
   # Run from a pipe or on its own: fetch the release.
   [ "$VERSION" != main ] || die "this install.sh is not from a release; use $REPO_URL/releases/latest/download/install.sh"
   command -v curl >/dev/null || die "curl is missing"
@@ -53,14 +55,27 @@ first=no
 
 # Builds without a version command print their help instead; only take a real "mayfly <version>" line.
 old=$( [ "$first" = no ] && /usr/local/sbin/mayfly version 2>/dev/null | awk 'NR == 1 && /^mayfly [0-9]/ { print $2 }' || true)
-new=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' "$src/mayfly")
+bin=$src/mayfly
+if [ ! -f "$bin" ]; then
+  # A checkout has no binary yet.
+  if command -v cargo >/dev/null && [ -f "$src/Cargo.toml" ]; then
+    step "building the mayfly binary"
+    (cd "$src" && cargo build --release --locked) || die "cargo build failed"
+    bin=$src/target/release/mayfly
+  else
+    die "no mayfly binary next to install.sh; use a release"
+  fi
+fi
+new=$("$bin" version 2>/dev/null | awk 'NR == 1 && /^mayfly [0-9]/ { print $2 }' || true)
+[ -n "$new" ] || die "$bin does not run on this host"
 step "installing Mayfly $new${old:+ (was $old)}"
 
 apt-get install -y -q jq curl openssl >/dev/null
 install -d -m 0700 "$conf" "$conf/env"
 install -d -m 0755 "$conf/hooks.d" "$conf/profiles"
-install -m 0755 "$src/mayfly" /usr/local/sbin/mayfly
+install -m 0755 "$bin" /usr/local/sbin/mayfly
 install -d "$share"
+install -m 0755 "$src/mayfly.sh" "$share/mayfly.sh"
 install -m 0644 "$src"/template/{provision.sh,ci-job.sh,pod-vm.sh,mayfly-job.service,template.env} "$share/"
 # Shipped profiles are replaced on every install; your own go in /etc/mayfly/profiles/<name>/.
 rm -rf "$share/profiles"
