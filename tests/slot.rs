@@ -360,8 +360,6 @@ fn a_job_cycle_from_clone_to_runner_delete() {
             PVESM,
             CONFIG_TPL,
             POOL,
-            // template_layout.
-            CONFIG_TPL,
             CLONE,
             default_set(),
             // grow_disk: the template's disk is 32G, the slot wants 60G.
@@ -408,7 +406,7 @@ fn a_job_cycle_from_clone_to_runner_delete() {
 }
 
 #[test]
-fn the_snippet_carries_the_job_env_and_the_polara_ci_layout() {
+fn the_snippet_carries_the_job_env() {
     let rig = Rig::new("", "a-1 9002 linux 8 16 60 cache,missing current\n");
     fs::write(
         format!("{}/cache.env", rig.paths.env_dir),
@@ -423,7 +421,7 @@ fn the_snippet_carries_the_job_env_and_the_polara_ci_layout() {
     assert_eq!(
         rig.started.borrow().snippet.as_deref(),
         Some(
-            "#cloud-config\nhostname: ci-a-1\nwrite_files:\n  - path: /etc/polara-ci/jit\n    permissions: '0600'\n    content: JITSECRET\n  - path: /etc/polara-ci/job.env\n    permissions: '0600'\n    content: |\n      A=1\n      B=two words\nruncmd:\n  - [systemctl, start, --no-block, polara-ci-job.service]\n"
+            "#cloud-config\nhostname: ci-a-1\nwrite_files:\n  - path: /etc/mayfly/jit\n    permissions: '0600'\n    content: JITSECRET\n  - path: /etc/mayfly/job.env\n    permissions: '0600'\n    content: |\n      A=1\n      B=two words\nruncmd:\n  - [systemctl, start, --no-block, mayfly-job.service]\n"
         )
     );
     assert_eq!(
@@ -717,7 +715,6 @@ fn a_clone_that_fails_is_cleaned_up_and_retried() {
             PVESM,
             CONFIG_TPL,
             POOL,
-            CONFIG_TPL,
             CLONE,
             default_set(),
             // The clone exists, so it is destroyed; its runner goes.
