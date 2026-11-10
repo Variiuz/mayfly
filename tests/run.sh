@@ -41,7 +41,7 @@ fails=0 n=0
 ok() { n=$((n + 1)); if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 
 # shellcheck source=/dev/null
-. "$here/mayfly"
+. "$here/mayfly.sh"
 set +e
 
 # ---- load_env
@@ -288,8 +288,8 @@ tar -C "$t/prov/profile" -czf "$t/prov/profile.tgz" .
 sed -n '/^set -a$/,/^set +a$/p' "$here/template/provision.sh" | sed "s|/root/|$t/prov/|g" >"$t/prov/env.sh"
 ok "provision.sh exports core and profile template.env" '[ "$(bash -c ". \"$t/prov/env.sh\"; bash -c \"echo \\\$CORE_X-\\\$PROFILE_X\"")" = core-profile ]'
 ok "help lists the commands" 'cmd_help | grep -q "template build" && cmd_help | grep -q "enable"'
-ok "version" '[[ "$(bash "$here/mayfly" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
-ok "unknown command fails" '! bash "$here/mayfly" nope >/dev/null 2>&1'
+ok "version" '[[ "$(bash "$here/mayfly.sh" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
+ok "unknown command fails" '! bash "$here/mayfly.sh" nope >/dev/null 2>&1'
 cat >"$t/bin/systemctl" <<STUB
 #!/bin/sh
 echo "systemctl \$*" >>"$t/systemctl.log"

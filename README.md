@@ -4,8 +4,9 @@ Ephemeral GitHub Actions runners on Proxmox VE. Each job runs in its own VM or L
 clone of a template, which is destroyed when the job ends. Short jobs can instead run in pods: one
 long-lived VM that runs one throwaway container per job.
 
-Mayfly is a Bash script and a set of systemd units on the Proxmox host. It requires a GitHub App, a
-thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
+Mayfly is a static binary, a Bash script and a set of systemd units on the Proxmox host. The binary
+(Rust) runs `version`, `help`, `status` and `check` and hands every other command to the script. It
+requires a GitHub App, a thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
 
 ## Install
 
@@ -31,7 +32,9 @@ again; configuration, slots and running jobs are kept.
 
 2. In `/etc/mayfly/pool.env`, set `APP_ID`, either `ORG=<org>` or `REPO=<owner>/<name>`, and
    `STORAGE` (thin pool), `BRIDGE` and `VLAN` for job guests. All other options have defaults; see
-   [pool.env.example](pool.env.example).
+   [pool.env.example](pool.env.example). The file is read as plain `KEY=value` lines, optionally
+   quoted, never run as shell: `$VAR`, `$(...)` and other commands are refused, and `mayfly check`
+   lists such lines.
 
 3. In `/etc/mayfly/slots.conf`, add one line per runner slot: name, VMID, labels, vCPU, RAM, disk. See
    [slots.conf.example](slots.conf.example).
@@ -72,7 +75,8 @@ again; configuration, slots and running jobs are kept.
 
 | File | Installed to | Purpose |
 | --- | --- | --- |
-| `mayfly` | `/usr/local/sbin` | slot loop (VM, pod, LXC), status, check, gc, templates, enable/disable |
+| `mayfly` | `/usr/local/sbin` | the command: `version`, `help`, `status`, `check`; runs `mayfly.sh` for the rest |
+| `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC), gc, templates, enable/disable |
 | `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf` |
 | `mayfly-gc.{service,timer}` | systemd | every 15 min: removes stale runner registrations, orphan guests, old snippets |
 | `pool.env.example`, `slots.conf.example` | `/etc/mayfly/` | host settings and slots, with all options documented |
@@ -227,16 +231,19 @@ latency breaks file-lock and timing tests, even with `DISK_CACHE=unsafe`.
 ## Releases
 
 Releases are managed by [release-please](https://github.com/googleapis/release-please). Merging the
-release PR tags the version and attaches `mayfly-<version>.tar.gz`, a version-pinned `install.sh` and
-`SHA256SUMS`. To install a specific version:
+release PR tags the version and attaches `mayfly-<version>.tar.gz`, the binary on its own as
+`mayfly-<version>-x86_64-linux`, a version-pinned `install.sh` and `SHA256SUMS`. To install a specific version:
 
 ```
 curl -fsSL https://github.com/variiuz/mayfly/releases/download/v0.1.0/install.sh | bash
 ```
 
-To install from a checkout: `scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/install.sh`.
+To install from a checkout (the binary is built with `cargo` when the host has it, otherwise the released
+binary of the checkout's version is downloaded and checked against `SHA256SUMS`):
+`scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/install.sh`.
 
-Tests run without Proxmox: `bash tests/run.sh`.
+Tests run without Proxmox: `cargo test` and `bash tests/run.sh`. `bash tests/parity.sh` checks that the
+binary and `mayfly.sh` print the same for `version`, `help`, `status` and `check`.
 
 ## License
 

@@ -14,19 +14,49 @@ concurrency:
 
 jobs:
   check:
-    name: shellcheck and tests
+    name: rust, shellcheck and tests
     # Public: GitHub-hosted (free, and fork PRs never reach your own runners). Private: vars.RUNNER.
     runs-on: ${{ github.event.repository.private && (vars.RUNNER || 'self-hosted') || 'ubuntu-latest' }}
+    env:
+      MUSL: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: rust toolchain
+        run: |
+          SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq musl-tools
+          rustup component add rustfmt clippy
+          rustup target add "$MUSL"
+          cargo --version
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --locked
+      - name: build the static binary
+        run: |
+          cargo build --locked --release --target "$MUSL"
+          bin=target/$MUSL/release/mayfly
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -q 'libc\.so'; then echo "$bin is dynamically linked" >&2; exit 1; fi
       - name: shellcheck
-        run: shellcheck -S warning mayfly install.sh host/*.sh template/*.sh profiles/*/provision.sh tests/*.sh scripts/*.sh
+        run: shellcheck -S warning mayfly.sh install.sh host/*.sh template/*.sh profiles/*/provision.sh tests/*.sh scripts/*.sh
       - name: tests
         run: bash tests/run.sh </dev/null
+      - name: parity
+        run: bash tests/parity.sh "target/$MUSL/release/mayfly" </dev/null
       - name: package
         run: |
-          v=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' mayfly)
-          bash scripts/package.sh "$v" "$RUNNER_TEMP/dist"
+          v=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' mayfly.sh)
+          bash scripts/package.sh "$v" "$RUNNER_TEMP/dist" "target/$MUSL/release/mayfly"
           tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly$"
-          ! tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q /tests/
+          tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly.sh$"
+          tar -tvzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^-rwxr-xr-x.* mayfly-$v/mayfly$"
+          if tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -Eq '/(tests|src)/|Cargo'; then echo "tests or sources in the tarball" >&2; exit 1; fi
           grep -q "^VERSION=$v " "$RUNNER_TEMP/dist/install.sh"
+          grep -q " mayfly-$v-x86_64-linux$" "$RUNNER_TEMP/dist/SHA256SUMS"
+          (cd "$RUNNER_TEMP/dist" && sha256sum -c SHA256SUMS)
+          [ "$("$RUNNER_TEMP/dist/mayfly-$v-x86_64-linux" version)" = "mayfly $v" ]

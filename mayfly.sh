@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# mayfly: throwaway CI runners on a Proxmox host, one VM (or LXC container) per job.
-# Installed to /usr/local/sbin by install.sh, run as root. See README.md.
+# mayfly.sh: throwaway CI runners on a Proxmox host, one VM (or LXC container) per job.
+# Installed to /usr/local/share/mayfly by install.sh and run as root by the mayfly binary, which owns
+# version, help, status and check and hands every other command to this script. It also runs on its
+# own. See README.md.
 #
 #   mayfly slot <name>               loop behind mayfly-slot@<name>.service (kind=vm, pod or lxc)
 #   mayfly status                    slots, VMs, pool fill, free RAM, templates
@@ -794,10 +796,10 @@ cmd_pod() {
 # "<name> <online|offline> <busy>" for every runner of ours on GitHub; fails when GitHub can't be asked.
 github_runners() {
   local token page out
-  token=$(install_token) || return 1
+  token=$(install_token 2>/dev/null) || return 1
   page=1
   while :; do
-    out=$(gh_api "$token" GET "/$SCOPE/actions/runners?per_page=100&page=$page") || return 1
+    out=$(gh_api "$token" GET "/$SCOPE/actions/runners?per_page=100&page=$page" 2>/dev/null) || return 1
     [ "$(jq '.runners | length' <<<"$out")" -gt 0 ] || break
     jq -r --arg p "$RUNNER_PREFIX-" '.runners[] | select(.name | startswith($p)) | "\(.name) \(.status) \(.busy)"' <<<"$out"
     page=$((page + 1))
@@ -1017,7 +1019,7 @@ cmd_check() {
     done
   done < <(slot_names)
   if [ "$n" = 0 ]; then item warn slots "none in $SLOTS_CONF"; else item ok slots "$n in $SLOTS_CONF"; fi
-  e=$(find "$HOOK_DIR" -maxdepth 1 -type f -perm -u+x 2>/dev/null | wc -l)
+  e=$( { find "$HOOK_DIR" -maxdepth 1 -type f -perm -u+x 2>/dev/null || true; } | wc -l)
   [ "$e" = 0 ] || item ok hooks "$e in $HOOK_DIR"
   while read -r e; do
     [ -z "$e" ] || item warn backup "job $e backs up every VM: exclude $VMID_MIN-$VMID_MAX there"

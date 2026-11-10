@@ -27,11 +27,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.rp.outputs.tag_name }}
+      - name: build the static binary
+        if: steps.rp.outputs.release_created
+        run: |
+          SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --locked --release --target x86_64-unknown-linux-musl
       - name: upload the release files
         if: steps.rp.outputs.release_created
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.rp.outputs.tag_name }}
         run: |
-          bash scripts/package.sh "${TAG#v}" "$RUNNER_TEMP/dist"
+          bash scripts/package.sh "${TAG#v}" "$RUNNER_TEMP/dist" target/x86_64-unknown-linux-musl/release/mayfly
           gh release upload "$TAG" "$RUNNER_TEMP"/dist/* --clobber
