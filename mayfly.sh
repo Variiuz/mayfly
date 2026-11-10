@@ -8,7 +8,7 @@
 #   mayfly status                    slots, VMs, pool fill, free RAM, templates
 #   mayfly check                     App key, storage, network, template; changes nothing
 #   mayfly gc                        stale runner registrations, orphan VMs and snippets (timer)
-#   mayfly template build [profile] [--lxc]  new template from the cloud image (or container image)
+#   mayfly template build [profile] [--lxc] [--foreground]  new template from the cloud image (or container image)
 #   mayfly template canary <vmid>    slots marked "next" clone from it
 #   mayfly template promote <vmid>   every slot clones from it (the old one stays for rollback)
 #   mayfly template list
@@ -23,6 +23,7 @@ set -euo pipefail
 MAYFLY_VERSION=0.3.0 # x-release-please-version
 CONF_DIR=${MAYFLY_CONF_DIR:-/etc/mayfly}
 BUILD_LOCK=${MAYFLY_BUILD_LOCK:-/run/lock/mayfly-template-build.lock}
+BUILD_UNIT=mayfly-template-build
 REGISTER_MINUTES=10 # a job guest's runner has to be online on GitHub within this time
 POOL_ENV=$CONF_DIR/pool.env
 SLOTS_CONF=$CONF_DIR/slots.conf
@@ -1129,18 +1130,46 @@ legacy_template_note() {
   hint "rebuild it with mayfly template build when convenient"
 }
 
+# Starts `template build <args> --foreground` in the transient unit BUILD_UNIT and returns.
+build_detached() {
+  local self env=() v
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  for v in MAYFLY_CONF_DIR MAYFLY_SHARE MAYFLY_PVE_ETC MAYFLY_PVE_FW_DIR MAYFLY_BUILD_LOCK NO_COLOR; do
+    [ -z "${!v:-}" ] || env+=("--setenv=$v=${!v}")
+  done
+  systemctl is-active -q "$BUILD_UNIT" 2>/dev/null && die "$BUILD_UNIT is already running; follow it: journalctl -fu $BUILD_UNIT"
+  systemctl reset-failed "$BUILD_UNIT" >/dev/null 2>&1 || true
+  systemd-run -q --unit="$BUILD_UNIT" --description="mayfly template build" --collect "${env[@]}" \
+    bash "$self" template build "$@" --foreground || die "could not start $BUILD_UNIT"
+  done_ "template build started in $BUILD_UNIT"
+  hint "follow it: journalctl -fu $BUILD_UNIT (done when it prints 'ready'; mayfly template list)"
+}
+
 cmd_template() {
   local sub=${1:-}
   load_env
   case "$sub" in
     build)
       shift
-      local lxc=no profile=$PROFILE a
-      for a in "$@"; do if [ "$a" = --lxc ]; then lxc=yes; else profile=$a; fi; done
+      local lxc=no fg=no profile=$PROFILE a args=()
+      for a in "$@"; do
+        case "$a" in
+          --lxc) lxc=yes; args+=("$a") ;;
+          --foreground) fg=yes ;;
+          -*) die "usage: mayfly template build [profile] [--lxc] [--foreground]" ;;
+          *) profile=$a; args+=("$a") ;;
+        esac
+      done
       # One build at a time: a second one would pick the same free VMID and destroy the first's VM.
       mkdir -p "$(dirname "$BUILD_LOCK")"
       exec 9>>"$BUILD_LOCK"
-      flock -n 9 || die "another template build is running (lock $BUILD_LOCK); wait for it to finish"
+      flock -n 9 || die "another template build is running (lock $BUILD_LOCK); follow it: journalctl -fu $BUILD_UNIT"
+      # A build takes 20 to 40 min: run it in its own unit, so a closed SSH session doesn't kill it.
+      if [ "$fg" = no ] && command -v systemd-run >/dev/null; then
+        exec 9>&-
+        build_detached "${args[@]}"
+        return
+      fi
       if [ "$lxc" = yes ]; then template_build_ct "$profile"; else template_build "$profile"; fi ;;
     canary)
       [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template canary <template vmid>"
@@ -1397,7 +1426,8 @@ ${C_B}Usage${C_0}  mayfly <command>
 
 ${C_DIM}Set up${C_0}
   check                             App key, storage, network, template; changes nothing
-  template build [profile] [--lxc]  build a template (VM, or LXC container with --lxc)
+  template build [profile] [--lxc]  build a template (VM, or LXC container with --lxc); runs in
+                                    unit mayfly-template-build, --foreground to wait for it
   template canary <vmid>            slots marked "next" clone it
   template promote <vmid>           every slot clones it from its next job on
   template list

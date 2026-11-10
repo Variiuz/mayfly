@@ -44,6 +44,7 @@ again; configuration, slots and running jobs are kept.
    ```
    mayfly check                  # App, storage and network
    mayfly template build         # Ubuntu 24.04 with runner, Docker, gh; 20 to 40 min
+   journalctl -fu mayfly-template-build
    mayfly template promote 9097  # VMID printed by the build
    mayfly enable                 # starts all slots and the gc timer
    mayfly status
@@ -206,6 +207,8 @@ ct-1  9051  small  2  4  20  no  current  kind=lxc
 ## Templates
 
 `mayfly template build [profile]` builds into a free template VMID (`--lxc` for a container template).
+The build runs in the systemd unit `mayfly-template-build`, so it survives the SSH session; one build
+runs at a time. `--foreground` runs it in the terminal instead.
 `mayfly template canary <vmid>` points slots marked `next` at it. `mayfly template promote <vmid>`
 switches all slots at their next job. The previous template is kept for rollback with
 `mayfly template promote <old>`.
