@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/Variiuz/mayfly/compare/v0.2.0...v0.3.0) (2026-11-10)
+
+
+### Features
+
+* rust binary for version, help, status and check ([#10](https://github.com/Variiuz/mayfly/issues/10)) ([a478fe3](https://github.com/Variiuz/mayfly/commit/a478fe34d3949d5585fc6ceb9487d1f1efef37bb))
+* **slot:** replace a guest whose runner never comes online ([#16](https://github.com/Variiuz/mayfly/issues/16)) ([7765b3a](https://github.com/Variiuz/mayfly/commit/7765b3aaa97978c54933675c226f4370acbd0dfd))
+
 ## [0.2.0](https://github.com/Variiuz/mayfly/compare/v0.1.3...v0.2.0) (2026-11-10)
 
 
