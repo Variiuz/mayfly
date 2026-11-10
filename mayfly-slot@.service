@@ -7,7 +7,7 @@ Wants=network-online.target
 ExecStart=/usr/local/sbin/mayfly slot %i
 Restart=always
 RestartSec=30
-# Stop = drain: an idle VM is stopped at once, a running job may finish (MAX_JOB_HOURS caps it).
+# Stop = drain: an idle guest is destroyed within 30 s, a running job may finish (MAX_JOB_HOURS caps it).
 KillMode=mixed
 TimeoutStopSec=4h
 
