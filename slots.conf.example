@@ -1,0 +1,22 @@
+# /etc/mayfly/slots.conf: one line per slot, one VM at a time per slot.
+# name     vmid  labels        vcpu  ram_gb  disk_gb  env  template  [key=value ...]
+#
+# labels:   comma-separated, on top of RUNNER_LABELS_BASE.
+# env:      job environment: no, or comma-separated names of /etc/mayfly/env/<name>.env (KEY=value lines).
+#           Never give a release slot a cache that PR jobs can write to.
+# template: current, or next = canary slot that clones the template under test.
+# key=value (optional, any order):
+#   kind=vm|pod|lxc     vm (default): one fresh VM per job. pod: ONE long-lived VM running containers=N
+#   containers=N        throwaway containers, one job each (vcpu/ram/disk are the whole pod). See README "Pods".
+#                       lxc: one fresh LXC container per job, from the container template. See README "LXC".
+#   template=<vmid>     clone this template instead of current/next (pin a slot, or a second profile)
+#   bridge=, vlan=      network of this slot instead of BRIDGE/VLAN
+#   cpu=<type>          qm --cpu for this slot
+#   disk_cache=<mode>   instead of DISK_CACHE
+#   max_job_hours=N, max_idle_hours=N
+# VMIDs are cluster-wide: `mayfly check` warns when one is taken on another node.
+build-1    9002  linux         8     16      60       no   current
+build-2    9003  linux         8     16      60       no   next
+small-1    9011  small         2     4       30       no   current
+# pods-1   9041  small         12    36      120      no   current   kind=pod containers=6
+# ct-1     9051  small         2     4       20       no   current   kind=lxc

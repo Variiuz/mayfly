@@ -1,0 +1,6 @@
+[Unit]
+Description=mayfly: remove stale runner registrations, orphan job VMs and snippets
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mayfly gc

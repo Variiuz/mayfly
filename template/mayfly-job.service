@@ -1,0 +1,17 @@
+[Unit]
+Description=Run one GitHub Actions job, then power off
+Wants=network-online.target
+# Not cloud-final: on Ubuntu 24.04 it runs after multi-user.target, a cycle that drops this unit.
+# write_files (the JIT config) is done by cloud-config.
+After=network-online.target cloud-config.service docker.service
+ConditionPathExists=/etc/mayfly/jit
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/mayfly-job
+# The host enforces the job time limit (MAX_JOB_HOURS); nothing here may stop the job early.
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

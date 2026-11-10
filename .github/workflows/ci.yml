@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: shellcheck and tests
+    # Public: GitHub-hosted (free, and fork PRs never reach your own runners). Private: vars.RUNNER.
+    runs-on: ${{ github.event.repository.private && (vars.RUNNER || 'self-hosted') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: shellcheck -S warning mayfly install.sh host/*.sh template/*.sh profiles/*/provision.sh tests/*.sh scripts/*.sh
+      - name: tests
+        run: bash tests/run.sh </dev/null
+      - name: package
+        run: |
+          v=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' mayfly)
+          bash scripts/package.sh "$v" "$RUNNER_TEMP/dist"
+          tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q "^mayfly-$v/mayfly$"
+          ! tar -tzf "$RUNNER_TEMP/dist/mayfly-$v.tar.gz" | grep -q /tests/
+          grep -q "^VERSION=$v " "$RUNNER_TEMP/dist/install.sh"

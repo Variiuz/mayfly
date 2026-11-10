@@ -1,0 +1,15 @@
+[Unit]
+Description=mayfly slot %i (one throwaway VM per job)
+After=network-online.target pve-cluster.service pvedaemon.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/mayfly slot %i
+Restart=always
+RestartSec=30
+# Stop = drain: an idle VM is stopped at once, a running job may finish (MAX_JOB_HOURS caps it).
+KillMode=mixed
+TimeoutStopSec=4h
+
+[Install]
+WantedBy=multi-user.target

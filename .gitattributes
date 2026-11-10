@@ -1,0 +1,9 @@
+# Runs on Linux hosts: keep LF even when copied from a Windows checkout.
+* text eol=lf
+# Not in the release tarball.
+/.github export-ignore
+/tests export-ignore
+/scripts export-ignore
+/.gitattributes export-ignore
+/release-please-config.json export-ignore
+/.release-please-manifest.json export-ignore

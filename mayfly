@@ -1,0 +1,1232 @@
+#!/usr/bin/env bash
+# mayfly: throwaway CI runners on a Proxmox host, one VM (or LXC container) per job.
+# Installed to /usr/local/sbin by install.sh, run as root. See README.md.
+#
+#   mayfly slot <name>               loop behind mayfly-slot@<name>.service (kind=vm, pod or lxc)
+#   mayfly status                    slots, VMs, pool fill, free RAM, templates
+#   mayfly check                     App key, storage, network, template; changes nothing
+#   mayfly gc                        stale runner registrations, orphan VMs and snippets (timer)
+#   mayfly template build [profile] [--lxc]  new template from the cloud image (or container image)
+#   mayfly template canary <vmid>    slots marked "next" clone from it
+#   mayfly template promote <vmid>   every slot clones from it (the old one stays for rollback)
+#   mayfly template list
+#   mayfly enable [slot ...]         start slots (all in slots.conf when none named) and the gc timer
+#   mayfly disable [slot ...]        stop slots after their running job (all when none named)
+#   mayfly version
+#
+# Every VM this tool creates carries the tag TAG (mayfly), a name starting with NAME_PREFIX (ci-) and a
+# VMID inside VMID_MIN..VMID_MAX. It never stops, changes or destroys a VM that misses any of the three.
+set -euo pipefail
+
+MAYFLY_VERSION=0.0.0 # x-release-please-version
+CONF_DIR=${MAYFLY_CONF_DIR:-/etc/mayfly}
+POOL_ENV=$CONF_DIR/pool.env
+SLOTS_CONF=$CONF_DIR/slots.conf
+ENV_DIR=$CONF_DIR/env
+SHARE=${MAYFLY_SHARE:-/usr/local/share/mayfly}
+PVE_ETC=${MAYFLY_PVE_ETC:-/etc/pve}
+PVE_FW_DIR=${MAYFLY_PVE_FW_DIR:-$PVE_ETC/firewall}
+NODE=$(hostname -s)
+
+# ------------------------------------------------------------------ output
+# On a terminal: colour and a symbol per line (NO_COLOR=1 turns colour off). In the journal (slots, gc):
+# plain lines, warnings and errors prefixed, so they stay greppable.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then TTY=1; else TTY=0; fi
+if [ "$TTY" = 1 ]; then
+  C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_BLU=$'\e[36m' C_DIM=$'\e[2m' C_B=$'\e[1m' C_0=$'\e[0m'
+else
+  C_RED="" C_GRN="" C_YEL="" C_BLU="" C_DIM="" C_B="" C_0=""
+fi
+die() {
+  if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then printf '\e[31m✗\e[0m %s\n' "$*" >&2; else printf 'error: %s\n' "$*" >&2; fi
+  exit 1
+}
+log() { printf '%s\n' "$*"; }
+step() { if [ "$TTY" = 1 ]; then printf '%s›%s %s\n' "$C_BLU" "$C_0" "$*"; else log "$*"; fi; }
+done_() { if [ "$TTY" = 1 ]; then printf '%s✓%s %s\n' "$C_GRN" "$C_0" "$*"; else log "$*"; fi; }
+warn() { if [ "$TTY" = 1 ]; then printf '%s!%s %s\n' "$C_YEL" "$C_0" "$*"; else log "warning: $*"; fi; }
+hint() { if [ "$TTY" = 1 ]; then printf '  %s%s%s\n' "$C_DIM" "$*" "$C_0"; else log "  $*"; fi; }
+# One line of `mayfly check`: ok|warn|bad, a label, the text.
+CHECK_WARN=0 CHECK_BAD=0
+item() {
+  local sym col
+  case "$1" in
+    ok) sym=✓ col=$C_GRN ;;
+    warn) sym=! col=$C_YEL; CHECK_WARN=$((CHECK_WARN + 1)) ;;
+    *) sym=✗ col=$C_RED; CHECK_BAD=$((CHECK_BAD + 1)) ;;
+  esac
+  if [ "$TTY" = 1 ]; then printf '%s%s%s %-9s %s\n' "$col" "$sym" "$C_0" "$2" "$3"
+  else printf '%-4s %-9s %s\n' "$1" "$2" "$3"; fi
+}
+
+load_env() {
+  [ -r "$POOL_ENV" ] || die "$POOL_ENV missing (run install.sh)"
+  # Defaults; pool.env overrides them.
+  # GitHub: ORG for organization runners, or REPO=owner/name for runners of one repository.
+  APP_ID="" INSTALLATION_ID="" ORG="" REPO="" RUNNER_GROUP_ID=1 KEY_PATH=$CONF_DIR/app.pem
+  API_URL=https://api.github.com RUNNER_LABELS_BASE="self-hosted,Linux,X64"
+  STORAGE=local-lvm SNIPPET_STORAGE=local BRIDGE=vmbr0 VLAN="" GATEWAY="" CACHE_IP=""
+  FIREWALL=yes BLOCK_NETS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16" ALLOW_OUT=""
+  VMID_MIN=9000 VMID_MAX=9099 TEMPLATE_VMIDS="9097 9098 9099" TEMPLATE_VMID="" NEXT_TEMPLATE_VMID=""
+  TAG=mayfly LEGACY_TAGS="" NAME_PREFIX=ci- CPU_TYPE=""
+  POD_MAX_AGE_HOURS=24 MAX_POOL_PERCENT=70 POOL_PANIC_PERCENT=85 MIN_FREE_RAM_GB=8 MAX_JOB_HOURS=3 MAX_IDLE_HOURS=2 DISK_CACHE='' TEMPLATE_DISK=80
+  PROFILE=default TEMPLATE_CORES=8 TEMPLATE_MEMORY_GB=16 HOOK_DIR=$CONF_DIR/hooks.d
+  LXC_TEMPLATE_VMID="" NEXT_LXC_TEMPLATE_VMID="" LXC_OSTEMPLATE=ubuntu-24.04-standard LXC_TEMPLATE_STORAGE=local
+  IMAGE_URL="" UBUNTU_IMAGE_URL=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+  RUNNER_PREFIX=""
+  # shellcheck source=/dev/null
+  . "$POOL_ENV"
+  IMAGE_URL=${IMAGE_URL:-$UBUNTU_IMAGE_URL}
+  RUNNER_PREFIX=${RUNNER_PREFIX:-${NAME_PREFIX}$NODE}
+  [[ $NAME_PREFIX =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "NAME_PREFIX=$NAME_PREFIX: lowercase letters, digits and dashes only"
+  [[ $TAG =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "TAG=$TAG: lowercase letters, digits, dashes and underscores only"
+  if [ -n "$REPO" ]; then
+    [[ $REPO == */* ]] || die "REPO=$REPO: use owner/name"
+    SCOPE="repos/$REPO"
+  elif [ -n "$ORG" ]; then
+    SCOPE="orgs/$ORG"
+  else
+    die "set ORG (organization runners) or REPO=owner/name (repository runners) in $POOL_ENV"
+  fi
+  net_for "$BRIDGE" "$VLAN"
+  SNIPPET_DIR=$(pvesm path "$SNIPPET_STORAGE:snippets/x" 2>/dev/null | sed 's,/x$,,') || true
+  [ -n "$SNIPPET_DIR" ] || die "storage $SNIPPET_STORAGE has no snippets content (install.sh adds it)"
+}
+
+# NET0 for a bridge and VLAN. Empty VLAN = untagged (host-local bridge).
+net_for() {
+  local fw=1
+  [ "$FIREWALL" = yes ] || fw=0
+  NET0="virtio,bridge=$1${2:+,tag=$2},firewall=$fw"
+  CT_NET0="name=eth0,bridge=$1${2:+,tag=$2},ip=dhcp,firewall=$fw"
+}
+
+# Per-slot settings from the slot's trailing key=value fields, on top of pool.env. Call after load_env.
+# Sets SLOT_TEMPLATE (empty = current/next) and overrides BRIDGE, VLAN, DISK_CACHE, CPU_TYPE,
+# MAX_JOB_HOURS, MAX_IDLE_HOURS for this slot.
+apply_slot() {
+  local x=$1 v
+  SLOT_TEMPLATE=$(slot_opt template "$x")
+  BRIDGE=$(slot_opt bridge "$x" "$BRIDGE")
+  case " $x " in *" vlan="*) VLAN=$(slot_opt vlan "$x") ;; esac
+  case " $x " in *" disk_cache="*) DISK_CACHE=$(slot_opt disk_cache "$x") ;; esac
+  CPU_TYPE=$(slot_opt cpu "$x" "$CPU_TYPE")
+  for v in max_job_hours max_idle_hours; do
+    case " $x " in *" $v="*)
+      local n; n=$(slot_opt "$v" "$x")
+      [[ $n =~ ^[0-9]+$ ]] || die "slot $name: $v=$n must be a whole number of hours"
+      if [ "$v" = max_job_hours ]; then MAX_JOB_HOURS=$n; else MAX_IDLE_HOURS=$n; fi ;;
+    esac
+  done
+  net_for "$BRIDGE" "$VLAN"
+}
+
+# The template a slot clones: its template= field, else current (or next for a canary slot).
+# kind=lxc slots use the container templates (LXC_TEMPLATE_VMID, NEXT_LXC_TEMPLATE_VMID).
+slot_template() {
+  if [ -n "$SLOT_TEMPLATE" ]; then echo "$SLOT_TEMPLATE"; return; fi
+  if [ "${kind:-vm}" = lxc ]; then
+    if [ "$which" = next ]; then echo "${NEXT_LXC_TEMPLATE_VMID:-$LXC_TEMPLATE_VMID}"; else echo "$LXC_TEMPLATE_VMID"; fi
+  elif [ "$which" = next ]; then echo "${NEXT_TEMPLATE_VMID:-$TEMPLATE_VMID}"; else echo "$TEMPLATE_VMID"; fi
+}
+
+# The job environment of a slot's env column, as KEY=value lines: no (or -) = none; a comma-separated
+# list of names = /etc/mayfly/env/<name>.env each.
+job_env() {
+  local spec=$1 n f
+  case "$spec" in no|-|"") return 0 ;; esac
+  for n in ${spec//,/ }; do
+    [[ $n =~ ^[A-Za-z0-9_-]+$ ]] || die "env name $n: letters, digits, dash and underscore only"
+    f="$ENV_DIR/$n.env"
+    if [ -s "$f" ]; then
+      grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$f" || true
+    else
+      log "warning: env $n: $ENV_DIR/$n.env missing or empty; jobs run without it" >&2
+    fi
+  done
+}
+
+# Executables in HOOK_DIR run on events: vm-up <slot> <vmid> <runner>, vm-gone <slot> <vmid> <minutes>,
+# pod-up <slot> <vmid> <containers>, pod-gone <slot> <vmid> <minutes>. 30 s each, failures ignored.
+run_hook() {
+  local h
+  [ -d "$HOOK_DIR" ] || return 0
+  for h in "$HOOK_DIR"/*; do
+    [ -f "$h" ] && [ -x "$h" ] || continue
+    timeout 30 "$h" "$@" </dev/null >/dev/null 2>&1 || warn "hook $(basename "$h") $1 failed"
+  done
+  return 0
+}
+
+# slots.conf: name vmid labels vcpu ram_gb disk_gb env template(current|next) [key=value ...]
+slot_line() { awk -v n="$1" '$1 !~ /^#/ && $1 == n { print; exit }' "$SLOTS_CONF"; }
+# slot_opt <key> "<extra fields>" [default]: value of a trailing key=value field.
+slot_opt() { local k; for k in $2; do [[ $k == "$1="* ]] && { echo "${k#*=}"; return; }; done; echo "${3:-}"; }
+slot_names() { awk '$1 !~ /^#/ && NF { print $1 }' "$SLOTS_CONF"; }
+
+nap() { sleep "$1" & wait $! || true; }
+
+# ------------------------------------------------------------------ GitHub App
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+make_jwt() {
+  local now iss header payload sig
+  now=$(date +%s)
+  if [[ $APP_ID =~ ^[0-9]+$ ]]; then iss=$APP_ID; else iss="\"$APP_ID\""; fi
+  header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+  payload=$(printf '{"iat":%d,"exp":%d,"iss":%s}' $((now - 60)) $((now + 540)) "$iss" | b64url)
+  sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign "$KEY_PATH" -binary | b64url)
+  printf '%s.%s.%s' "$header" "$payload" "$sig"
+}
+
+# gh_api <bearer> <method> <path> [curl args...]; the bearer goes in on stdin, never on the command line.
+gh_api() {
+  local bearer=$1 method=$2 path=$3
+  shift 3
+  curl -fsS --max-time 30 --retry 2 -X "$method" --config - \
+    -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$@" "$API_URL$path" <<<"header = \"Authorization: Bearer $bearer\""
+}
+
+install_token() {
+  local jwt id=$INSTALLATION_ID
+  jwt=$(make_jwt)
+  [ -n "$id" ] || id=$(gh_api "$jwt" GET "/$SCOPE/installation" | jq -er .id)
+  gh_api "$jwt" POST "/app/installations/$id/access_tokens" | jq -er .token
+}
+
+# stdout: the generate-jitconfig answer ({runner: {id, ...}, encoded_jit_config}). Never log it.
+jit_config() {
+  local token=$1 name=$2 labels=$3 body
+  body=$(jq -nc --arg name "$name" --argjson gid "$RUNNER_GROUP_ID" --arg labels "$labels" --arg base "$RUNNER_LABELS_BASE" \
+    '{name: $name, runner_group_id: $gid, work_folder: "_work",
+      labels: ((($base | split(",")) + ($labels | split(","))) | map(select(. != "")) | unique)}')
+  gh_api "$token" POST "/$SCOPE/actions/runners/generate-jitconfig" -d "$body"
+}
+
+delete_runner() {
+  local token=$1 id=$2
+  [ -n "$id" ] || return 0
+  gh_api "$token" DELETE "/$SCOPE/actions/runners/$id" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------ guests (VMs and LXC containers)
+
+# vm, ct, or nothing: what a VMID is on this node. Without qm/pct: every call starts the Proxmox Perl
+# CLI, and ten slots polling it cost whole cores.
+guest_kind() {
+  if [ -e "$PVE_ETC/qemu-server/$1.conf" ]; then echo vm
+  elif [ -e "$PVE_ETC/lxc/$1.conf" ]; then echo ct
+  fi
+}
+# A VM or container exists with this VMID on this node.
+vm_exists() { [ -n "$(guest_kind "$1")" ]; }
+guest_config() {
+  case "$(guest_kind "$1")" in
+    vm) qm config "$1" 2>/dev/null ;;
+    ct) pct config "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# The node a VMID belongs to anywhere in the cluster (empty when unused). qm only sees this node.
+vmid_node() { jq -r --arg id "$1" '.ids[$id].node // empty' "$PVE_ETC/.vmlist" 2>/dev/null; }
+used_elsewhere() { local n; n=$(vmid_node "$1"); [ -n "$n" ] && [ "$n" != "$NODE" ]; }
+vm_running() {
+  local pid
+  if [ "$(guest_kind "$1")" = ct ]; then
+    [ "$(lxc-info -n "$1" -sH 2>/dev/null)" = RUNNING ]
+    return
+  fi
+  pid=$(cat "/var/run/qemu-server/$1.pid" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "-id $1 "
+}
+
+# guest_exec <vmid> <timeout s> <cmd...>: runs a command in a VM (guest agent) or container
+# (lxc-attach). Prints its stdout and returns its exit code; 124 = no answer in time.
+guest_exec() {
+  local id=$1 t=$2 out code
+  shift 2
+  if [ "$(guest_kind "$id")" = ct ]; then
+    timeout "$t" lxc-attach -n "$id" -- "$@" 2>/dev/null
+    return
+  fi
+  out=$(timeout $((t + 5)) qm guest exec "$id" --timeout "$t" -- "$@" 2>/dev/null) || return 124
+  code=$(jq -r '.exitcode // 124' <<<"$out")
+  jq -r '."out-data" // ""' <<<"$out"
+  return "$code"
+}
+
+# True only for VMs this tool made: VMID in range, tag TAG (or one of LEGACY_TAGS), name NAME_PREFIX*.
+is_ours() {
+  local id=$1 cfg t
+  [ "$id" -ge "$VMID_MIN" ] && [ "$id" -le "$VMID_MAX" ] || return 1
+  used_elsewhere "$id" && return 1
+  cfg=$(guest_config "$id") || return 1
+  has_tag() { grep -Eq "^tags:.*(^|[ ;,])$1([ ;,]|$)" <<<"$cfg"; }
+  # A container's name is its hostname.
+  if has_tag "$TAG"; then grep -Eq "^(name|hostname): $NAME_PREFIX" <<<"$cfg"; return; fi
+  # VMs made by an earlier tool (LEGACY_TAGS), named ci-*.
+  for t in $LEGACY_TAGS; do
+    if has_tag "$t"; then grep -q '^name: ci-' <<<"$cfg"; return; fi
+  done
+  return 1
+}
+
+# Job VMs are thrown away after one job, so on a host with slow sync writes (nested, qcow2 on
+# a VMDK) DISK_CACHE=unsafe makes fsync free inside the guest. Empty keeps the template's setting.
+set_disk_cache() {
+  [ -n "$DISK_CACHE" ] || return 0
+  local spec
+  spec=$(qm config "$1" | sed -n 's/^scsi0: //p' | sed 's/,cache=[^,]*//')
+  [ -n "$spec" ] && qm set "$1" --scsi0 "$spec,cache=$DISK_CACHE" >/dev/null
+}
+
+# Size in whole GB of a VM's scsi0 disk (empty when unknown). Rounds a M/T size sensibly.
+disk_gb() {
+  local s
+  s=$(qm config "$1" 2>/dev/null | sed -n 's/^scsi0:.*[,:]size=\([0-9]*[MGT]\).*/\1/p' | head -n1)
+  case "$s" in
+    *G) echo "${s%G}" ;;
+    *T) echo $(( ${s%T} * 1024 )) ;;
+    *M) echo $(( (${s%M} + 1023) / 1024 )) ;;
+  esac
+}
+
+# Grow the clone only when the slot wants more than the template has. Every grow makes ext4 zero-fill
+# new inode tables in the guest (~32 MB per GB added), which is heavy SSD wear at CI volume. A clone
+# cannot shrink, so a smaller slot keeps the template size (thin-provisioned, costs nothing unwritten).
+grow_disk() {
+  local id=$1 want=$2 have
+  have=$(disk_gb "$id")
+  if [ -n "$have" ] && [ "$want" -le "$have" ] 2>/dev/null; then return 0; fi
+  qm resize "$id" scsi0 "${want}G" >/dev/null
+}
+
+is_template() { guest_config "$1" | grep -q '^template: 1'; }
+
+# Stops and destroys a VM or container of ours (never a template), with its disks and firewall file.
+destroy_vm() {
+  local id=$1 kind
+  kind=$(guest_kind "$id")
+  [ -n "$kind" ] || return 0
+  is_ours "$id" || die "VMID $id exists but is not a mayfly guest; refusing to touch it"
+  is_template "$id" && die "VMID $id is a template; refusing to destroy it from a slot"
+  # --purge also drops it from backup jobs, replication and HA.
+  if [ "$kind" = ct ]; then
+    pct stop "$id" --skiplock 1 >/dev/null 2>&1 || true
+    pct destroy "$id" --purge 1 --destroy-unreferenced-disks 1 --force 1 >/dev/null
+  else
+    qm stop "$id" --skiplock 1 --timeout 30 >/dev/null 2>&1 || true
+    qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 --skiplock 1 >/dev/null
+  fi
+  rm -f "$PVE_FW_DIR/$id.fw" "$SNIPPET_DIR/mayfly-$id.yaml"
+}
+
+# True while the runner inside is running a job (VMs: needs qemu-guest-agent in the template).
+job_active() { guest_exec "$1" 10 pgrep -f 'bin/Runner\.Worker' >/dev/null; }
+
+# True only when the guest answered and runs no job. A guest that is slow under load (the exec
+# timing out) counts as busy, so a stop never cancels a running job.
+job_idle() {
+  local rc=0
+  job_seconds "$1" >/dev/null || rc=$?
+  [ "$rc" = 1 ]
+}
+
+# Seconds the oldest job in the VM has run (printed): 0 = busy, 1 = idle, 2 = the guest did not answer.
+job_seconds() {
+  local out code=0
+  # 3, not 1, for "no job": lxc-attach itself fails with 1, which must count as no answer.
+  out=$(guest_exec "$1" 10 sh -c 'p=$(pgrep -of "bin/Runner\.Worker") || exit 3; ps -o etimes= -p "$p"') || code=$?
+  [ "$code" = 0 ] || { [ "$code" = 3 ] && return 1; return 2; }
+  tr -dc 0-9 <<<"$out" | grep . || return 2
+}
+
+pool_percent() {
+  pvesh get "/nodes/$NODE/storage/$STORAGE/status" --output-format json \
+    | jq -r 'if .total > 0 then (.used * 100 / .total | floor) else 100 end'
+}
+
+free_ram_gb() { awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' /proc/meminfo; }
+
+# Room for one more VM of <ram_gb>: thin pool under the cap and RAM left for the host's own VMs.
+has_capacity() {
+  local ram=$1 pct free
+  pct=$(pool_percent) || return 1
+  free=$(free_ram_gb)
+  if [ "$pct" -ge "$MAX_POOL_PERCENT" ]; then
+    log "waiting: $STORAGE is ${pct}% full (cap ${MAX_POOL_PERCENT}%)"
+    return 1
+  fi
+  if [ $((free - ram)) -lt "$MIN_FREE_RAM_GB" ]; then
+    log "waiting: ${free} GB RAM available, a ${ram} GB VM would leave less than ${MIN_FREE_RAM_GB} GB"
+    return 1
+  fi
+}
+
+# Per-VM firewall: nothing in, DNS to the gateway, CACHE_IP and ALLOW_OUT, nothing to BLOCK_NETS,
+# the rest (the internet) out. FIREWALL=no writes none (and net0 has firewall=0).
+write_firewall() {
+  local id=$1 dest net
+  [ "$FIREWALL" = yes ] || { rm -f "$PVE_FW_DIR/$id.fw"; return 0; }
+  {
+    echo "[OPTIONS]"
+    echo "enable: 1"
+    echo "dhcp: 1"
+    echo "policy_in: DROP"
+    echo "policy_out: ACCEPT"
+    echo
+    echo "[RULES]"
+    if [ -n "$GATEWAY" ]; then
+      echo "OUT ACCEPT -dest $GATEWAY -p udp -dport 53"
+      echo "OUT ACCEPT -dest $GATEWAY -p tcp -dport 53"
+    fi
+    for dest in $CACHE_IP $ALLOW_OUT; do echo "OUT ACCEPT -dest $dest"; done
+    # Default: internet only, no other job VM, no LAN, no VLAN behind the gateway, no Tailscale.
+    for net in $BLOCK_NETS; do echo "OUT DROP -dest $net"; done
+  } >"$PVE_FW_DIR/$id.fw"
+}
+
+# cloud-init user-data for one job VM. Holds the one-use JIT config, so 0600 and deleted
+# as soon as the VM has started (Proxmox has built its cloud-init drive by then).
+write_snippet() {
+  local id=$1 host=$2 jit=$3 envspec=$4 f lines
+  f="$SNIPPET_DIR/mayfly-$id.yaml"
+  lines=$(job_env "$envspec")
+  (
+    umask 077
+    {
+      echo "#cloud-config"
+      echo "hostname: $host"
+      echo "write_files:"
+      echo "  - path: /etc/mayfly/jit"
+      echo "    permissions: '0600'"
+      echo "    content: $jit"
+      if [ -n "$lines" ]; then
+        echo "  - path: /etc/mayfly/job.env"
+        echo "    permissions: '0600'"
+        echo "    content: |"
+        sed 's/^/      /' <<<"$lines"
+      fi
+      # Also start the job from cloud-final, so a template whose unit did not start at boot still works.
+      echo "runcmd:"
+      echo "  - [systemctl, start, --no-block, mayfly-job.service]"
+    } >"$f"
+  )
+}
+
+# ------------------------------------------------------------------ LXC containers (kind=lxc)
+
+# A linked clone of the container template, sized for the slot. Uses vcpu, ram of cmd_slot.
+ct_create() {
+  local tpl=$1 id=$2 host=$3 runner=$4
+  pct clone "$tpl" "$id" --hostname "$host" >/dev/null || return 1
+  pct set "$id" --cores "$vcpu" --memory $((ram * 1024)) --swap 0 --onboot 0 \
+    --tags "$TAG" --description "runner $runner, template $tpl" --net0 "$CT_NET0" >/dev/null || return 1
+  ct_grow "$id" "$disk"
+}
+
+# Grows the container's rootfs to <gb> when it is smaller (same reasoning as grow_disk).
+ct_grow() {
+  local id=$1 want=$2 s have=""
+  s=$(pct config "$id" 2>/dev/null | sed -n 's/^rootfs:.*[,:]size=\([0-9]*[MGT]\).*/\1/p' | head -n1)
+  case "$s" in
+    *G) have=${s%G} ;;
+    *T) have=$(( ${s%T} * 1024 )) ;;
+    *M) have=$(( (${s%M} + 1023) / 1024 )) ;;
+  esac
+  if [ -n "$have" ] && [ "$want" -le "$have" ] 2>/dev/null; then return 0; fi
+  pct resize "$id" rootfs "${want}G" >/dev/null
+}
+
+# A container has no cloud-init: once it has booted, the JIT config and the job environment go in
+# over lxc-attach's stdin (never onto the host's disk or a command line), then the job service starts.
+ct_deliver() {
+  local id=$1 jit=$2 lines st i
+  lines=$(job_env "$3")
+  for i in $(seq 60); do
+    st=$(timeout 10 lxc-attach -n "$id" -- systemctl is-system-running 2>/dev/null) || true
+    case "$st" in running|degraded) break ;; esac
+    [ "$i" -lt 60 ] && nap 2
+  done
+  printf '%s' "$jit" | timeout 30 lxc-attach -n "$id" -- sh -c 'umask 077; mkdir -p /etc/mayfly; cat >/etc/mayfly/jit' || return 1
+  if [ -n "$lines" ]; then
+    printf '%s\n' "$lines" | timeout 30 lxc-attach -n "$id" -- sh -c 'umask 077; cat >/etc/mayfly/job.env' || return 1
+  fi
+  timeout 30 lxc-attach -n "$id" -- systemctl start --no-block mayfly-job.service
+}
+
+# ------------------------------------------------------------------ slot loop
+
+stopping=0
+cur_vmid=""
+on_term() {
+  stopping=1
+  # An idle VM goes at once; a VM in a job finishes it (systemd waits, TimeoutStopSec).
+  if [ -n "$cur_vmid" ] && vm_running "$cur_vmid" && job_idle "$cur_vmid"; then
+    if [ "$(guest_kind "$cur_vmid")" = ct ]; then pct stop "$cur_vmid" --skiplock 1 >/dev/null 2>&1 || true
+    else qm stop "$cur_vmid" --skiplock 1 --timeout 30 >/dev/null 2>&1 || true; fi
+  fi
+}
+
+cmd_slot() {
+  local name=$1 line vmid labels vcpu ram disk envspec which extra tpl token resp jit runner_id host started kind
+  load_env
+  line=$(slot_line "$name")
+  [ -n "$line" ] || die "no slot $name in $SLOTS_CONF"
+  read -r _ vmid labels vcpu ram disk envspec which extra <<<"$line"
+  which=${which:-current}
+  extra=${extra:-}
+  apply_slot "$extra"
+  kind=$(slot_opt kind "$extra" vm)
+  case "$kind" in vm|pod|lxc) ;; *) die "slot $name: kind=$kind (vm, pod or lxc)" ;; esac
+  [ "$vmid" -ge "$VMID_MIN" ] && [ "$vmid" -le "$VMID_MAX" ] || die "slot $name: VMID $vmid outside $VMID_MIN..$VMID_MAX"
+  for t in $TEMPLATE_VMIDS; do [ "$vmid" != "$t" ] || die "slot $name: VMID $vmid is a template VMID"; done
+  if used_elsewhere "$vmid"; then
+    log "slot $name: VMID $vmid belongs to node $(vmid_node "$vmid"); pick a free VMID in $SLOTS_CONF"
+    nap 600
+    exit 1
+  fi
+  if [ "$kind" = pod ]; then cmd_pod; return; fi
+  cur_vmid=$vmid
+  trap on_term TERM INT
+
+  while [ "$stopping" = 0 ]; do
+    destroy_vm "$vmid"
+    load_env
+    apply_slot "$extra"
+    tpl=$(slot_template)
+    if [ -z "$tpl" ] || ! is_template "$tpl"; then
+      log "slot $name: no template ${tpl:+$tpl }(TEMPLATE_VMID in $POOL_ENV or template= in $SLOTS_CONF); run mayfly template build"
+      nap 300
+      continue
+    fi
+    if ! has_capacity "$ram"; then nap 60; continue; fi
+
+    # Stopped while waiting for a template or capacity: register nothing, clone nothing.
+    [ "$stopping" = 0 ] || break
+    host="${NAME_PREFIX}$name"
+    runner_name="$RUNNER_PREFIX-$name-$(date +%s)"
+    if ! token=$(install_token) || ! resp=$(jit_config "$token" "$runner_name" "$labels"); then
+      log "slot $name: GitHub refused the runner registration; retrying in 2 min"
+      nap 120
+      continue
+    fi
+    jit=$(jq -er .encoded_jit_config <<<"$resp")
+    runner_id=$(jq -r '.runner.id // empty' <<<"$resp")
+    unset resp
+
+    if [ "$kind" = lxc ]; then
+      if ! ct_create "$tpl" "$vmid" "$host" "$runner_name"; then
+        log "slot $name: could not create container $vmid from template $tpl"
+        vm_exists "$vmid" && destroy_vm "$vmid"
+        delete_runner "$token" "$runner_id"
+        nap 120
+        continue
+      fi
+      write_firewall "$vmid"
+      if [ "$stopping" = 1 ]; then
+        destroy_vm "$vmid"
+        delete_runner "$token" "$runner_id"
+        break
+      fi
+      if ! pct start "$vmid" >/dev/null || ! ct_deliver "$vmid" "$jit" "$envspec"; then
+        log "slot $name: container $vmid did not start or did not take the runner config"
+        unset jit
+        destroy_vm "$vmid"
+        delete_runner "$token" "$runner_id"
+        nap 120
+        continue
+      fi
+      unset jit
+    else
+      write_snippet "$vmid" "$host" "$jit" "$envspec"
+      unset jit
+      if ! qm clone "$tpl" "$vmid" --name "$host" >/dev/null ||
+         ! qm set "$vmid" --cores "$vcpu" --memory $((ram * 1024)) --balloon 0 --onboot 0 ${CPU_TYPE:+--cpu "$CPU_TYPE"} \
+             --tags "$TAG" --description "runner $runner_name, template $tpl" \
+             --net0 "$NET0" --ipconfig0 ip=dhcp \
+             --cicustom "user=$SNIPPET_STORAGE:snippets/mayfly-$vmid.yaml" >/dev/null ||
+         ! grow_disk "$vmid" "$disk" ||
+         ! set_disk_cache "$vmid"; then
+        log "slot $name: could not create VM $vmid from template $tpl"
+        rm -f "$SNIPPET_DIR/mayfly-$vmid.yaml"
+        vm_exists "$vmid" && destroy_vm "$vmid"
+        delete_runner "$token" "$runner_id"
+        nap 120
+        continue
+      fi
+      write_firewall "$vmid"
+      if [ "$stopping" = 1 ]; then
+        rm -f "$SNIPPET_DIR/mayfly-$vmid.yaml"
+        destroy_vm "$vmid"
+        delete_runner "$token" "$runner_id"
+        break
+      fi
+      if ! qm start "$vmid" >/dev/null; then
+        log "slot $name: VM $vmid did not start"
+        destroy_vm "$vmid"
+        delete_runner "$token" "$runner_id"
+        nap 120
+        continue
+      fi
+    fi
+    rm -f "$SNIPPET_DIR/mayfly-$vmid.yaml"
+    started=$(date +%s)
+    log "slot $name: $kind $vmid up as $runner_name (template $tpl)"
+    run_hook vm-up "$name" "$vmid" "$runner_name"
+
+    # The VM powers itself off after its one job. Replace it after MAX_IDLE_HOURS without a job,
+    # so no job lands on an old VM; stop it once its job has run MAX_JOB_HOURS; and stop it when
+    # the slot is stopping and the VM has no job. The guest is only asked once it is MAX_IDLE_HOURS old.
+    job_since=""
+    while vm_running "$vmid"; do
+      now=$(date +%s)
+      if [ -z "$job_since" ] && [ $((now - started)) -ge $((MAX_IDLE_HOURS * 3600)) ]; then
+        rc=0; secs=$(job_seconds "$vmid") || rc=$?
+        if [ "$rc" = 0 ]; then
+          job_since=$((now - secs))
+        elif [ "$rc" = 1 ]; then
+          log "slot $name: VM $vmid had no job for ${MAX_IDLE_HOURS} h; replacing it"
+          break
+        fi
+      fi
+      if [ -n "$job_since" ] && [ $((now - job_since)) -ge $((MAX_JOB_HOURS * 3600)) ]; then
+        log "slot $name: job in VM $vmid ran ${MAX_JOB_HOURS} h; stopping it (its job is cancelled)"
+        break
+      fi
+      # Backstop for a guest that never answers.
+      if [ $((now - started)) -ge $(((MAX_IDLE_HOURS + MAX_JOB_HOURS) * 3600)) ]; then
+        log "slot $name: VM $vmid ran $((MAX_IDLE_HOURS + MAX_JOB_HOURS)) h; stopping it (its job is cancelled)"
+        break
+      fi
+      if [ "$stopping" = 1 ] && job_idle "$vmid"; then break; fi
+      # The pool is shared with other VMs: a full thin pool would break them too, so job VMs go first.
+      ticks=$(( ${ticks:-0} + 1 ))
+      if [ $((ticks % 2)) = 0 ] && pct=$(pool_percent) && [ "$pct" -ge "$POOL_PANIC_PERCENT" ]; then
+        log "slot $name: $STORAGE is ${pct}% full (limit ${POOL_PANIC_PERCENT}%); stopping VM $vmid (its job is cancelled)"
+        break
+      fi
+      nap 30
+    done
+    destroy_vm "$vmid"
+    # An ephemeral runner removes itself after its job; this catches one that never got one.
+    token=$(install_token 2>/dev/null) && delete_runner "$token" "$runner_id"
+    unset token
+    log "slot $name: VM $vmid gone after $(( ($(date +%s) - started) / 60 )) min"
+    run_hook vm-gone "$name" "$vmid" "$(( ($(date +%s) - started) / 60 ))"
+  done
+}
+
+# ------------------------------------------------------------------ pods
+
+# kind=pod: one long-lived VM (clone of the template) runs `containers=N` throwaway containers, one
+# job each, from an image the VM builds from its own filesystem (template/pod-vm.sh). The App key stays
+# here: the host makes the one-use JIT configs and hands each to the VM, which feeds an idle container.
+# The VM is recycled after POD_MAX_AGE_HOURS (staggered by VMID) or when its template stops being the
+# slot's template, after running jobs finish. Uses the variables of cmd_slot.
+pod_exec() {
+  local out
+  out=$(timeout 40 qm guest exec "$vmid" --timeout 30 -- /usr/local/sbin/mayfly-pod "$@" 2>/dev/null) || return 1
+  [ "$(jq -r '.exitcode // 1' <<<"$out")" = 0 ] || return 1
+  jq -r '."out-data" // ""' <<<"$out"
+}
+
+on_term_pod() { stopping=1; }
+
+# cloud-init user-data of a pod: the in-VM script, its limits, and the slot's job environment. 0600, deleted once started.
+write_pod_snippet() {
+  local id=$1 host=$2 n=$3 envspec=$4 f="$SNIPPET_DIR/mayfly-$1.yaml" lines
+  lines=$(job_env "$envspec")
+  (
+    umask 077
+    {
+      echo "#cloud-config"
+      echo "hostname: $host"
+      echo "write_files:"
+      echo "  - path: /usr/local/sbin/mayfly-pod"
+      echo "    permissions: '0755'"
+      echo "    encoding: b64"
+      echo "    content: $(base64 -w0 "$SHARE/pod-vm.sh")"
+      echo "  - path: /etc/mayfly/pod.env"
+      echo "    permissions: '0600'"
+      echo "    content: |"
+      echo "      CONTAINERS=$n"
+      echo "      CPUS=$(awk -v c="$vcpu" -v n="$n" 'BEGIN { printf "%.2f", c / n }')"
+      echo "      MEMORY=$((ram / n))g"
+      echo "      MAX_JOB_SECS=$((MAX_JOB_HOURS * 3600))"
+      echo "      MAX_IDLE_SECS=$((MAX_IDLE_HOURS * 3600))"
+      if [ -n "$lines" ]; then
+        echo "  - path: /etc/mayfly/job.env"
+        echo "    permissions: '0600'"
+        echo "    content: |"
+        sed 's/^/      /' <<<"$lines"
+      fi
+      echo "runcmd:"
+      echo "  - [bash, -c, '/usr/local/sbin/mayfly-pod image > /var/log/mayfly-pod-image.log 2>&1']"
+    } >"$f"
+  )
+}
+
+cmd_pod() {
+  local n tpl cur token resp jit rname want i misses born ready recycle busy waited ticks=0
+  n=$(slot_opt containers "$extra" 4)
+  [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$ram" ] || die "slot $name: containers=$n must be a number from 1 to ram_gb"
+  trap on_term_pod TERM INT
+  while [ "$stopping" = 0 ]; do
+    destroy_vm "$vmid"
+    load_env
+    apply_slot "$extra"
+    tpl=$(slot_template)
+    if [ -z "$tpl" ] || ! is_template "$tpl"; then
+      log "pod $name: no template ${tpl:+$tpl }(TEMPLATE_VMID in $POOL_ENV or template= in $SLOTS_CONF); run mayfly template build"
+      nap 300
+      continue
+    fi
+    if ! has_capacity "$ram"; then nap 60; continue; fi
+    [ "$stopping" = 0 ] || break
+    write_pod_snippet "$vmid" "${NAME_PREFIX}$name" "$n" "$envspec"
+    if ! qm clone "$tpl" "$vmid" --name "${NAME_PREFIX}$name" >/dev/null ||
+       ! qm set "$vmid" --cores "$vcpu" --memory $((ram * 1024)) --balloon 0 --onboot 0 ${CPU_TYPE:+--cpu "$CPU_TYPE"} \
+           --tags "$TAG" --description "pod $name, template $tpl" \
+           --net0 "$NET0" --ipconfig0 ip=dhcp \
+           --cicustom "user=$SNIPPET_STORAGE:snippets/mayfly-$vmid.yaml" >/dev/null ||
+       ! grow_disk "$vmid" "$disk" ||
+       ! set_disk_cache "$vmid"; then
+      log "pod $name: could not create VM $vmid from template $tpl"
+      rm -f "$SNIPPET_DIR/mayfly-$vmid.yaml"
+      vm_exists "$vmid" && destroy_vm "$vmid"
+      nap 120
+      continue
+    fi
+    write_firewall "$vmid"
+    if ! qm start "$vmid" >/dev/null; then
+      log "pod $name: VM $vmid did not start"
+      rm -f "$SNIPPET_DIR/mayfly-$vmid.yaml"
+      destroy_vm "$vmid"
+      nap 120
+      continue
+    fi
+    rm -f "$SNIPPET_DIR/mayfly-$vmid.yaml"
+    born=$(date +%s)
+    log "pod $name: VM $vmid booting ($n containers, template $tpl)"
+    run_hook pod-up "$name" "$vmid" "$n"
+
+    # Ready = the VM has built its container image and started the container loops (minutes).
+    ready=0
+    for _ in $(seq 90); do
+      [ "$stopping" = 0 ] && vm_running "$vmid" || break
+      if pod_exec ready >/dev/null; then ready=1; break; fi
+      nap 20
+    done
+    if [ "$ready" = 1 ]; then log "pod $name: ready after $(( ($(date +%s) - born) / 60 )) min"
+    elif [ "$stopping" = 0 ]; then log "pod $name: VM $vmid never got ready (see /var/log/mayfly-pod-image.log inside); replacing it"; fi
+
+    misses=0 recycle=""
+    while [ "$ready" = 1 ] && [ "$stopping" = 0 ] && vm_running "$vmid"; do
+      if [ $(( $(date +%s) - born )) -ge $((POD_MAX_AGE_HOURS * 3600 + (vmid % 8) * 1800)) ]; then
+        recycle="older than $POD_MAX_AGE_HOURS h"; break
+      fi
+      if [ -n "$SLOT_TEMPLATE" ]; then
+        cur=$SLOT_TEMPLATE
+      else
+        cur=$(sed -n 's/^TEMPLATE_VMID=//p' "$POOL_ENV" | tail -n1)
+        if [ "$which" = next ]; then cur=$(sed -n 's/^NEXT_TEMPLATE_VMID=//p' "$POOL_ENV" | tail -n1); [ -n "$cur" ] || cur=$(sed -n 's/^TEMPLATE_VMID=//p' "$POOL_ENV" | tail -n1); fi
+      fi
+      if [ "$cur" != "$tpl" ]; then recycle="template $cur replaces $tpl"; break; fi
+      # want = container loops waiting for a runner config. One JIT config per waiting loop.
+      if want=$(pod_exec want) && [[ $want =~ ^[0-9]+$ ]]; then
+        misses=0
+        if [ "$want" -gt 0 ] && token=$(install_token); then
+          for i in $(seq "$((want > 8 ? 8 : want))"); do
+            rname="$RUNNER_PREFIX-$name-$i-$(date +%s)"
+            if ! resp=$(jit_config "$token" "$rname" "$labels"); then
+              log "pod $name: GitHub refused the runner registration; retrying in 1 min"
+              nap 60
+              break
+            fi
+            jit=$(jq -er .encoded_jit_config <<<"$resp")
+            pod_exec put "$rname" "$jit" >/dev/null || delete_runner "$token" "$(jq -r '.runner.id // empty' <<<"$resp")"
+          done
+          unset token resp jit
+        fi
+      else
+        misses=$((misses + 1))
+        if [ "$misses" -ge 20 ]; then recycle="the guest has not answered for 5 min"; break; fi
+      fi
+      ticks=$((ticks + 1))
+      if [ $((ticks % 4)) = 0 ] && cur=$(pool_percent) && [ "$cur" -ge "$POOL_PANIC_PERCENT" ]; then
+        log "pod $name: $STORAGE is ${cur}% full (limit ${POOL_PANIC_PERCENT}%); stopping VM $vmid (its jobs are cancelled)"
+        ready=0; break
+      fi
+      nap 15
+    done
+
+    # Drain: no new configs, idle containers go, running jobs finish (MAX_JOB_HOURS caps them in the VM).
+    [ -z "$recycle" ] || log "pod $name: recycling VM $vmid ($recycle)"
+    if [ "$ready" = 1 ]; then
+      pod_exec drain >/dev/null || true
+      waited=0
+      while vm_running "$vmid" && busy=$(pod_exec busy) && [ "${busy:-1}" -gt 0 ] && [ "$waited" -lt $((MAX_JOB_HOURS * 3600 + 600)) ]; do
+        nap 30
+        waited=$((waited + 30))
+      done
+    fi
+    destroy_vm "$vmid"
+    log "pod $name: VM $vmid gone after $(( ($(date +%s) - born) / 60 )) min"
+    run_hook pod-gone "$name" "$vmid" "$(( ($(date +%s) - born) / 60 ))"
+    [ "$stopping" = 1 ] || { [ "$ready" = 1 ] || nap 120; }
+  done
+}
+
+# ------------------------------------------------------------------ status, check, gc
+
+cmd_status() {
+  local name line vmid labels vcpu ram disk envspec which extra state job svc kind
+  load_env
+  [ -s "$SLOTS_CONF" ] && [ -n "$(slot_names)" ] || { warn "no slots in $SLOTS_CONF"; return 0; }
+  printf '%s%-10s %-6s %-4s %-22s %-7s %-9s %-8s %s%s\n' "$C_DIM" SLOT VMID KIND LABELS SIZE SERVICE GUEST JOB "$C_0"
+  while read -r name; do
+    line=$(slot_line "$name")
+    read -r _ vmid labels vcpu ram disk envspec which extra <<<"$line"
+    kind=$(slot_opt kind "${extra:-}" vm)
+    case "$(guest_kind "$vmid")" in
+      vm) state=$(qm status "$vmid" 2>/dev/null | awk '{print $2}') || true ;;
+      ct) state=$(pct status "$vmid" 2>/dev/null | awk '{print $2}') || true ;;
+      *) state="" ;;
+    esac
+    job=-
+    if [ "$state" = running ] && [ "$kind" = pod ]; then
+      job="$(slot_opt containers "$extra" ?) containers"
+    elif [ "$state" = running ]; then
+      job_active "$vmid" && job=busy || job=idle
+    fi
+    svc=$(systemctl is-active "mayfly-slot@$name" 2>/dev/null || true)
+    printf '%-10s %-6s %-4s %-22s %-7s %s %s %s\n' "$name" "$vmid" "$kind" "$labels" "${vcpu}c/${ram}G" \
+      "$(paint "$svc" 9 active=GRN failed=RED activating=BLU deactivating=YEL)" \
+      "$(paint "${state:-none}" 8 running=GRN)" "$(paint "$job" 0 busy=BLU idle=DIM)"
+  done < <(slot_names)
+  echo
+  printf '%s%-10s%s %s %s%% used, limit %s%%\n' "$C_DIM" storage "$C_0" "$STORAGE" "$(pool_percent)" "$MAX_POOL_PERCENT"
+  printf '%s%-10s%s %s GB free, %s GB kept for the host\n' "$C_DIM" ram "$C_0" "$(free_ram_gb)" "$MIN_FREE_RAM_GB"
+  printf '%s%-10s%s %s%s, profile %s\n' "$C_DIM" template "$C_0" "${TEMPLATE_VMID:-none}" "${NEXT_TEMPLATE_VMID:+, next $NEXT_TEMPLATE_VMID}" "$PROFILE"
+  [ -z "$LXC_TEMPLATE_VMID$NEXT_LXC_TEMPLATE_VMID" ] ||
+    printf '%s%-10s%s %s%s\n' "$C_DIM" lxc "$C_0" "${LXC_TEMPLATE_VMID:-none}" "${NEXT_LXC_TEMPLATE_VMID:+, next $NEXT_LXC_TEMPLATE_VMID}"
+}
+
+# paint <text> <width> [value=COLOUR ...]: the text padded to width, coloured when it matches a value.
+paint() {
+  local text=$1 width=$2 m c=""; shift 2
+  for m in "$@"; do [ "${m%%=*}" = "$text" ] && c=${m#*=}; done
+  case "$c" in GRN) c=$C_GRN ;; RED) c=$C_RED ;; YEL) c=$C_YEL ;; BLU) c=$C_BLU ;; DIM) c=$C_DIM ;; *) c="" ;; esac
+  printf '%s%-*s%s' "$c" "$width" "$text" "${c:+$C_0}"
+}
+
+cmd_check() {
+  local jwt token count fw app name line vmid envspec extra e kind p n
+  load_env
+  [ -n "$APP_ID" ] || die "APP_ID is empty in $POOL_ENV"
+  [ -r "$KEY_PATH" ] || die "$KEY_PATH missing: put the GitHub App's private key there"
+  jwt=$(make_jwt)
+  app=$(gh_api "$jwt" GET /app | jq -r .slug) || die "GitHub refused the App key; check APP_ID and $KEY_PATH"
+  token=$(install_token) || die "App $app has no installation token for $SCOPE; is it installed there?"
+  count=$(gh_api "$token" GET "/$SCOPE/actions/runners?per_page=1" | jq -er .total_count) ||
+    die "App $app cannot list the runners of $SCOPE; check its permissions"
+  unset token
+  item ok GitHub "App $app, $count runners in ${SCOPE#*/}"
+  if pvesm status --storage "$STORAGE" >/dev/null 2>&1; then
+    p=$(pool_percent)
+    if [ "$p" -ge "$MAX_POOL_PERCENT" ]; then item warn storage "$STORAGE ${p}% used, over the ${MAX_POOL_PERCENT}% limit: no new VMs"
+    else item ok storage "$STORAGE ${p}% used"; fi
+  else item bad storage "$STORAGE not found (STORAGE in $POOL_ENV)"; fi
+  if ip link show "$BRIDGE" >/dev/null 2>&1; then
+    item ok network "$BRIDGE${VLAN:+, VLAN $VLAN}${GATEWAY:+, gateway $GATEWAY}"
+  else item bad network "bridge $BRIDGE not found (BRIDGE in $POOL_ENV)"; fi
+  fw=$(pve-firewall status 2>/dev/null || true)
+  if [ "$FIREWALL" != yes ]; then
+    item ok firewall "off (FIREWALL=no): isolate job VMs by VLAN or on the host"
+  else case "$fw" in
+    *enabled*) item ok firewall "job VMs reach the internet only" ;;
+    *) item warn firewall "cluster firewall is off, so the per-VM rules do nothing${VLAN:+ (VLAN $VLAN still isolates)}" ;;
+  esac; fi
+  if [ -n "$TEMPLATE_VMID" ] && is_template "$TEMPLATE_VMID"; then item ok template "$TEMPLATE_VMID"
+  else item warn template "none yet: mayfly template build, then mayfly template promote <vmid>"; fi
+  if find_profile "$PROFILE" >/dev/null; then item ok profile "$PROFILE"
+  else item bad profile "$PROFILE not found in $CONF_DIR/profiles or $SHARE/profiles"; fi
+  n=0
+  while read -r name; do
+    n=$((n + 1))
+    line=$(slot_line "$name"); read -r _ vmid _ _ _ _ envspec _ extra <<<"$line"
+    if used_elsewhere "$vmid"; then item bad "$name" "VMID $vmid is taken on node $(vmid_node "$vmid")"; fi
+    kind=$(slot_opt kind "${extra:-}" vm)
+    case "$kind" in
+      vm|pod) ;;
+      lxc)
+        command -v lxc-attach >/dev/null || item bad "$name" "kind=lxc, but lxc-attach is missing"
+        [ -n "$(slot_opt template "${extra:-}")" ] || [ -n "$LXC_TEMPLATE_VMID" ] || item warn "$name" "kind=lxc, no container template yet: mayfly template build --lxc" ;;
+      *) item bad "$name" "unknown kind=$kind (vm, pod or lxc)" ;;
+    esac
+    e=$(slot_opt template "${extra:-}")
+    if [ -n "$e" ] && ! is_template "$e"; then item bad "$name" "template=$e is not a template"; fi
+    for e in ${envspec//,/ }; do
+      case "$e" in no|-) continue ;; esac
+      [ -s "$ENV_DIR/$e.env" ] || item warn "$name" "env $e: $ENV_DIR/$e.env is missing"
+    done
+  done < <(slot_names)
+  if [ "$n" = 0 ]; then item warn slots "none in $SLOTS_CONF"; else item ok slots "$n in $SLOTS_CONF"; fi
+  e=$(find "$HOOK_DIR" -maxdepth 1 -type f -perm -u+x 2>/dev/null | wc -l)
+  [ "$e" = 0 ] || item ok hooks "$e in $HOOK_DIR"
+  while read -r e; do
+    [ -z "$e" ] || item warn backup "job $e backs up every VM: exclude $VMID_MIN-$VMID_MAX there"
+  done < <(pvesh get /cluster/backup --output-format json 2>/dev/null | jq -r '.[] | select(.all == 1) | .id' || true)
+  echo
+  if [ "$CHECK_BAD" -gt 0 ]; then printf '%s%s problem(s) to fix.%s\n' "$C_RED" "$CHECK_BAD" "$C_0"; return 1
+  elif [ "$CHECK_WARN" -gt 0 ]; then printf '%sReady, with %s warning(s).%s\n' "$C_YEL" "$CHECK_WARN" "$C_0"
+  else printf '%sAll good.%s\n' "$C_GRN" "$C_0"; fi
+}
+
+cmd_gc() {
+  local token page names live id name status busy f vmid born now
+  load_env
+  # Runner names of the VMs that exist right now. (An && list as the last command would make the
+  # substitution fail under set -e whenever the highest VMID is free.)
+  live=$(for vmid in $(seq "$VMID_MIN" "$VMID_MAX"); do
+           if vm_exists "$vmid"; then
+             guest_config "$vmid" | sed -n 's/^description: runner \([^ ,]*\).*/\1/p' || true
+           fi
+         done)
+  token=$(install_token) || die "could not mint an installation token"
+  page=1
+  while :; do
+    names=$(gh_api "$token" GET "/$SCOPE/actions/runners?per_page=100&page=$page") || break
+    [ "$(jq '.runners | length' <<<"$names")" -gt 0 ] || break
+    while read -r id name status busy; do
+      [[ $name == "$RUNNER_PREFIX"-* ]] || continue
+      [ "$status" = offline ] && [ "$busy" = false ] || continue
+      grep -qxF "$name" <<<"$live" && continue
+      # A slot registers its runner (named <prefix>-<slot>-<epoch>) before qm set writes the
+      # description onto the new clone, so a fresh registration has no matching VM yet. Leave
+      # registrations younger than 10 minutes alone.
+      born=${name##*-}
+      now=$(date +%s)
+      if [[ $born =~ ^[0-9]+$ ]] && (( now - born < 600 )); then
+        continue
+      fi
+      log "gc: removing stale registration $name"
+      delete_runner "$token" "$id"
+    done < <(jq -r '.runners[] | "\(.id) \(.name) \(.status) \(.busy)"' <<<"$names")
+    page=$((page + 1))
+  done
+  unset token
+  # VMs of slots that no longer exist or whose service is not running.
+  for vmid in $(seq "$VMID_MIN" "$VMID_MAX"); do
+    vm_exists "$vmid" && is_ours "$vmid" && ! is_template "$vmid" || continue
+    # Template VMIDs belong to `template build`; a build in progress is not a template yet.
+    case " $TEMPLATE_VMIDS " in *" $vmid "*) continue ;; esac
+    name=$(awk -v v="$vmid" '$1 !~ /^#/ && $2 == v { print $1; exit }' "$SLOTS_CONF")
+    if [ -z "$name" ] || ! systemctl is-active -q "mayfly-slot@$name"; then
+      log "gc: destroying orphan VM $vmid"
+      destroy_vm "$vmid"
+    fi
+  done
+  # Snippets left by a crash between write and start.
+  for f in "$SNIPPET_DIR"/mayfly-*.yaml; do
+    [ -e "$f" ] || continue
+    vmid=${f##*mayfly-}; vmid=${vmid%.yaml}
+    [[ $vmid =~ ^[0-9]+$ ]] || continue
+    vm_running "$vmid" && continue
+    [ -z "$(find "$f" -mmin +30)" ] || rm -f "$f"
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------ templates
+
+set_pool_value() {
+  local key=$1 value=$2
+  if grep -q "^$key=" "$POOL_ENV"; then
+    sed -i "s|^$key=.*|$key=$value|" "$POOL_ENV"
+  else
+    echo "$key=$value" >>"$POOL_ENV"
+  fi
+}
+
+cmd_template() {
+  local sub=${1:-}
+  load_env
+  case "$sub" in
+    build)
+      shift
+      local lxc=no profile=$PROFILE a
+      for a in "$@"; do if [ "$a" = --lxc ]; then lxc=yes; else profile=$a; fi; done
+      if [ "$lxc" = yes ]; then template_build_ct "$profile"; else template_build "$profile"; fi ;;
+    canary)
+      [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template canary <template vmid>"
+      if [ "$(guest_kind "$2")" = ct ]; then
+        set_pool_value NEXT_LXC_TEMPLATE_VMID "$2"; done_ "lxc slots marked next now clone $2"
+      else
+        set_pool_value NEXT_TEMPLATE_VMID "$2"; done_ "slots marked next now clone $2"
+      fi
+      hint "when their jobs pass: mayfly template promote $2" ;;
+    promote)
+      [ -n "${2:-}" ] && is_template "$2" && is_ours "$2" || die "usage: mayfly template promote <template vmid>"
+      if [ "$(guest_kind "$2")" = ct ]; then
+        set_pool_value LXC_TEMPLATE_VMID "$2"; set_pool_value NEXT_LXC_TEMPLATE_VMID ""
+        done_ "every lxc slot clones $2 from its next job on"
+      else
+        set_pool_value TEMPLATE_VMID "$2"; set_pool_value NEXT_TEMPLATE_VMID ""
+        done_ "every slot clones $2 from its next job on"
+      fi ;;
+    list)
+      for t in $TEMPLATE_VMIDS; do
+        vm_exists "$t" || continue
+        printf '%s %s %s%s%s\n' "$t" "$(guest_kind "$t")" "$(guest_config "$t" | sed -n 's/^\(name\|hostname\): //p')" \
+          "$([ "$t" = "$TEMPLATE_VMID" ] || [ "$t" = "$LXC_TEMPLATE_VMID" ] && echo ' (current)')" \
+          "$([ "$t" = "$NEXT_TEMPLATE_VMID" ] || [ "$t" = "$NEXT_LXC_TEMPLATE_VMID" ] && echo ' (next)')"
+      done ;;
+    *) die "usage: mayfly template build [profile] [--lxc]|canary <vmid>|promote <vmid>|list" ;;
+  esac
+}
+
+# The folder of a template profile: /etc/mayfly/profiles/<name> first, then the shipped ones.
+find_profile() {
+  local d
+  [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  for d in "$CONF_DIR/profiles/$1" "$SHARE/profiles/$1"; do
+    [ -d "$d" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# Builds into the first template VMID that is neither current nor next. Clones keep their base,
+# so an old template can only be replaced once no job VM still runs from it.
+# The first template VMID that is no current or next template (VM or container), emptied: an old
+# template there is destroyed, unless a VM or container is still a linked clone of it.
+free_template_vmid() {
+  local t id="" f
+  for t in $TEMPLATE_VMIDS; do
+    case " $TEMPLATE_VMID $NEXT_TEMPLATE_VMID $LXC_TEMPLATE_VMID $NEXT_LXC_TEMPLATE_VMID " in *" $t "*) continue ;; esac
+    used_elsewhere "$t" && continue
+    id=$t
+    break
+  done
+  [ -n "$id" ] || die "no free template VMID in TEMPLATE_VMIDS ($TEMPLATE_VMIDS); add one"
+  if vm_exists "$id"; then
+    is_ours "$id" || die "VMID $id exists and is not a mayfly guest"
+    for f in "$PVE_ETC"/qemu-server/*.conf "$PVE_ETC"/lxc/*.conf; do
+      [ -e "$f" ] && [ "$(basename "$f" .conf)" != "$id" ] || continue
+      grep -q "base-$id-disk" "$f" && die "template $id still has clones ($(basename "$f" .conf))"
+    done
+    step "removing old template $id" >&2
+    if [ "$(guest_kind "$id")" = ct ]; then
+      pct destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null
+    else
+      qm destroy "$id" --purge 1 --destroy-unreferenced-disks 1 >/dev/null
+    fi
+  fi
+  echo "$id"
+}
+
+template_build() {
+  local profile=$1 pdir id t img dir sums stamp snippet stype fmt
+  pdir=$(find_profile "$profile") || die "profile $profile not found in $CONF_DIR/profiles or $SHARE/profiles"
+  id=$(free_template_vmid) || exit 1
+
+  stamp=$(date -u +%Y%m%d)
+  dir=/var/lib/mayfly/images
+  mkdir -p "$dir"
+  img="$dir/$(basename "$IMAGE_URL")"
+  # Ubuntu and Debian publish SHA256SUMS / SHA512SUMS next to their cloud images.
+  sums=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "$(dirname "$IMAGE_URL")/SHA256SUMS") ||
+    die "no SHA256SUMS next to $IMAGE_URL; refusing an unchecked image"
+  step "downloading $(basename "$IMAGE_URL")"
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$img.part" "$IMAGE_URL"
+  echo "$(grep -E " \*?$(basename "$IMAGE_URL")\$" <<<"$sums" | awk '{print $1}')  $img.part" | sha256sum -c - >/dev/null \
+    || die "checksum of the cloud image does not match SHA256SUMS"
+  mv "$img.part" "$img"
+
+  snippet="$SNIPPET_DIR/mayfly-$id.yaml"
+  (
+    umask 077
+    {
+      echo "#cloud-config"
+      echo "hostname: ${NAME_PREFIX}template"
+      echo "write_files:"
+      echo "  - path: /root/provision.sh"
+      echo "    permissions: '0700'"
+      echo "    encoding: b64"
+      echo "    content: $(base64 -w0 "$SHARE/provision.sh")"
+      echo "  - path: /root/ci-job.sh"
+      echo "    encoding: b64"
+      echo "    content: $(base64 -w0 "$SHARE/ci-job.sh")"
+      echo "  - path: /root/mayfly-job.service"
+      echo "    encoding: b64"
+      echo "    content: $(base64 -w0 "$SHARE/mayfly-job.service")"
+      echo "  - path: /root/template.env"
+      echo "    encoding: b64"
+      echo "    content: $(base64 -w0 "$SHARE/template.env")"
+      echo "  - path: /root/profile.tgz"
+      echo "    encoding: b64"
+      echo "    content: $(tar -C "$pdir" -czf - . | base64 -w0)"
+      echo "runcmd:"
+      echo "  - [bash, -c, 'CACHE_IP=$CACHE_IP /root/provision.sh > /var/log/mayfly-provision.log 2>&1 && poweroff || touch /var/log/mayfly-provision.failed']"
+    } >"$snippet"
+  )
+
+  step "building template VM $id, profile $profile (20 to 40 min)"
+  qm create "$id" --name "${NAME_PREFIX}template-build" --tags "$TAG" --ostype l26 --cpu host \
+    --cores "$TEMPLATE_CORES" --memory $((TEMPLATE_MEMORY_GB * 1024)) --description "profile $profile" \
+    --balloon 0 --scsihw virtio-scsi-single --agent enabled=1 --serial0 socket --vga serial0 \
+    --net0 "$NET0" --ipconfig0 ip=dhcp \
+    --cicustom "user=$SNIPPET_STORAGE:snippets/mayfly-$id.yaml" >/dev/null
+  # File-based storage needs qcow2 so that linked clones work; LVM-thin keeps its raw volumes.
+  stype=$(pvesh get "/storage/$STORAGE" --output-format json 2>/dev/null | jq -r '.type // empty' 2>/dev/null) || stype=""
+  fmt=""
+  case "$stype" in dir|nfs|cifs) fmt=",format=qcow2" ;; esac
+  qm set "$id" --scsi0 "$STORAGE:0,import-from=$img,discard=on,iothread=1,ssd=1$fmt" >/dev/null
+  qm set "$id" --ide2 "$STORAGE:cloudinit" --boot order=scsi0 >/dev/null
+  qm resize "$id" scsi0 "${TEMPLATE_DISK}G" >/dev/null
+  write_firewall "$id"
+  qm start "$id" >/dev/null
+
+  local waited=0
+  while vm_running "$id"; do
+    if [ "$waited" -ge 5400 ]; then
+      die "template VM $id still running after 90 min; see 'qm terminal $id' or /var/log/mayfly-provision.log inside"
+    fi
+    nap 30
+    waited=$((waited + 30))
+    # provision.sh failed: stop now instead of waiting out the 90 minutes.
+    if [ $((waited % 120)) = 0 ] &&
+      qm guest exec "$id" --timeout 20 -- test -e /var/log/mayfly-provision.failed 2>/dev/null |
+        jq -e '.exitcode == 0' >/dev/null 2>&1; then
+      qm guest exec "$id" --timeout 20 -- tail -n 30 /var/log/mayfly-provision.log 2>/dev/null | jq -r '."out-data" // empty' >&2 || true
+      die "provisioning failed in template VM $id (log above; VM left running for a look, 'mayfly template build' again replaces it)"
+    fi
+  done
+  rm -f "$snippet"
+  qm set "$id" --delete cicustom --name "${NAME_PREFIX}template-$profile-$stamp" >/dev/null
+  qm template "$id" >/dev/null
+  done_ "template $id ready (${NAME_PREFIX}template-$profile-$stamp)"
+  hint "next: mayfly template canary $id, watch a job, then mayfly template promote $id"
+}
+
+# Container template: an unprivileged LXC container (nesting and keyctl on, for Docker) from the
+# distribution's container image, provisioned with the same core and profile as a VM template, then
+# converted. pveam checks the image against its index's checksum.
+template_build_ct() {
+  local profile=$1 pdir id file stamp tgz f st i
+  pdir=$(find_profile "$profile") || die "profile $profile not found in $CONF_DIR/profiles or $SHARE/profiles"
+  command -v pveam >/dev/null && command -v lxc-attach >/dev/null || die "pveam/lxc-attach missing: not a Proxmox host?"
+  id=$(free_template_vmid) || exit 1
+  stamp=$(date -u +%Y%m%d)
+  pveam update >/dev/null || warn "pveam update failed; using the cached image index"
+  file=$(pveam available --section system | awk '{print $2}' | grep "^$LXC_OSTEMPLATE" | sort -V | tail -n1)
+  [ -n "$file" ] || die "no container image matching LXC_OSTEMPLATE=$LXC_OSTEMPLATE (pveam available --section system)"
+  if ! pveam list "$LXC_TEMPLATE_STORAGE" | grep -q "vztmpl/$file"; then
+    step "downloading $file"
+    pveam download "$LXC_TEMPLATE_STORAGE" "$file" >/dev/null
+  fi
+
+  step "building container template $id, profile $profile (15 to 30 min)"
+  pct create "$id" "$LXC_TEMPLATE_STORAGE:vztmpl/$file" --hostname "${NAME_PREFIX}template-build" \
+    --unprivileged 1 --features nesting=1,keyctl=1 --ostype ubuntu --onboot 0 \
+    --cores "$TEMPLATE_CORES" --memory $((TEMPLATE_MEMORY_GB * 1024)) --swap 0 \
+    --rootfs "$STORAGE:$TEMPLATE_DISK" --net0 "$CT_NET0" \
+    --tags "$TAG" --description "profile $profile" >/dev/null
+  write_firewall "$id"
+  pct start "$id" >/dev/null
+  for i in $(seq 60); do
+    st=$(timeout 10 lxc-attach -n "$id" -- systemctl is-system-running 2>/dev/null) || true
+    case "$st" in running|degraded) break ;; esac
+    [ "$i" -lt 60 ] && nap 2
+  done
+  for i in $(seq 30); do
+    timeout 10 lxc-attach -n "$id" -- getent hosts github.com >/dev/null 2>&1 && break
+    [ "$i" -lt 30 ] && nap 2
+  done
+  for f in provision.sh ci-job.sh mayfly-job.service template.env; do
+    pct push "$id" "$SHARE/$f" "/root/$f" >/dev/null
+  done
+  tgz=$(mktemp)
+  tar -C "$pdir" -czf "$tgz" .
+  pct push "$id" "$tgz" /root/profile.tgz >/dev/null
+  rm -f "$tgz"
+  if ! timeout 5400 pct exec "$id" -- env MAYFLY_GUEST=lxc CACHE_IP="$CACHE_IP" \
+      bash -c 'bash /root/provision.sh > /var/log/mayfly-provision.log 2>&1'; then
+    timeout 20 lxc-attach -n "$id" -- tail -n 30 /var/log/mayfly-provision.log >&2 || true
+    die "provisioning failed in container $id (log above; left running for a look, 'mayfly template build --lxc' again replaces it)"
+  fi
+  pct stop "$id" >/dev/null
+  pct set "$id" --hostname "${NAME_PREFIX}template-$profile-$stamp" >/dev/null
+  pct template "$id" >/dev/null
+  done_ "container template $id ready (${NAME_PREFIX}template-$profile-$stamp)"
+  hint "next: mayfly template canary $id, watch a job, then mayfly template promote $id"
+}
+
+# enable|disable [slot ...]: every slot in slots.conf when none is named. disable lets a running job
+# finish (the slot drains on stop); the gc timer goes with the last slot.
+cmd_slots() {
+  local verb=$1 s; shift
+  local names=("$@")
+  [ ${#names[@]} -gt 0 ] || mapfile -t names < <(slot_names)
+  [ ${#names[@]} -gt 0 ] || die "no slots in $SLOTS_CONF"
+  for s in "${names[@]}"; do
+    [ -n "$(slot_line "$s")" ] || die "slot $s is not in $SLOTS_CONF"
+  done
+  if [ "$verb" = enable ]; then
+    for s in "${names[@]}"; do systemctl enable -q --now "mayfly-slot@$s"; done
+    done_ "on: ${names[*]}"
+    systemctl enable -q --now mayfly-gc.timer
+  else
+    for s in "${names[@]}"; do systemctl disable -q "mayfly-slot@$s"; done
+    for s in "${names[@]}"; do systemctl stop "mayfly-slot@$s" & done
+    wait
+    done_ "off: ${names[*]}"
+    systemctl list-units --plain --no-legend --state=active 'mayfly-slot@*' | grep -q . || systemctl disable -q --now mayfly-gc.timer
+  fi
+}
+
+cmd_help() {
+  cat <<HELP
+${C_B}mayfly${C_0} $MAYFLY_VERSION: throwaway GitHub Actions runners on Proxmox, one VM or container per job.
+
+${C_B}Usage${C_0}  mayfly <command>
+
+${C_DIM}Set up${C_0}
+  check                             App key, storage, network, template; changes nothing
+  template build [profile] [--lxc]  build a template (VM, or LXC container with --lxc)
+  template canary <vmid>            slots marked "next" clone it
+  template promote <vmid>           every slot clones it from its next job on
+  template list
+
+${C_DIM}Run${C_0}
+  enable [slot ...]                 start slots (all when none named) and the gc timer
+  disable [slot ...]                stop slots; running jobs finish first
+  status                            slots, guests, jobs, pool and RAM
+
+${C_DIM}Other${C_0}
+  gc                                stale runners, orphan guests, old snippets (the timer runs it)
+  slot <name>                       one slot's loop (mayfly-slot@<name>.service runs it)
+  version
+
+Config in $CONF_DIR: pool.env, slots.conf. Docs: https://github.com/variiuz/mayfly
+HELP
+}
+
+# Sourced (tests/run.sh): functions only.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
+case "${1:-}" in
+  slot) shift; [ -n "${1:-}" ] || die "usage: mayfly slot <name>"; cmd_slot "$1" ;;
+  status) cmd_status ;;
+  check) cmd_check ;;
+  gc) cmd_gc ;;
+  template) shift; cmd_template "$@" ;;
+  enable|disable) v=$1; shift; load_env; cmd_slots "$v" "$@" ;;
+  version|--version|-v) echo "mayfly $MAYFLY_VERSION" ;;
+  help|--help|-h) cmd_help ;;
+  *) cmd_help >&2; [ -z "${1:-}" ] || die "unknown command: $1"; exit 2 ;;
+esac
