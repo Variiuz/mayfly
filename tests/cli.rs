@@ -348,12 +348,13 @@ fn status_lines() {
     let (f, pve) = status_fixture("LXC_TEMPLATE_VMID=9096\nNEXT_LXC_TEMPLATE_VMID=9095\n");
     let (code, out) = f.run_status(&pve);
     let want = "\
-SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB
-build-1    9002   vm   linux                  8c/16G  active    running  busy
-pods-1     9041   pod  small                  12c/36G activating running  6 containers
-ct-1       9051   lxc  small                  2c/4G   failed    stopped  -
-off-1      9052   vm   small                  1c/1G   inactive  none     -
+SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB
+build-1    9002   vm   linux                  8c/16G  active    running  busy   ?
+pods-1     9041   pod  small                  12c/36G activating running  6 containers ?
+ct-1       9051   lxc  small                  2c/4G   failed    stopped  -      ?
+off-1      9052   vm   small                  1c/1G   inactive  none     -      ?
 
+warning: could not list the runners on GitHub (mayfly check)
 storage    local-lvm 42% used, limit 70%
 ram        32 GB free, 8 GB kept for the host
 template   9098, next 9099, profile default
@@ -486,6 +487,17 @@ fn fake_github(app_status: u16) -> FakeGithub {
                 ("POST", "/app/installations/42/access_tokens") => {
                     (201, "{\"token\":\"ghs_faketoken\"}")
                 }
+                ("GET", "/orgs/acme/actions/runners?per_page=100&page=1") => (
+                    200,
+                    "{\"total_count\":6,\"runners\":[\
+                     {\"name\":\"ci-pve1-build-1-1700000000\",\"status\":\"online\",\"busy\":true},\
+                     {\"name\":\"ci-pve1-pods-1-1-1700000000\",\"status\":\"online\",\"busy\":false},\
+                     {\"name\":\"ci-pve1-pods-1-2-1700000000\",\"status\":\"online\",\"busy\":true},\
+                     {\"name\":\"ci-pve1-pods-1-3-1700000000\",\"status\":\"offline\",\"busy\":false},\
+                     {\"name\":\"ci-pve1-ct-1-1700000001\",\"status\":\"offline\",\"busy\":false},\
+                     {\"name\":\"other-x\",\"status\":\"online\",\"busy\":false}]}",
+                ),
+                ("GET", "/orgs/acme/actions/runners?per_page=100&page=2") => (200, "{\"runners\":[]}"),
                 ("GET", "/orgs/acme/actions/runners?per_page=1") => {
                     (200, "{\"total_count\":3,\"runners\":[]}")
                 }
@@ -574,7 +586,10 @@ fn check_fixture(gh_port: u16, key: &Path) -> (Fixture, FakePve) {
         )
         .answer("ip link show vmbr0", "")
         .answer("pve-firewall status", "Status: enabled/running\n")
-        .answer("qm config 9098", "name: ci-template\ntemplate: 1\n")
+        .answer(
+            "qm config 9098",
+            "name: ci-template\ndescription: profile default\ntemplate: 1\n",
+        )
         .answer(
             "pvesh get /cluster/backup --output-format json",
             "[{\"id\":\"backup-1\",\"all\":1},{\"id\":\"b2\",\"all\":0},{\"id\":\"b3\"}]",
@@ -874,4 +889,105 @@ fn a_missing_script_is_a_clear_error() {
         )),
         "{err}"
     );
+}
+
+// ------------------------------------------------------------------ GitHub column, polara-ci templates
+
+#[test]
+fn status_github_column() {
+    let dir = tmp("key5");
+    let (key, _) = make_key(&dir, false);
+    let gh = fake_github(200);
+    let (f, pve) = status_fixture(&format!(
+        "APP_ID=12345\nKEY_PATH={}\nAPI_URL=http://127.0.0.1:{}\n",
+        key.display(),
+        gh.port
+    ));
+    let pve = pve
+        .answer("pct status 9051", "status: running\n")
+        .answer(
+            "qm config 9002",
+            "name: ci-build-1\ndescription: runner ci-pve1-build-1-1700000000, template 9098\n",
+        )
+        .answer(
+            "pct config 9051",
+            "hostname: ci-ct-1\ndescription: runner ci-pve1-ct-1-1700000001, template 9096\n",
+        );
+    let (_, out) = f.run_status(&pve);
+    let want = "\
+SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB
+build-1    9002   vm   linux                  8c/16G  active    running  busy   busy
+pods-1     9041   pod  small                  12c/36G activating running  6 containers 2/3
+ct-1       9051   lxc  small                  2c/4G   failed    running  idle   offline
+off-1      9052   vm   small                  1c/1G   inactive  none     -      -
+
+warning: 1 running guest(s) have no online runner on GitHub; a job VM that boots but never registers points at the template (mayfly check)
+storage    local-lvm 42% used, limit 70%
+ram        32 GB free, 8 GB kept for the host
+template   9098, next 9099, profile default
+";
+    assert_eq!(out, want);
+    let seen = gh.seen.lock().unwrap();
+    let paths: Vec<&str> = seen.iter().map(|s| s.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/orgs/acme/installation",
+            "/app/installations/42/access_tokens",
+            "/orgs/acme/actions/runners?per_page=100&page=1",
+            "/orgs/acme/actions/runners?per_page=100&page=2"
+        ]
+    );
+}
+
+#[test]
+fn status_colours_the_github_column() {
+    // paint is what colours it; the values are the ones bash uses.
+    use mayfly::out::Colour;
+    let tty = Out { tty: true };
+    let map = [
+        ("online", Colour::Grn),
+        ("busy", Colour::Blu),
+        ("offline", Colour::Red),
+        ("none", Colour::Red),
+    ];
+    assert_eq!(tty.paint("offline", 0, &map), "\x1b[31moffline\x1b[0m");
+    assert_eq!(tty.paint("2/3", 0, &map), "2/3");
+}
+
+#[test]
+fn check_warns_about_polara_ci_templates() {
+    let dir = tmp("key6");
+    let (key, _) = make_key(&dir, false);
+    let gh = fake_github(200);
+    let (f, pve) = check_fixture(gh.port, &key);
+    let mut env = fs::read_to_string(&f.paths.pool_env).unwrap();
+    env.push_str("NEXT_TEMPLATE_VMID=9099\n");
+    write(&f.paths.pool_env, &env);
+    f.guest("qemu-server", "9099");
+    // 9098 has no "description: profile", 9099 has one; a container template is never flagged.
+    let pve = pve
+        .answer("qm config 9098", "name: ci-template\ntemplate: 1\n")
+        .answer(
+            "qm config 9099",
+            "name: ci-next\ndescription: profile default\ntemplate: 1\n",
+        );
+    let (_, out) = f.run_check(&pve).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| *l == "ok   template  9098")
+        .unwrap();
+    assert_eq!(
+        lines[at + 1],
+        "warn template  9098 was built by polara-ci; jobs get its /etc/polara-ci paths. Rebuild: mayfly template build"
+    );
+    assert_eq!(lines[at + 2], "ok   profile   default");
+    // Both templates built here: no warning.
+    let pve = pve.answer(
+        "qm config 9098",
+        "name: ci-template\ndescription: profile default\ntemplate: 1\n",
+    );
+    let (_, out) = f.run_check(&pve).unwrap();
+    assert!(!out.contains("polara-ci"), "{out}");
 }

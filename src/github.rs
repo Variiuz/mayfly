@@ -147,6 +147,49 @@ impl GitHub {
     }
 }
 
+/// A runner of ours on GitHub.
+pub struct Runner {
+    pub name: String,
+    pub status: String,
+    pub busy: bool,
+}
+
+impl GitHub {
+    /// Every runner whose name starts with `<prefix>-`, over all pages (100 at a time). Fails when GitHub
+    /// cannot be asked.
+    pub fn runners(&self, token: &str, scope: &str, prefix: &str) -> Result<Vec<Runner>, String> {
+        let want = format!("{prefix}-");
+        let mut found = Vec::new();
+        for page in 1.. {
+            let v = self.call(
+                token,
+                false,
+                &format!("/{scope}/actions/runners?per_page=100&page={page}"),
+            )?;
+            let list = match v.get("runners").and_then(Value::as_array) {
+                Some(l) if !l.is_empty() => l,
+                _ => break,
+            };
+            for r in list {
+                let text = |k: &str| match r.get(k) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => "null".to_string(),
+                };
+                let name = text("name");
+                if name.starts_with(&want) {
+                    found.push(Runner {
+                        name,
+                        status: text("status"),
+                        busy: r.get("busy") == Some(&Value::Bool(true)),
+                    });
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
 /// Reads the key and makes the JWT; the error says what is wrong with the file.
 pub fn jwt_from_file(app_id: &str, key_path: &str) -> R<String> {
     let pem = match std::fs::read(key_path) {

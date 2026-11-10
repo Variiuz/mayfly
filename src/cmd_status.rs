@@ -1,6 +1,7 @@
 //! `mayfly status`: slots, guests, jobs, pool fill, free RAM and templates.
 
-use crate::config::{self, slot_opt, Slots};
+use crate::config::{self, slot_opt, Config, Slots};
+use crate::github::{self, GitHub, Runner};
 use crate::out::{Colour, Out, R};
 use crate::pve::guest_kind;
 use crate::Ctx;
@@ -17,6 +18,65 @@ pub fn free_ram_gb(meminfo: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Our runners on GitHub; None when GitHub cannot be asked (no key, no token, an error).
+fn github_runners(c: &Config) -> Option<Vec<Runner>> {
+    let jwt = github::jwt_from_file(c.get("APP_ID"), c.get("KEY_PATH")).ok()?;
+    let gh = GitHub::new(c.get("API_URL"));
+    let token = gh
+        .install_token(&jwt, c.get("INSTALLATION_ID"), &c.scope)
+        .ok()?;
+    gh.runners(&token, &c.scope, c.get("RUNNER_PREFIX")).ok()
+}
+
+/// GitHub's view of a slot: for a pod `<online+busy>/<total>` of its runners (or none); for a VM or
+/// container the runner named in the guest's description: busy, online, offline or none; `-` when
+/// the description names no runner.
+fn github_state(
+    cx: &Ctx,
+    c: &Config,
+    runners: &[Runner],
+    name: &str,
+    vmid: &str,
+    kind: &str,
+) -> String {
+    if kind == "pod" {
+        let own = format!("{}-{name}-", c.get("RUNNER_PREFIX"));
+        let (mut on, mut off, mut busy) = (0, 0, 0);
+        for r in runners.iter().filter(|r| r.name.starts_with(&own)) {
+            if r.status == "online" && r.busy {
+                busy += 1;
+            } else if r.status == "online" {
+                on += 1;
+            } else {
+                off += 1;
+            }
+        }
+        if on + off + busy == 0 {
+            return "none".to_string();
+        }
+        return format!("{}/{}", on + busy, on + off + busy);
+    }
+    let described = guest_kind(&cx.paths.pve_etc, vmid)
+        .and_then(|k| cx.pve.guest_config(k, vmid))
+        .and_then(|cfg| {
+            cfg.lines().find_map(|l| {
+                let rest = l.strip_prefix("description: runner ")?;
+                Some(rest.split([' ', ',']).next().unwrap_or("").to_string())
+            })
+        })
+        .unwrap_or_default();
+    if described.is_empty() {
+        return "-".to_string();
+    }
+    match runners.iter().find(|r| r.name == described) {
+        Some(r) if r.status == "online" && r.busy => "busy",
+        Some(r) if r.status == "online" => "online",
+        Some(r) if r.status == "offline" => "offline",
+        _ => "none",
+    }
+    .to_string()
+}
+
 pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
     let (c, _) = config::load(cx.paths, cx.pve, cx.node, true)?;
     let slots = Slots::read(&cx.paths.slots_conf);
@@ -27,9 +87,10 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         out.warn(w, &format!("no slots in {}", cx.paths.slots_conf));
         return Ok(0);
     }
+    let runners = github_runners(&c);
     let _ = writeln!(
         w,
-        "{}{:<10} {:<6} {:<4} {:<22} {:<7} {:<9} {:<8} JOB{}",
+        "{}{:<10} {:<6} {:<4} {:<22} {:<7} {:<9} {:<8} {:<6} GITHUB{}",
         out.dim(),
         "SLOT",
         "VMID",
@@ -38,8 +99,10 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         "SIZE",
         "SERVICE",
         "GUEST",
+        "JOB",
         out.reset()
     );
+    let mut stuck = 0;
     for name in slots.names() {
         let Some(slot) = slots.get(name) else {
             continue;
@@ -74,10 +137,28 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
             8,
             &[("running", Colour::Grn)],
         );
-        let job = out.paint(&job, 0, &[("busy", Colour::Blu), ("idle", Colour::Dim)]);
+        let job = out.paint(&job, 6, &[("busy", Colour::Blu), ("idle", Colour::Dim)]);
+        let gh = match &runners {
+            None => "?".to_string(),
+            Some(list) if state == "running" => github_state(cx, &c, list, name, &slot.vmid, &kind),
+            Some(_) => "-".to_string(),
+        };
+        if gh == "offline" || gh == "none" || gh.starts_with("0/") {
+            stuck += 1;
+        }
+        let gh = out.paint(
+            &gh,
+            0,
+            &[
+                ("online", Colour::Grn),
+                ("busy", Colour::Blu),
+                ("offline", Colour::Red),
+                ("none", Colour::Red),
+            ],
+        );
         let _ = writeln!(
             w,
-            "{:<10} {:<6} {:<4} {:<22} {:<7} {} {} {}",
+            "{:<10} {:<6} {:<4} {:<22} {:<7} {} {} {} {}",
             name,
             slot.vmid,
             kind,
@@ -85,10 +166,20 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
             format!("{}c/{}G", slot.vcpu, slot.ram),
             svc,
             guest,
-            job
+            job,
+            gh
         );
     }
     let _ = writeln!(w);
+    if runners.is_none() {
+        out.warn(w, "could not list the runners on GitHub (mayfly check)");
+    }
+    if stuck > 0 {
+        out.warn(
+            w,
+            &format!("{stuck} running guest(s) have no online runner on GitHub; a job VM that boots but never registers points at the template (mayfly check)"),
+        );
+    }
     let pct = cx
         .pve
         .pool_percent(cx.node, c.get("STORAGE"))

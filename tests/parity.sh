@@ -26,7 +26,8 @@ cat >"$t/bin/qm" <<'STUB'
 #!/bin/sh
 case "$1 $2" in
   "status 9002") echo "status: running" ;;
-  "status 9041") echo "status: stopped" ;;
+  "status 9041") echo "status: running" ;;
+  "config 9002") printf 'name: ci-a\ndescription: runner mf-a-1-111, template 9098\n' ;;
   "config 9098") printf 'name: ci-template\ntemplate: 1\n' ;;
   "guest exec") echo '{"exitcode":0,"out-data":"1"}' ;;
   *) exit 2 ;;
@@ -36,6 +37,7 @@ cat >"$t/bin/pct" <<'STUB'
 #!/bin/sh
 case "$1 $2" in
   "status 9051") echo "status: running" ;;
+  "config 9051") printf 'hostname: ci-c-1\ndescription: runner mf-c-1-222, template 9096\n' ;;
   *) exit 2 ;;
 esac
 STUB
@@ -89,6 +91,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, {"slug": "my-app"})
         elif self.path == "/orgs/acme/installation":
             self.send(200, {"id": 42})
+        elif self.path == "/orgs/acme/actions/runners?per_page=100&page=1":
+            self.send(200, {"runners": [
+                {"id": 1, "name": "mf-a-1-111", "status": "online", "busy": True},
+                {"id": 2, "name": "mf-b-1-1-5", "status": "online", "busy": False},
+                {"id": 3, "name": "mf-b-1-2-5", "status": "offline", "busy": False},
+                {"id": 4, "name": "mf-c-1-222", "status": "offline", "busy": False},
+                {"id": 5, "name": "other-9", "status": "online", "busy": False},
+            ]})
+        elif self.path.startswith("/orgs/acme/actions/runners?per_page=100"):
+            self.send(200, {"runners": []})
         elif self.path.startswith("/orgs/acme/actions/runners"):
             self.send(200, {"total_count": 3, "runners": []})
         else:
@@ -127,6 +139,7 @@ API_URL=http://127.0.0.1:$(cat "$t/port")
 TEMPLATE_VMID=9098
 NEXT_TEMPLATE_VMID=9099
 LXC_TEMPLATE_VMID=9096
+RUNNER_PREFIX=mf
 ENV
 cat >"$t/conf/slots.conf" <<'SLOTS'
 a-1 9002 linux 8 16 60 cache current
@@ -163,6 +176,10 @@ same "help" help
 same "-h" -h
 same "status" status
 same "check" check
+cp "$t/conf/pool.env" "$t/pool.env.good"
+sed 's#^API_URL=.*#API_URL=http://127.0.0.1:1#' "$t/pool.env.good" >"$t/conf/pool.env"
+same "status with GitHub unreachable" status
+cp "$t/pool.env.good" "$t/conf/pool.env"
 : >"$t/conf/slots.conf"
 same "status without slots" status
 same "check without slots" check
