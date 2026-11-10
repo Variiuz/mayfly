@@ -261,40 +261,21 @@ impl Loop<'_> {
 
     // ---- TERM and INT
 
-    /// Deals with signals that arrived since the last look, once each, like the bash trap.
+    /// Notes signals that arrived since the last look, like the bash trap.
     fn poll(&mut self) {
         let t = self.stop.terms.load(Ordering::SeqCst);
         let s = self.stop.seen.load(Ordering::SeqCst);
         if t > s {
             self.stop.seen.store(t, Ordering::SeqCst);
-            for _ in s..t {
-                self.on_term();
-            }
+            // Only flags the stop, like bash `on_term` (no guest call in a trap): the loop's own
+            // `stopping() && job_idle` check stops an idle guest, a guest in a job finishes it.
+            self.stopping = true;
         }
     }
 
     fn stopping(&mut self) -> bool {
         self.poll();
         self.stopping
-    }
-
-    /// An idle VM goes at once; a VM in a job finishes it (systemd waits, TimeoutStopSec).
-    fn on_term(&mut self) {
-        self.stopping = true;
-        // A pod only stops taking jobs: its containers finish theirs (`on_term_pod`).
-        if self.kind == "pod" {
-            return;
-        }
-        let id = self.slot.vmid.clone();
-        if self.running(&id) && self.job_idle(&id) {
-            if self.kind(&id) == Some(GuestKind::Ct) {
-                self.cx.pve.run("pct", &["stop", &id, "--skiplock", "1"]);
-            } else {
-                self.cx
-                    .pve
-                    .run("qm", &["stop", &id, "--skiplock", "1", "--timeout", "30"]);
-            }
-        }
     }
 
     // ---- the guest

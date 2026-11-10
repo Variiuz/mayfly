@@ -270,12 +270,7 @@ guest_exec() {
     timeout "$t" lxc-attach -n "$id" -- "$@" 2>/dev/null
     return
   fi
-  # The status travels in the output: bash 5.2 can lose a substitution's $? in a trap that interrupted
-  # `wait` (see job_seconds), and on_term reaches this.
-  out=$(timeout $((t + 5)) qm guest exec "$id" --timeout "$t" -- "$@" 2>/dev/null; printf '\n%s' "$?")
-  code=${out##*$'\n'}
-  out=${out%$'\n'*}
-  [ "$code" = 0 ] || return 124
+  out=$(timeout $((t + 5)) qm guest exec "$id" --timeout "$t" -- "$@" 2>/dev/null) || return 124
   code=$(jq -r '.exitcode // 124' <<<"$out")
   jq -r '."out-data" // ""' <<<"$out"
   return "$code"
@@ -362,12 +357,7 @@ job_idle() {
 job_seconds() {
   local out code=0
   # 3, not 1, for "no job": lxc-attach itself fails with 1, which must count as no answer.
-  # The exit code rides in the output, not in $?: when the TERM trap (on_term) interrupted `wait` in nap,
-  # bash 5.2 loses the status of a command substitution (code stays 0, out empty), and an idle guest
-  # looked busy. The &&/|| list also keeps set -e from aborting on a failing guest_exec.
-  out=$(guest_exec "$1" 10 sh -c 'p=$(pgrep -of "bin/Runner\.Worker") || exit 3; ps -o etimes= -p "$p"' && printf '\n0' || printf '\n%s' "$?")
-  code=${out##*$'\n'}
-  out=${out%$'\n'*}
+  out=$(guest_exec "$1" 10 sh -c 'p=$(pgrep -of "bin/Runner\.Worker") || exit 3; ps -o etimes= -p "$p"') || code=$?
   [ "$code" = 0 ] || { [ "$code" = 3 ] && return 1; return 2; }
   tr -dc 0-9 <<<"$out" | grep . || return 2
 }
@@ -489,15 +479,11 @@ ct_deliver() {
 # ------------------------------------------------------------------ slot loop
 
 stopping=0
-cur_vmid=""
-on_term() {
-  stopping=1
-  # An idle VM goes at once; a VM in a job finishes it (systemd waits, TimeoutStopSec).
-  if [ -n "$cur_vmid" ] && vm_running "$cur_vmid" && job_idle "$cur_vmid"; then
-    if [ "$(guest_kind "$cur_vmid")" = ct ]; then pct stop "$cur_vmid" --skiplock 1 >/dev/null 2>&1 || true
-    else qm stop "$cur_vmid" --skiplock 1 --timeout 30 >/dev/null 2>&1 || true; fi
-  fi
-}
+# Only flags the stop: no guest call in a trap, because bash loses the exit status of child processes
+# there (a trap that interrupts `wait` makes `$(...)` and `||` read 0 and empty output). The interrupted
+# `wait` returns at once, and the loop's own `stopping && job_idle` check stops and destroys an idle
+# guest, while a guest in a job finishes it (systemd waits, TimeoutStopSec).
+on_term() { stopping=1; }
 
 cmd_slot() {
   local name=$1 line vmid labels vcpu ram disk envspec which extra tpl token resp jit runner_id host started kind online stuck=0 t
@@ -518,7 +504,6 @@ cmd_slot() {
     exit 1
   fi
   if [ "$kind" = pod ]; then cmd_pod; return; fi
-  cur_vmid=$vmid
   trap on_term TERM INT
 
   while [ "$stopping" = 0 ]; do

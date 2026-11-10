@@ -758,7 +758,7 @@ fn a_stop_while_the_vm_is_idle_stops_it_at_once() {
     let rig = Rig::new("", SLOT_LINE);
     rig.stop_after_destroy.set(false);
     let pve = rig
-        .pve(&[true, true, false])
+        .pve(&[true, true])
         .answer(&exec_line(), NO_JOB)
         .on_call("sleep 30", rig.signal());
     let gh = FakeGh::new();
@@ -777,10 +777,9 @@ fn a_stop_while_the_vm_is_idle_stops_it_at_once() {
         lines![
             START,
             "sleep 30",
-            // The signal: is a job running? No: stop the VM.
+            // The signal only flags the stop. The loop asks: is a job running? No: destroy,
+            // which stops the VM.
             exec_line(),
-            STOP,
-            // Then the VM is gone: destroy, which stops it once more.
             CONFIG,
             CONFIG,
             STOP,
@@ -797,7 +796,7 @@ fn a_stop_while_a_job_runs_lets_the_job_finish() {
     let rig = Rig::new("", SLOT_LINE);
     rig.stop_after_destroy.set(false);
     let pve = rig
-        .pve(&[true, true, true, false])
+        .pve(&[true, true, false])
         .answer(&exec_line(), BUSY)
         .on_call("sleep 30", rig.signal());
     let o = rig.run(&pve, &FakeGh::new());
@@ -809,8 +808,7 @@ fn a_stop_while_a_job_runs_lets_the_job_finish() {
         lines![
             START,
             "sleep 30",
-            // The signal: a job runs, nothing is stopped. The loop looks again while stopping.
-            exec_line(),
+            // The signal only flags the stop. The loop asks: a job runs, so it waits on.
             exec_line(),
             POOL,
             "sleep 30",
@@ -2022,7 +2020,7 @@ fn a_stop_while_the_container_is_idle_stops_it_at_once() {
     let rig = Rig::new(LXC_POOL, CT_SLOT);
     rig.stop_after_destroy.set(false);
     let pve = rig
-        .ct_pve(&[true, true, false])
+        .ct_pve(&[true, true])
         .fail(&ct_exec_line(), 3)
         .on_call("sleep 30", rig.signal());
     let gh = FakeGh::new();
@@ -2036,12 +2034,10 @@ fn a_stop_while_the_container_is_idle_stops_it_at_once() {
             CT_JOB,
             CT_INFO,
             "sleep 30",
-            // The signal: is a job running? No (exit 3): stop the container.
+            // The signal only flags the stop. The loop asks: is a job running? No (exit 3):
+            // destroy, which stops the container.
             CT_INFO,
             ct_exec_line(),
-            CT_STOP,
-            CT_INFO,
-            // Then it is gone: destroy.
             CT_CONFIG,
             CT_CONFIG,
             CT_STOP,
@@ -2057,7 +2053,7 @@ fn a_stop_while_a_container_runs_a_job_lets_the_job_finish() {
     let rig = Rig::new(LXC_POOL, CT_SLOT);
     rig.stop_after_destroy.set(false);
     let pve = rig
-        .ct_pve(&[true, true, true, false])
+        .ct_pve(&[true, true, false])
         .answer(&ct_exec_line(), "42\n")
         .on_call("sleep 30", rig.signal());
     let o = rig.run(&pve, &FakeGh::new());
@@ -2070,9 +2066,7 @@ fn a_stop_while_a_container_runs_a_job_lets_the_job_finish() {
             CT_JOB,
             CT_INFO,
             "sleep 30",
-            // The signal: a job runs, nothing is stopped. The loop looks again while stopping.
-            CT_INFO,
-            ct_exec_line(),
+            // The signal only flags the stop. The loop asks: a job runs, so it waits on.
             CT_INFO,
             ct_exec_line(),
             POOL,
