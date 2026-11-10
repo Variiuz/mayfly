@@ -6,6 +6,7 @@
 # previous/, and that `mayfly update --rollback` brings it back.
 # Usage: bash tests/update.sh <dist dir from scripts/package.sh> [old version]
 #   old version: default the newest release older than the one in <dist>. Needs github.com, jq, python3.
+# shellcheck disable=SC2034 # rc, before: read by the eval in ok()
 set -uo pipefail
 dist=$(cd "${1:?usage: tests/update.sh <dist dir> [old version]}" && pwd)
 new=$(sed -n 's/^mayfly-\([0-9.]*\)\.tar\.gz$/\1/p' < <(ls "$dist"))
