@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/Variiuz/mayfly/compare/v0.6.0...v0.7.0) (2026-11-10)
+
+
+### Features
+
+* rust slot loops for lxc and pod slots behind engine=rust ([#30](https://github.com/Variiuz/mayfly/issues/30)) ([80e9603](https://github.com/Variiuz/mayfly/commit/80e96037c3a1e34fbfc53fda9e08b6f0addaaf51))
+
 ## [0.6.0](https://github.com/Variiuz/mayfly/compare/v0.5.0...v0.6.0) (2026-11-10)
 
 
