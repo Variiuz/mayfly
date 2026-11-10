@@ -178,6 +178,98 @@ ok "profile from /etc/mayfly/profiles first" '[ "$(find_profile mine)" = "$t/con
 ok "shipped profile" '[ "$(find_profile default)" = "$t/share/profiles/default" ]'
 ok "unknown or odd profile names fail" '! find_profile nope && ! find_profile "../x"'
 
+# ---- pool.env syntax (the next Mayfly reads it as plain KEY=value)
+saved_pool_env=$POOL_ENV
+POOL_ENV=$t/scan.env
+tab=$'\t'
+scan_line() { printf '%s\n' "$pe_line" >"$POOL_ENV"; pool_env_scan; }
+while IFS= read -r pe_line; do
+  ok "pool.env accepts: $pe_line" '[ -z "$(scan_line)" ]'
+done <<'LINES'
+# a comment
+   # an indented comment
+ORG=acme
+  ORG=acme
+export ORG=acme
+export   ORG=acme
+_X1=a
+EMPTY=
+API_URL=https://ghe.example.com/api/v3
+RUNNER_LABELS_BASE=self-hosted,Linux,X64
+KEY=a#b
+KEY=value # trailing comment
+KEY= # empty, then a comment
+KEY=value   
+KEY="two words"
+KEY="a # not a comment"
+KEY="single ' inside"
+KEY='two words'
+KEY='$HOME and `x` and \ stay literal'
+KEY='a\'
+KEY="a" # comment
+KEY=''
+KEY=""
+BLOCK_NETS="10.0.0.0/8 172.16.0.0/12"
+LINES
+printf '\n   \n\t\n' >"$POOL_ENV"
+ok "pool.env accepts blank lines" '[ -z "$(pool_env_scan)" ]'
+printf 'ORG=acme' >"$POOL_ENV"
+ok "pool.env accepts a last line without a newline" '[ -z "$(pool_env_scan)" ]'
+ok "pool.env.example is plain KEY=value" '[ -z "$(POOL_ENV=$here/pool.env.example pool_env_scan)" ]'
+POOL_ENV=$t/missing.env
+ok "no pool.env, nothing to scan" '[ -z "$(pool_env_scan)" ]'
+POOL_ENV=$t/scan.env
+while IFS= read -r spec; do
+  pe_line=${spec%%@@*} pe_want=${spec##*@@}
+  ok "pool.env refuses: $pe_line" '[[ "$(scan_line)" == "1$tab"*"$pe_want"* ]]'
+done <<'LINES'
+ORG=$ORG@@variable or command substitution
+KEY=$(hostname)@@variable or command substitution
+KEY=`hostname`@@variable or command substitution
+KEY="$HOME/x"@@$, backtick or backslash inside double quotes
+KEY="`id`"@@$, backtick or backslash inside double quotes
+KEY="a\nb"@@$, backtick or backslash inside double quotes
+KEY="a\"b"@@$, backtick or backslash inside double quotes
+KEY=a\b@@backslash in an unquoted value
+KEY=a\@@line continuation
+KEY=a b@@spaces in an unquoted value
+KEY= b@@spaces in an unquoted value
+KEY=a B=2@@more than one assignment on a line
+A=1; B=2@@more than one command on a line
+A=1 && B=2@@more than one command on a line
+A=1|cat@@more than one command on a line
+KEY=a>b@@shell syntax in an unquoted value
+KEY=(a b)@@shell syntax in an unquoted value
+KEY=a"b"@@quote inside an unquoted value
+KEY=~/x@@~ is not expanded
+KEY="unterminated@@unterminated double quote
+KEY='unterminated@@unterminated single quote
+KEY="a"b@@text after the closing quote
+KEY='a' 'b'@@text after the closing quote
+KEY="a"#x@@text after the closing quote
+source /etc/other.env@@not a KEY=value assignment
+. /etc/other.env@@not a KEY=value assignment
+if [ -x /bin/x ]; then@@not a KEY=value assignment
+fi@@not a KEY=value assignment
+export KEY@@not a KEY=value assignment
+=value@@not a KEY=value assignment
+KEY =value@@space before =
+export KEY = value@@space before =
+1KEY=a@@KEY is letters, digits and _
+A-B=c@@KEY is letters, digits and _
+LINES
+printf 'ORG=acme\r\n' >"$POOL_ENV"
+ok "pool.env refuses a Windows line ending" '[[ "$(pool_env_scan)" == "1${tab}carriage return"* ]]'
+printf '# ok\nORG=acme\n\nKEY=$(x)\nKEY=\\\n' >"$POOL_ENV"
+ok "pool.env: lines are counted from 1, blank lines included" '[ "$(pool_env_scan | cut -f1 | tr "\n" " ")" = "4 5 " ]'
+printf 'A=1\nB=$B\n' >"$POOL_ENV"
+ok "check: a warning naming the line and the reason" '[ "$(CHECK_WARN=0; check_pool_env)" = "warn pool.env  line 2: variable or command substitution; the next Mayfly reads pool.env as plain KEY=value" ]'
+for i in 1 2 3 4 5 6 7; do printf 'K%s=$x\n' "$i"; done >"$POOL_ENV"
+ok "check: five lines, then a count" '[ "$(check_pool_env | wc -l)" = 6 ] && check_pool_env | tail -n1 | grep -q "^warn pool.env  and 2 more lines"'
+printf 'ORG=acme\n' >"$POOL_ENV"
+ok "check: a clean pool.env adds nothing" '[ -z "$(check_pool_env)" ]'
+POOL_ENV=$saved_pool_env
+
 # ---- output and commands
 ok "no colour when not a terminal" '[ "$TTY" = 0 ] && [ -z "$C_GRN" ]'
 ok "warn: prefixed off a terminal" '[ "$(warn x)" = "warning: x" ]'
