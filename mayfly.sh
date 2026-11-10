@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # mayfly.sh: throwaway CI runners on a Proxmox host, one VM (or LXC container) per job.
 # Installed to /usr/local/share/mayfly by install.sh and run as root by the mayfly binary, which owns
-# version, help, status, check and update and hands every other command to this script. It also runs on its
-# own. See README.md.
+# version, help, status, check, update, gc, enable and disable and hands slot and template to this script.
+# It also runs on its own (and then does all of them). See README.md.
 #
 #   mayfly slot <name>               loop behind mayfly-slot@<name>.service (kind=vm, pod or lxc)
 #   mayfly status                    slots, VMs, pool fill, free RAM, templates

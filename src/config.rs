@@ -495,6 +495,63 @@ impl Slots {
     pub fn get(&self, name: &str) -> Option<&Slot> {
         self.lines.iter().find(|s| s.name == name)
     }
+
+    /// The first line whose name awk (`$1 == n`) takes for `name`: equal as text, or as numbers when
+    /// both look like numbers (`01` is `1`). bash `slot_line` is this.
+    pub fn line_for_name(&self, name: &str) -> Option<&Slot> {
+        self.lines.iter().find(|s| awk_equal(&s.name, name))
+    }
+
+    /// The name on the first line whose VMID awk (`$2 == v`) takes for `vmid`; bash `gc` asks this.
+    pub fn name_for_vmid(&self, vmid: &str) -> Option<&str> {
+        self.lines
+            .iter()
+            .find(|s| !s.vmid.is_empty() && awk_equal(&s.vmid, vmid))
+            .map(|s| s.name.as_str())
+    }
+}
+
+/// A decimal number as awk reads one from input: blanks, a sign, digits with an optional point, an
+/// optional exponent.
+fn awk_number(s: &str) -> Option<f64> {
+    let t = s.trim_matches(is_blank);
+    let b = t.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let digits = |from: usize| b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+    let int = digits(i);
+    i += int;
+    let mut frac = 0;
+    if b.get(i) == Some(&b'.') {
+        frac = digits(i + 1);
+        i += 1 + frac;
+    }
+    if int + frac == 0 {
+        return None;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let mut j = i + 1;
+        if matches!(b.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        let exp = digits(j);
+        if exp > 0 {
+            i = j + exp;
+        }
+    }
+    if i == b.len() {
+        t.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// awk's `a == b` for two input fields (the second one given with `-v`): numbers compare as numbers,
+/// everything else as text.
+pub fn awk_equal(a: &str, b: &str) -> bool {
+    match (awk_number(a), awk_number(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// The value of a trailing `key=value` field of a slot (the first one), else `default`.
@@ -637,5 +694,34 @@ mod tests {
         assert_eq!(slot_opt("template", &p.extra, ""), "");
         assert_eq!(slot_opt("kind", "", "vm"), "vm");
         assert_eq!(slot_opt("vlan", "vlan= x", "d"), "");
+    }
+
+    #[test]
+    fn awk_compares_numbers_as_numbers() {
+        assert!(awk_equal("9002", "9002"));
+        assert!(awk_equal("09002", "9002"));
+        assert!(awk_equal("9002.0", "9002"));
+        assert!(awk_equal("+9002", "9002"));
+        assert!(awk_equal("9.002e3", "9002"));
+        assert!(!awk_equal("9002", "9003"));
+        assert!(awk_equal("build-1", "build-1"));
+        assert!(!awk_equal("build-1", "build-2"));
+        assert!(!awk_equal("1a", "1"));
+        assert!(!awk_equal("", "0"));
+        assert!(awk_equal("", ""));
+        assert!(!awk_equal("-", "0"));
+        assert!(!awk_equal(".", "0"));
+    }
+
+    #[test]
+    fn slots_are_found_the_way_awk_finds_them() {
+        let s = Slots::parse("a 9002 x\n# b 9003 x\n01 9004 x\nc 09005 x\nd 9002 x\n");
+        assert_eq!(s.line_for_name("1").unwrap().vmid, "9004");
+        assert!(s.line_for_name("b").is_none());
+        assert!(s.line_for_name("").is_none());
+        assert_eq!(s.name_for_vmid("9002"), Some("a"));
+        assert_eq!(s.name_for_vmid("9005"), Some("c"));
+        assert_eq!(s.name_for_vmid("9003"), None);
+        assert_eq!(s.name_for_vmid("9999"), None);
     }
 }

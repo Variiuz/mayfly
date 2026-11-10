@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # The Rust commands print what mayfly.sh prints: runs version, help, status and check of both against
 # one fixture (stubs for qm, pct, pvesm, pvesh, systemctl, ip, pve-firewall and a local GitHub) and
-# compares stdout, stderr and the exit code.
+# compares stdout, stderr and the exit code. gc, enable and disable run against stubs that record every
+# call: the recorded calls, the requests the fake GitHub saw and the files left behind are compared too.
 # Usage: bash tests/parity.sh [path to the mayfly binary]   (default target/release/mayfly)
 set -uo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${1:-$here/target/release/mayfly}
 [ -x "$bin" ] || { echo "no binary at $bin (cargo build --release)" >&2; exit 2; }
 t=$(mktemp -d)
-srv=""
-cleanup() { [ -z "$srv" ] || kill "$srv" 2>/dev/null; rm -rf "$t"; }
+srv="" srv2=""
+cleanup() {
+  [ -z "$srv" ] || kill "$srv" 2>/dev/null
+  [ -z "$srv2" ] || kill "$srv2" 2>/dev/null
+  rm -rf "$t"
+}
 trap cleanup EXIT
 mkdir -p "$t/bin" "$t/conf/env" "$t/conf/profiles" "$t/share/profiles/default" "$t/pve/qemu-server" "$t/pve/lxc" "$t/fw" "$t/snippets"
 
@@ -196,6 +201,230 @@ same "REPO without owner" check
 same "no ORG or REPO" status
 rm "$t/conf/pool.env"
 same "no pool.env" status
+
+# ---- gc, enable and disable: stubs that record their calls, and a GitHub that records its requests
+g=$t/g
+mkdir -p "$g/bin" "$g/conf"
+cat >"$g/bin/qm" <<'STUB'
+#!/bin/sh
+echo "qm $*" >>"$CALLS"
+case "$1" in
+  config) cat "$MAYFLY_PVE_ETC/qemu-server/$2.conf" 2>/dev/null || exit 2 ;;
+  destroy) if [ "$2" = "${FAIL_DESTROY:-}" ]; then echo "destroy failed" >&2; exit 5; fi ;;
+esac
+exit 0
+STUB
+cat >"$g/bin/pct" <<'STUB'
+#!/bin/sh
+echo "pct $*" >>"$CALLS"
+case "$1" in
+  config) cat "$MAYFLY_PVE_ETC/lxc/$2.conf" 2>/dev/null || exit 2 ;;
+esac
+exit 0
+STUB
+cat >"$g/bin/lxc-info" <<'STUB'
+#!/bin/sh
+echo "lxc-info $*" >>"$CALLS"
+if [ "$2" = 9051 ]; then echo RUNNING; else echo STOPPED; fi
+STUB
+cat >"$g/bin/pvesm" <<'STUB'
+#!/bin/sh
+echo "pvesm $*" >>"$CALLS"
+case "$1" in
+  path) echo "$GSNIP/x" ;;
+  *) exit 0 ;;
+esac
+STUB
+cat >"$g/bin/systemctl" <<'STUB'
+#!/bin/sh
+echo "systemctl $*" >>"$CALLS"
+case "$1" in
+  is-active) case "$3" in mayfly-slot@a-1|mayfly-slot@c-1) exit 0 ;; *) exit 3 ;; esac ;;
+  list-units) cat "$ACTIVE" 2>/dev/null; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$g/bin/"*
+
+cat >"$t/gc.py" <<'PY'
+import http.server, json, sys, time
+
+LOG = sys.argv[1]
+
+
+def runners(page):
+    now = int(time.time())
+    if page == 1:
+        return [
+            {"id": 1, "name": "mf-a-1-111", "status": "offline", "busy": False},
+            {"id": 2, "name": "mf-old-1-5", "status": "offline", "busy": False},
+            {"id": 3, "name": "mf-busy-1-6", "status": "online", "busy": False},
+            {"id": 4, "name": "mf-offbusy-1-7", "status": "offline", "busy": True},
+            {"id": 5, "name": "other-9", "status": "offline", "busy": False},
+            {"id": 6, "name": "mf-fresh-1-%d" % (now - 60), "status": "offline", "busy": False},
+            {"id": 7, "name": "mf-weird-xyz", "status": "offline", "busy": False},
+            {"id": 8, "name": "mf-c-1-222", "status": "offline", "busy": False},
+        ]
+    if page == 2:
+        return [{"id": 9, "name": "mf-p2-1-8", "status": "offline", "busy": False}]
+    return []
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def note(self):
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (self.command, self.path))
+
+    def send(self, code, obj=None):
+        body = b"" if obj is None else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.note()
+        prefix = "/orgs/acme/actions/runners?per_page=100&page="
+        if self.path == "/orgs/acme/installation":
+            self.send(200, {"id": 42})
+        elif self.path.startswith(prefix):
+            self.send(200, {"total_count": 9, "runners": runners(int(self.path[len(prefix):]))})
+        else:
+            self.send(404, {})
+
+    def do_POST(self):
+        self.note()
+        if self.path == "/app/installations/42/access_tokens":
+            self.send(201, {"token": "ghs_fake"})
+        else:
+            self.send(404, {})
+
+    def do_DELETE(self):
+        self.note()
+        self.send(204)
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+PY
+python3 "$t/gc.py" "$g/gh.log" >"$t/gport" &
+srv2=$!
+for _ in $(seq 50); do [ -s "$t/gport" ] && break; sleep 0.1; done
+[ -s "$t/gport" ] || { echo "the fake GitHub for gc did not start" >&2; exit 2; }
+
+cat >"$g/conf/pool.env" <<ENV
+APP_ID=12345
+ORG=acme
+KEY_PATH=$t/app.pem
+API_URL=http://127.0.0.1:$(cat "$t/gport")
+RUNNER_PREFIX=mf
+LEGACY_TAGS=oldci
+ENV
+cat >"$g/slots.conf" <<'SLOTS'
+a-1 9002 linux 8 16 60 no current
+b-1 9004 linux 8 16 60 no current
+# off-1 9060 small 1 1 1 no current
+c-1 9051 small 2 4 20 no current kind=lxc
+SLOTS
+
+# A guest's config file: what the qm and pct stubs print.
+guest() { printf '%b' "$3" >"$g/pve/$1/$2.conf"; }
+# A file in a directory, with an age.
+aged() { : >"$1"; touch -d "$2" "$1"; }
+
+# The same host before every run, so that the second run does not see what the first one removed.
+state_reset() {
+  rm -rf "$g/pve" "$g/fw" "$g/snip"
+  mkdir -p "$g/pve/qemu-server" "$g/pve/lxc" "$g/fw" "$g/snip"
+  cp "$g/slots.conf" "$g/conf/slots.conf"
+  guest qemu-server 9002 'name: ci-a\ntags: mayfly\ndescription: runner mf-a-1-111, template 9098\n'
+  guest qemu-server 9003 'name: ci-orphan\ntags: mayfly\n'
+  guest qemu-server 9004 'name: ci-b\ntags: mayfly\ndescription: runner mf-b-1-5\n'
+  guest qemu-server 9005 'name: web\ntags: mayfly\n'
+  guest qemu-server 9006 'name: ci-x\ntags: other\n'
+  guest qemu-server 9007 'name: ci-legacy\ntags: oldci\n'
+  guest qemu-server 9008 'name: ci-template\ntags: mayfly\ntemplate: 1\n'
+  guest qemu-server 9009 'name: ci-elsewhere\ntags: mayfly\n'
+  guest qemu-server 9097 'name: ci-building\ntags: mayfly\n'
+  guest qemu-server 9100 'name: ci-outside\ntags: mayfly\n'
+  guest lxc 9051 'hostname: ci-c-1\ntags: mayfly\ndescription: runner mf-c-1-222\n'
+  guest lxc 9052 'hostname: ci-c-2\ntags: mayfly\n'
+  printf '{"ids":{"9009":{"node":"othernode"}}}\n' >"$g/pve/.vmlist"
+  : >"$g/fw/9003.fw"
+  : >"$g/fw/9002.fw"
+  aged "$g/snip/mayfly-9003.yaml" '3 hours ago'
+  aged "$g/snip/mayfly-9500.yaml" '40 minutes ago'
+  aged "$g/snip/mayfly-9501.yaml" '20 minutes ago'
+  aged "$g/snip/mayfly-9051.yaml" '3 hours ago'
+  aged "$g/snip/mayfly-9053.yaml" '3 hours ago'
+  aged "$g/snip/mayfly-abc.yaml" '3 hours ago'
+  aged "$g/snip/other.yaml" '3 hours ago'
+  : >"$g/active"
+  : >"$g/calls"
+  : >"$g/gh.log"
+}
+
+# snap_run <prefix> <command ...>: resets the host, runs the command and saves its output, its exit code
+# and the state it left: the calls the stubs recorded (the parallel `systemctl stop`s sorted), the
+# requests the GitHub saw and the files that are left.
+snap_run() {
+  local p=$1
+  shift
+  state_reset
+  [ -z "${PRE:-}" ] || "$PRE"
+  env "PATH=$g/bin:$PATH" "CALLS=$g/calls" "ACTIVE=$g/active" "GSNIP=$g/snip" \
+    "MAYFLY_CONF_DIR=$g/conf" "MAYFLY_PVE_ETC=$g/pve" "MAYFLY_PVE_FW_DIR=$g/fw" \
+    "$@" >"$p.out" 2>"$p.err" </dev/null
+  echo "$?" >"$p.rc"
+  {
+    echo "--- calls"
+    grep -v '^systemctl stop ' "$g/calls"
+    echo "--- parallel stops, sorted"
+    grep '^systemctl stop ' "$g/calls" | sort
+    echo "--- github"
+    cat "$g/gh.log"
+    echo "--- files"
+    (cd "$g" && ls fw snip)
+  } >"$p.state"
+}
+
+same_state() {
+  local name=$1 ok=1 f
+  shift
+  snap_run "$t/sb" bash "$here/mayfly.sh" "$@"
+  snap_run "$t/sr" "$bin" "$@"
+  n=$((n + 1))
+  for f in out err rc state; do cmp -s "$t/sb.$f" "$t/sr.$f" || ok=0; done
+  if [ "$ok" = 1 ]; then
+    echo "ok   $name (exit $(cat "$t/sb.rc"), $(wc -l <"$t/sb.out") lines, $(wc -l <"$t/sb.state") lines of state)"
+  else
+    echo "FAIL $name: bash exit $(cat "$t/sb.rc"), rust exit $(cat "$t/sr.rc")"
+    for f in out err rc state; do
+      diff -u --label "bash $f" --label "rust $f" "$t/sb.$f" "$t/sr.$f" | head -40
+    done
+    fails=$((fails + 1))
+  fi
+}
+
+pre_active() { echo "mayfly-slot@b-1.service loaded active running Mayfly slot b-1" >"$g/active"; }
+pre_no_slots() { : >"$g/conf/slots.conf"; }
+
+same_state "gc" gc
+FAIL_DESTROY=9004 same_state "gc, a destroy fails" gc
+same_state "enable" enable
+same_state "enable a-1 c-1" enable a-1 c-1
+same_state "enable, unknown slot" enable a-1 nope
+same_state "disable" disable
+same_state "disable a-1 b-1 c-1" disable a-1 b-1 c-1
+PRE=pre_active same_state "disable a-1, b-1 still active" disable a-1
+PRE=pre_no_slots same_state "enable without slots" enable
+PRE=pre_no_slots same_state "disable without slots" disable
+PRE=pre_no_slots same_state "enable a slot that is not there" enable a-1
 
 echo
 echo "$((n - fails))/$n identical"
