@@ -1,6 +1,6 @@
 [package]
 name = "mayfly"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Throwaway GitHub Actions runners on Proxmox VE"
 license = "MIT"
