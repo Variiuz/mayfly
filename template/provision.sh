@@ -11,10 +11,13 @@ export DEBIAN_FRONTEND=noninteractive
 set -a
 # shellcheck source=/dev/null
 . /root/template.env
-mkdir -p /root/profile
-tar -xzf /root/profile.tgz -C /root/profile
+# The profile goes to a world-readable directory: its provision.sh runs from there, and commands it
+# runs as runner (runuser keeps the working directory) would fail in root's 0700 home.
+install -d -m 0755 /opt/mayfly-profile
+tar -xzf /root/profile.tgz -C /opt/mayfly-profile --no-same-owner
+chmod -R a+rX /opt/mayfly-profile
 # shellcheck source=/dev/null
-[ ! -e /root/profile/template.env ] || . /root/profile/template.env
+[ ! -e /opt/mayfly-profile/template.env ] || . /opt/mayfly-profile/template.env
 set +a
 INSTALL_DOCKER=${INSTALL_DOCKER:-yes}
 INSTALL_GH=${INSTALL_GH:-yes}
@@ -96,8 +99,8 @@ ENV
 echo "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >/opt/actions-runner/.path
 
 # ---- the profile: toolchains, libraries, anything the workflows expect
-if [ -e /root/profile/provision.sh ]; then
-  (cd /root/profile && bash -euxo pipefail ./provision.sh)
+if [ -e /opt/mayfly-profile/provision.sh ]; then
+  (cd /opt/mayfly-profile && bash -euxo pipefail ./provision.sh)
 fi
 chown runner:runner /opt/actions-runner/.env /opt/actions-runner/.path
 
@@ -112,7 +115,7 @@ install -m 0644 /root/mayfly-job.service /etc/systemd/system/mayfly-job.service
 systemctl enable mayfly-job.service
 
 # ---- seal: every clone gets its own machine id, SSH host keys and cloud-init run
-rm -rf /root/provision.sh /root/ci-job.sh /root/mayfly-job.service /root/template.env /root/profile /root/profile.tgz
+rm -rf /root/provision.sh /root/ci-job.sh /root/mayfly-job.service /root/template.env /opt/mayfly-profile /root/profile.tgz
 apt-get clean
 rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 rm -f /etc/ssh/ssh_host_*
