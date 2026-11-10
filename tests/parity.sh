@@ -801,7 +801,19 @@ case "$2" in
       # Capacity of the second guest (3), its second pass (4; a pod's fourth look at the pool): the unit is stopped.
       4)
         for _ in $(seq 50); do [ -s "$PIDFILE" ] && break; sleep 0.1; done
-        kill -TERM "$(cat "$PIDFILE")" ;;
+        pid=$(cat "$PIDFILE")
+        kill -TERM "$pid"
+        # Answer only once the slot has taken the TERM (the kernel has handed it to the bash trap or the Rust
+        # handler: no longer pending), so that both engines have it before the call returns and deal with it at
+        # their next step, not at some point after it that depends on the scheduler.
+        for _ in $(seq 100); do
+          pend=0
+          while read -r k v; do
+            case "$k" in SigPnd: | ShdPnd:) [ $((0x$v & 0x4000)) = 0 ] || pend=1 ;; esac
+          done <"/proc/$pid/status"
+          [ "$pend" = 0 ] && break
+          sleep 0.05
+        done ;;
     esac
     echo '{"total":1000,"used":100}' ;;
   *) exit 1 ;;
