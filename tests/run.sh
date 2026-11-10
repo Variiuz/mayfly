@@ -76,6 +76,9 @@ ok "max_job_hours= and max_idle_hours=" '[ "$MAX_JOB_HOURS" = 6 ] && [ "$MAX_IDL
 ok "cpu= and disk_cache=" '[ "$CPU_TYPE" = x86-64-v3 ] && [ "$DISK_CACHE" = unsafe ]'
 ok "template= wins over next" '[ "$(slot_template)" = 9097 ]'
 ok "max_job_hours=abc is refused" '! (apply_slot "max_job_hours=abc") 2>/dev/null'
+load_env
+apply_slot "kind=vm engine=rust"
+ok "engine= is no setting of bash: other keys and the slot are unchanged" '[ "$BRIDGE" = vmbr2 ] && [ "$VLAN" = 42 ] && [ "$MAX_JOB_HOURS" = 3 ] && [ -z "$SLOT_TEMPLATE" ] && [ "$(slot_opt kind "kind=vm engine=rust")" = vm ] && [ "$(slot_opt engine "kind=vm engine=rust")" = rust ]'
 
 # ---- job environment
 load_env

@@ -1,3 +1,4 @@
+use mayfly::cmd_slot::{self, Route};
 use mayfly::cmd_slots::Verb;
 use mayfly::config::Paths;
 use mayfly::out::{print_die, Out};
@@ -58,7 +59,23 @@ fn main() -> ExitCode {
                 _ => cmd_slots::run(&cx, Verb::Disable, &args[1..], &out, &mut stdout),
             }
         }
+        Some("slot") if args.len() == 2 && cmd_slot::route(&paths, &args[1]) == Route::Rust => {
+            let node = node();
+            let cx = Ctx {
+                paths: &paths,
+                pve: &RealPve,
+                node: &node,
+                meminfo: "/proc/meminfo",
+            };
+            cmd_slot::run(&cx, &args[1..], &mut stdout)
+        }
         _ => {
+            // A slot that stays on bash says so first (engine=rust on a pod or container slot).
+            if let (Some("slot"), Some(name)) = (args.first().map(String::as_str), args.get(1)) {
+                if let Route::Bash { note: Some(note) } = cmd_slot::route(&paths, name) {
+                    let _ = writeln!(stdout, "{note}");
+                }
+            }
             let _ = stdout.flush();
             forward::exec(&paths, &args)
         }

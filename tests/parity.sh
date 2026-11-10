@@ -9,17 +9,21 @@
 # template list, canary, promote and build are compared like gc (a VM build to the end, with a stub qm that
 # answers the guest agent and a stand-in qemu process; MAYFLY_TEST_NAP=0 and MAYFLY_QEMU_RUN_DIR keep it
 # fast and local).
+# slot: one kind=vm slot runs on bash and on Rust (engine=rust in slots.conf, which bash ignores) through one job
+# cycle (the VM powers itself off) and a second VM that a TERM drains; stubs record every qm, pvesh and pvesm
+# call and the cloud-init snippet and firewall file at `qm start`, a fake GitHub records its requests (the
+# JIT body included), hooks record their arguments. The calls, files, requests, output and exit code are compared.
 # Usage: bash tests/parity.sh [path to the mayfly binary]   (default target/release/mayfly)
 set -uo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${1:-$here/target/release/mayfly}
 [ -x "$bin" ] || { echo "no binary at $bin (cargo build --release)" >&2; exit 2; }
 t=$(mktemp -d)
-srv="" srv2=""
+srv="" srv2="" srv3=""
 # The stand-in qemu processes of the template build (pid files under $t/g/qemu).
 kill_qemu() {
   local f
-  for f in "$t"/g/qemu/*.pid; do
+  for f in "$t"/g/qemu/*.pid "$t"/s/qemu/*.pid; do
     [ -e "$f" ] || continue
     kill "$(cat "$f")" 2>/dev/null || true
   done
@@ -28,6 +32,7 @@ cleanup() {
   kill_qemu
   [ -z "$srv" ] || kill "$srv" 2>/dev/null
   [ -z "$srv2" ] || kill "$srv2" 2>/dev/null
+  [ -z "$srv3" ] || kill "$srv3" 2>/dev/null
   rm -rf "$t"
 }
 trap cleanup EXIT
@@ -660,6 +665,232 @@ same_install "install, second, update units new" pre_no_update_units
 POOL_ENV_TEXT='UPDATE="off" # by hand' same_install "install, UPDATE=off" pre_pool_env
 POOL_ENV_TEXT=$'APP_ID=3\nSNIPPET_STORAGE=tank\nUPDATE=patch' same_install "install, SNIPPET_STORAGE and APP_ID set" pre_pool_env
 same_install "install, snippets already there" pre_snippets_there
+
+# ---- slot: kind=vm, one job cycle and a drain, on bash and on Rust
+s=$t/s
+mkdir -p "$s/bin"
+cat >"$s/bin/pvesm" <<'STUB'
+#!/bin/sh
+echo "pvesm $*" >>"$CALLS"
+case "$1" in
+  path) echo "$GSNIP/x" ;;
+  *) exit 1 ;;
+esac
+STUB
+cat >"$s/bin/qm" <<'STUB'
+#!/bin/sh
+echo "qm $*" >>"$CALLS"
+etc=$MAYFLY_PVE_ETC/qemu-server
+case "$1" in
+  config) cat "$etc/$2.conf" 2>/dev/null || exit 2 ;;
+  clone) printf 'name: %s\ntags: mayfly\nscsi0: local-lvm:vm-%s-disk-0,size=32G\n' "$5" "$3" >"$etc/$3.conf" ;;
+  start)
+    # What the VM starts from: the snippet (and its mode) and the firewall file, as they are right now.
+    n=$(cat "$CAP/n" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" >"$CAP/n"
+    cp "$GSNIP/mayfly-$2.yaml" "$CAP/snippet-$n.yaml" 2>/dev/null
+    stat -c %a "$GSNIP/mayfly-$2.yaml" >"$CAP/snippet-$n.mode" 2>/dev/null
+    cp "$MAYFLY_PVE_FW_DIR/$2.fw" "$CAP/fw-$n.fw" 2>/dev/null
+    # A stand-in for the qemu process: vm_running looks for a live pid whose command line has "-id <vmid> ".
+    python3 -c 'import time; time.sleep(300)' -id "$2" x </dev/null >/dev/null 2>&1 &
+    echo $! >"$MAYFLY_QEMU_RUN_DIR/$2.pid"
+    for _ in $(seq 100); do
+      tr '\0' ' ' <"/proc/$!/cmdline" 2>/dev/null | grep -q -- "-id $2 " && break
+      sleep 0.05
+    done ;;
+  stop)
+    if [ -f "$MAYFLY_QEMU_RUN_DIR/$2.pid" ]; then
+      kill "$(cat "$MAYFLY_QEMU_RUN_DIR/$2.pid")" 2>/dev/null
+      rm -f "$MAYFLY_QEMU_RUN_DIR/$2.pid"
+    fi ;;
+  destroy) rm -f "$etc/$2.conf" ;;
+  guest) echo '{"exitcode":3}' ;;
+esac
+exit 0
+STUB
+cat >"$s/bin/pvesh" <<'STUB'
+#!/bin/sh
+echo "pvesh $*" >>"$CALLS"
+case "$2" in
+  /nodes/*/storage/*/status)
+    n=$(cat "$CAP/pvesh.n" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" >"$CAP/pvesh.n"
+    case "$n" in
+      # Capacity (1), the first VM's second pass (2): its job is over and it powers off.
+      2)
+        kill "$(cat "$MAYFLY_QEMU_RUN_DIR/9002.pid")" 2>/dev/null
+        rm -f "$MAYFLY_QEMU_RUN_DIR/9002.pid" ;;
+      # Capacity of the second VM (3), its second pass (4): the unit is stopped.
+      4)
+        for _ in $(seq 50); do [ -s "$PIDFILE" ] && break; sleep 0.1; done
+        kill -TERM "$(cat "$PIDFILE")" ;;
+    esac
+    echo '{"total":1000,"used":100}' ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$s/bin/"*
+
+cat >"$t/slot.py" <<'PY'
+import http.server, json, sys
+
+LOG = sys.argv[1]
+state = {"n": 76}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def note(self, body=""):
+        auth = self.headers.get("Authorization", "")
+        if auth.count(".") == 2:
+            auth = "Bearer <jwt>"
+        with open(LOG, "a") as f:
+            f.write("%s %s %s %s\n" % (self.command, self.path, auth, body))
+
+    def send(self, code, obj=None):
+        body = b"" if obj is None else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.note()
+        if self.path == "/orgs/acme/installation":
+            self.send(200, {"id": 42})
+        elif self.path.startswith("/orgs/acme/actions/runners/"):
+            self.send(200, {"status": "online"})
+        else:
+            self.send(404, {})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n).decode() if n else ""
+        if self.path == "/__reset":
+            state["n"] = 76
+            self.send(200, {})
+            return
+        self.note(body)
+        if self.path == "/app/installations/42/access_tokens":
+            self.send(201, {"token": "ghs_fake"})
+        elif self.path == "/orgs/acme/actions/runners/generate-jitconfig":
+            state["n"] += 1
+            self.send(201, {"runner": {"id": state["n"], "name": "x"}, "encoded_jit_config": "JITSECRET-%d" % state["n"]})
+        else:
+            self.send(404, {})
+
+    def do_DELETE(self):
+        self.note()
+        self.send(204)
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+PY
+python3 "$t/slot.py" "$s/gh.log" >"$t/sport" &
+srv3=$!
+for _ in $(seq 50); do [ -s "$t/sport" ] && break; sleep 0.1; done
+[ -s "$t/sport" ] || { echo "the fake GitHub for slot did not start" >&2; exit 2; }
+
+slot_reset() {
+  kill_qemu
+  rm -rf "$s/pve" "$s/fw" "$s/snip" "$s/cap" "$s/qemu" "$s/conf" "$s/mayfly.pid"
+  mkdir -p "$s/pve/qemu-server" "$s/fw" "$s/snip" "$s/cap" "$s/qemu" "$s/conf/hooks.d" "$s/conf/env"
+  printf 'name: ci-template\ntags: mayfly\ndescription: profile default\ntemplate: 1\n' >"$s/pve/qemu-server/9098.conf"
+  cat >"$s/conf/pool.env" <<ENV
+APP_ID=12345
+ORG=acme
+KEY_PATH=$t/app.pem
+API_URL=http://127.0.0.1:$(cat "$t/sport")
+RUNNER_PREFIX=mf
+TEMPLATE_VMID=9098
+GATEWAY=10.0.0.1
+CACHE_IP=10.0.0.5
+HOOK_DIR=$s/conf/hooks.d
+MIN_FREE_RAM_GB=0
+ENV
+  # engine=rust is for the Rust binary; bash reads the slot and ignores the key.
+  echo 'a-1 9002 linux,gpu 8 1 60 cache,missing current engine=rust' >"$s/conf/slots.conf"
+  printf 'A=1\nB=two\n# comment\nnot a line\n' >"$s/conf/env/cache.env"
+  printf '#!/bin/sh\necho "hook $*" >>"$CALLS"\n' >"$s/conf/hooks.d/10-rec"
+  printf '#!/bin/sh\necho "hook-fail $*" >>"$CALLS"\nexit 1\n' >"$s/conf/hooks.d/20-fail"
+  printf '#!/bin/sh\necho "never $*" >>"$CALLS"\n' >"$s/conf/hooks.d/30-not-executable"
+  chmod +x "$s/conf/hooks.d/10-rec" "$s/conf/hooks.d/20-fail"
+  curl -s -X POST "http://127.0.0.1:$(cat "$t/sport")/__reset" >/dev/null
+  : >"$s/gh.log"
+  : >"$s/calls"
+}
+
+# slot_run <prefix> <command ...>: runs the slot (in the background, so that the stubs can send it a TERM),
+# saves its output, exit code and the state it left. Epoch seconds in names are replaced.
+slot_run() {
+  local p=$1 pid f
+  shift
+  slot_reset
+  env -u INVOCATION_ID "PATH=$s/bin:$PATH" "CALLS=$s/calls" "CAP=$s/cap" "GSNIP=$s/snip" "PIDFILE=$s/mayfly.pid" \
+    "MAYFLY_TEST_NAP=0" "MAYFLY_QEMU_RUN_DIR=$s/qemu" "MAYFLY_CONF_DIR=$s/conf" "MAYFLY_PVE_ETC=$s/pve" \
+    "MAYFLY_PVE_FW_DIR=$s/fw" "$@" >"$p.out" 2>"$p.err" </dev/null &
+  pid=$!
+  echo "$pid" >"$s/mayfly.pid"
+  for _ in $(seq 600); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    echo "timed out" >>"$p.err"
+  fi
+  wait "$pid"
+  echo "$?" >"$p.rc"
+  kill_qemu
+  sed -i -E 's/[0-9]{10}/EPOCH/g' "$p.out" "$p.err"
+  sed -E 's/[0-9]{10}/EPOCH/g' "$s/calls" >"$p.calls"
+  sed -E 's/[0-9]{10}/EPOCH/g' "$s/gh.log" >"$p.gh"
+  {
+    echo "--- calls"
+    cat "$p.calls"
+    echo "--- github"
+    cat "$p.gh"
+    echo "--- what each VM started from"
+    for f in "$s"/cap/snippet-* "$s"/cap/fw-*; do
+      [ -e "$f" ] || continue
+      echo "== ${f#"$s"/cap/}"
+      cat "$f"
+    done
+    echo "--- files left"
+    (cd "$s" && ls fw snip pve/qemu-server)
+  } >"$p.state"
+}
+
+same_slot() {
+  local name=$1 ok=1 f
+  shift
+  slot_run "$t/lb" bash "$here/mayfly.sh" "$@"
+  slot_run "$t/lr" "$bin" "$@"
+  n=$((n + 1))
+  for f in out err rc state; do cmp -s "$t/lb.$f" "$t/lr.$f" || ok=0; done
+  # The JIT config is only ever in the snippet.
+  if grep -q JITSECRET "$t/lr.out" "$t/lr.err" "$t/lr.calls" "$t/lr.gh"; then ok=0; echo "the JIT config leaked"; fi
+  if [ "$(cat "$t/lr.rc")" != 0 ] || ! grep -q 'gone after' "$t/lr.out" || [ "$(grep -c 'qm start' "$t/lr.calls")" != 2 ]; then
+    ok=0
+    echo "the run did not go through two VMs and a drain:"
+    cat "$t/lr.out" "$t/lr.err"
+  fi
+  if [ "$ok" = 1 ]; then
+    echo "ok   $name (exit $(cat "$t/lb.rc"), $(wc -l <"$t/lb.out") lines, $(wc -l <"$t/lb.state") lines of state)"
+  else
+    echo "FAIL $name: bash exit $(cat "$t/lb.rc"), rust exit $(cat "$t/lr.rc")"
+    for f in out err rc state; do
+      diff -u --label "bash $f" --label "rust $f" "$t/lb.$f" "$t/lr.$f" | head -60
+    done
+    fails=$((fails + 1))
+  fi
+}
+
+same_slot "slot, one job cycle and a drain (kind=vm)" slot a-1
 
 echo
 echo "$((n - fails))/$n identical"

@@ -284,6 +284,7 @@ fn defaults(conf_dir: &str) -> Vec<(&'static str, String)> {
         ),
         ("RUNNER_PREFIX", s("")),
         ("UPDATE", s("auto")),
+        ("SLOT_ENGINE", s("bash")),
     ]
 }
 
@@ -295,6 +296,11 @@ impl Config {
             "no setting {key}"
         );
         self.vars.get(key).map(String::as_str).unwrap_or("")
+    }
+
+    /// Changes a setting for this run (a slot's own `bridge=`, `max_job_hours=` and so on).
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.vars.insert(key.to_string(), value.to_string());
     }
 
     /// A whole-number setting, as bash `[ "$x" -ge ... ]` reads it: None when it is not one.

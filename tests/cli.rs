@@ -2098,3 +2098,107 @@ fn a_failing_command_stops_the_install_with_its_exit_code() {
     // Nothing after the failed step ran.
     assert!(!i.calls().iter().any(|c| c.starts_with("systemctl")));
 }
+
+// ------------------------------------------------------------------ engine= and SLOT_ENGINE
+
+#[test]
+fn status_shows_the_engine_only_while_a_slot_runs_rust() {
+    // No engine setting anywhere: the columns of the bash status.
+    let (f, pve) = status_fixture("");
+    let (_, out) = f.run_status(&pve);
+    assert!(!out.contains("ENGINE"), "{out}");
+    assert!(out.starts_with(
+        "SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB\n"
+    ));
+
+    // One slot on rust: a column for all of them; pods and containers are bash whatever they ask.
+    write(
+        &f.paths.slots_conf,
+        "build-1 9002 linux 8 16 60 no current engine=rust\n\
+         pods-1 9041 small 12 36 120 no current kind=pod containers=6 engine=rust\n\
+         ct-1 9051 small 2 4 20 no current kind=lxc engine=rust\n\
+         off-1 9052 small 1 1 1 no current engine=bash\n",
+    );
+    let (_, out) = f.run_status(&pve);
+    let rows: Vec<&str> = out.lines().take(5).collect();
+    assert_eq!(
+        rows[0],
+        "SLOT       VMID   KIND ENGINE LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB"
+    );
+    assert!(rows[1].starts_with("build-1    9002   vm   rust   linux                  8c/16G  "));
+    assert!(rows[2].starts_with("pods-1     9041   pod  bash   small                  12c/36G "));
+    assert!(rows[3].starts_with("ct-1       9051   lxc  bash   small                  2c/4G   "));
+    assert!(rows[4].starts_with("off-1      9052   vm   bash   small                  1c/1G   "));
+
+    // SLOT_ENGINE in pool.env is the default of the vm slots.
+    let (f, pve) = status_fixture("SLOT_ENGINE=rust\n");
+    let (_, out) = f.run_status(&pve);
+    let rows: Vec<&str> = out.lines().take(5).collect();
+    assert!(
+        rows[1].starts_with("build-1    9002   vm   rust   "),
+        "{out}"
+    );
+    assert!(
+        rows[2].starts_with("pods-1     9041   pod  bash   "),
+        "{out}"
+    );
+    assert!(
+        rows[4].starts_with("off-1      9052   vm   rust   "),
+        "{out}"
+    );
+
+    // Only an unknown value: the slot runs on bash, and no slot runs rust.
+    let (f, pve) = status_fixture("SLOT_ENGINE=nope\n");
+    let (_, out) = f.run_status(&pve);
+    assert!(!out.contains("ENGINE"), "{out}");
+}
+
+#[test]
+fn check_accepts_engine_and_warns_about_an_unknown_value() {
+    let dir = tmp("key-engine");
+    let (key, _) = make_key(&dir, false);
+    let gh = fake_github(200);
+    let (f, pve) = check_fixture(gh.port, &key);
+    write(
+        &f.paths.slots_conf,
+        "r-1 9002 x 1 1 1 no current engine=rust\n\
+         b-1 9003 x 1 1 1 no current engine=bash\n\
+         u-1 9004 x 1 1 1 no current engine=fast\n\
+         p-1 9005 x 1 1 1 no current kind=pod engine=rust\n",
+    );
+    write(
+        &f.paths.pool_env,
+        &format!(
+            "APP_ID=12345\nKEY_PATH={}\nAPI_URL=http://127.0.0.1:{}\nORG=acme\nTEMPLATE_VMID=9098\nSLOT_ENGINE=nope\n",
+            key.display(),
+            gh.port
+        ),
+    );
+    let (code, out) = f.run_check(&pve).unwrap();
+    let got: Vec<&str> = out
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().contains("engine"))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            format!(
+                "warn {:<9} SLOT_ENGINE=nope is not rust or bash; slots run on bash",
+                "pool.env"
+            ),
+            format!(
+                "warn {:<9} engine=fast is not rust or bash; the slot runs on bash",
+                "u-1"
+            ),
+        ]
+    );
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn slot_engine_defaults_to_bash() {
+    let f = Fixture::new("engine-default", "ORG=acme\n", "");
+    assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "bash");
+    write(&f.paths.pool_env, "ORG=acme\nSLOT_ENGINE=rust\n");
+    assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "rust");
+}

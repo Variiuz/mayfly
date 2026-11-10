@@ -1,5 +1,6 @@
 //! `mayfly check`: App key, storage, network, template; changes nothing.
 
+use crate::cmd_slot::engine_setting;
 use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{self, GitHub};
 use crate::out::{die, Kind, Out, R};
@@ -131,6 +132,15 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
                 "and {} more lines that are not plain KEY=value",
                 issues.len() - 5
             ),
+        );
+    }
+
+    if let (_, Some(v)) = engine_setting("", c.get("SLOT_ENGINE")) {
+        t.item(
+            w,
+            Kind::Warn,
+            "pool.env",
+            &format!("SLOT_ENGINE={v} is not rust or bash; slots run on bash"),
         );
     }
 
@@ -295,6 +305,14 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
                 name,
                 &format!("unknown kind={kind} (vm, pod or lxc)"),
             ),
+        }
+        if let (_, Some(v)) = engine_setting(&slot.extra, "") {
+            t.item(
+                w,
+                Kind::Warn,
+                name,
+                &format!("engine={v} is not rust or bash; the slot runs on bash"),
+            );
         }
         let pinned = slot_opt("template", &slot.extra, "");
         if !pinned.is_empty() && !is_template(cx, &pinned) {

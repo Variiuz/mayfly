@@ -1,5 +1,6 @@
 //! `mayfly status`: slots, guests, jobs, pool fill, free RAM and templates.
 
+use crate::cmd_slot::{engine_for_kind, Engine};
 use crate::cmd_update::status_text;
 use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{self, GitHub, Runner};
@@ -89,13 +90,30 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         return Ok(0);
     }
     let runners = github_runners(&c);
+    // The engine column only shows while some slot runs the Rust loop (SLOT_ENGINE / engine=); without
+    // one the output is that of the bash status.
+    let engine_of =
+        |extra: &str| engine_for_kind(&slot_opt("kind", extra, "vm"), extra, c.get("SLOT_ENGINE"));
+    let any_rust = slots
+        .names()
+        .iter()
+        .filter_map(|n| slots.get(n))
+        .any(|s| engine_of(&s.extra) == Engine::Rust);
+    let engine_col = |text: &str| {
+        if any_rust {
+            format!("{text:<6} ")
+        } else {
+            String::new()
+        }
+    };
     let _ = writeln!(
         w,
-        "{}{:<10} {:<6} {:<4} {:<22} {:<7} {:<9} {:<8} {:<6} GITHUB{}",
+        "{}{:<10} {:<6} {:<4} {}{:<22} {:<7} {:<9} {:<8} {:<6} GITHUB{}",
         out.dim(),
         "SLOT",
         "VMID",
         "KIND",
+        engine_col("ENGINE"),
         "LABELS",
         "SIZE",
         "SERVICE",
@@ -159,10 +177,14 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         );
         let _ = writeln!(
             w,
-            "{:<10} {:<6} {:<4} {:<22} {:<7} {} {} {} {}",
+            "{:<10} {:<6} {:<4} {}{:<22} {:<7} {} {} {} {}",
             name,
             slot.vmid,
             kind,
+            engine_col(match engine_of(&slot.extra) {
+                Engine::Rust => "rust",
+                Engine::Bash => "bash",
+            }),
             slot.labels,
             format!("{}c/{}G", slot.vcpu, slot.ram),
             svc,
