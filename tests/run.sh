@@ -142,6 +142,13 @@ ok "github_state: online, offline, busy, none" '[ "$(github_state s1 9011 vm)" =
 ok "github_state: pod counts online runners" '[ "$(github_state p1 9041 pod)" = 1/2 ] && [ "$(github_state p9 9049 pod)" = none ]'
 GH_RUNNERS=""
 
+# ---- runner online on GitHub
+gh_api() { case "$3" in */runners/1) echo '{"status":"online"}' ;; */runners/2) echo '{"status":"offline"}' ;; *) return 22 ;; esac; }
+ok "runner_online: online, offline, unknown, no id" 'runner_online tok 1 && ! runner_online tok 2 && ! runner_online tok 3 && ! runner_online tok ""'
+unset -f gh_api
+# shellcheck source=/dev/null
+. <(sed -n '/^gh_api() {/,/^}/p' "$here/mayfly")
+
 # ---- containers
 vcpu=2 ram=4 disk=20
 : >"$t/pct.log"
