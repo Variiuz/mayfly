@@ -112,7 +112,8 @@ pods-1   9041  small   12    36      120      no       current   kind=pod contai
 ### Profiles
 
 A template consists of the core (runner, Docker, gh, single-job service) and a profile. A profile is a
-directory with a `provision.sh`, run as root in the template guest, and a `template.env` with versions
+directory with a `provision.sh`, run as root in the template guest from `/opt/mayfly-profile`
+(readable for `runner`, removed when the template is sealed), and a `template.env` with versions
 and `PREPULL_IMAGES`. The shipped `default` profile installs build-essential, pkg-config, OpenSSL
 headers and shellcheck. Profiles in `/etc/mayfly/profiles/<name>/` take precedence over shipped profiles
 of the same name. `PROFILE` in `pool.env` sets the default; `mayfly template build <name>` builds

@@ -302,7 +302,7 @@ mkdir -p "$t/prov/profile"
 echo 'CORE_X=core' >"$t/prov/template.env"
 echo 'PROFILE_X=profile' >"$t/prov/profile/template.env"
 tar -C "$t/prov/profile" -czf "$t/prov/profile.tgz" .
-sed -n '/^set -a$/,/^set +a$/p' "$here/template/provision.sh" | sed "s|/root/|$t/prov/|g" >"$t/prov/env.sh"
+sed -n '/^set -a$/,/^set +a$/p' "$here/template/provision.sh" | sed -e "s|/opt/mayfly-profile|$t/prov/profile|g" -e "s|/root/|$t/prov/|g" >"$t/prov/env.sh"
 ok "provision.sh exports core and profile template.env" '[ "$(bash -c ". \"$t/prov/env.sh\"; bash -c \"echo \\\$CORE_X-\\\$PROFILE_X\"")" = core-profile ]'
 ok "help lists the commands" 'cmd_help | grep -q "template build" && cmd_help | grep -q "enable"'
 ok "version" '[[ "$(bash "$here/mayfly.sh" version)" =~ ^mayfly\ [0-9]+\.[0-9]+\.[0-9]+$ ]]'
