@@ -479,15 +479,11 @@ ct_deliver() {
 # ------------------------------------------------------------------ slot loop
 
 stopping=0
-cur_vmid=""
-on_term() {
-  stopping=1
-  # An idle VM goes at once; a VM in a job finishes it (systemd waits, TimeoutStopSec).
-  if [ -n "$cur_vmid" ] && vm_running "$cur_vmid" && job_idle "$cur_vmid"; then
-    if [ "$(guest_kind "$cur_vmid")" = ct ]; then pct stop "$cur_vmid" --skiplock 1 >/dev/null 2>&1 || true
-    else qm stop "$cur_vmid" --skiplock 1 --timeout 30 >/dev/null 2>&1 || true; fi
-  fi
-}
+# Only flags the stop: no guest call in a trap, because bash loses the exit status of child processes
+# there (a trap that interrupts `wait` makes `$(...)` and `||` read 0 and empty output). The interrupted
+# `wait` returns at once, and the loop's own `stopping && job_idle` check stops and destroys an idle
+# guest, while a guest in a job finishes it (systemd waits, TimeoutStopSec).
+on_term() { stopping=1; }
 
 cmd_slot() {
   local name=$1 line vmid labels vcpu ram disk envspec which extra tpl token resp jit runner_id host started kind online stuck=0 t
@@ -508,7 +504,6 @@ cmd_slot() {
     exit 1
   fi
   if [ "$kind" = pod ]; then cmd_pod; return; fi
-  cur_vmid=$vmid
   trap on_term TERM INT
 
   while [ "$stopping" = 0 ]; do
