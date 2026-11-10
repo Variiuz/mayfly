@@ -33,6 +33,9 @@ mkdir -p "$t/old"
 curl -fsSL --retry 3 -o "$t/old/mayfly.tar.gz" "https://github.com/variiuz/mayfly/releases/download/v$old/mayfly-$old.tar.gz" ||
   { echo "cannot download release $old" >&2; exit 2; }
 tar -C "$t/old" -xzf "$t/old/mayfly.tar.gz"
+# Installers before 0.5.0 always wrote /etc/mayfly; point them at the stub root too (setup only, the
+# update under test runs the old binary as it is).
+sed -i 's|^conf=/etc/mayfly$|conf=${MAYFLY_CONF_DIR:-/etc/mayfly}|' "$t/old/mayfly-$old/install.sh"
 
 # ---- stub root: every command install, update and check call is answered and logged
 mkdir -p "$t/bin" "$t/root/conf" "$t/root/share" "$t/root/sbin" "$t/root/systemd" "$t/root/state" "$t/root/tmp" "$t/root/pve"
