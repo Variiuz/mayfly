@@ -2,7 +2,7 @@
 pvesm path local:snippets/x
 pvesm path local:snippets/x
 qm config 9098
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 qm clone 9098 9041 --name ci-a-1
 qm set 9041 --cores 8 --memory 8192 --balloon 0 --onboot 0 --tags mayfly --description pod a-1, template 9098 --net0 virtio,bridge=vmbr0,firewall=1 --ipconfig0 ip=dhcp --cicustom user=local:snippets/mayfly-9041.yaml
 qm config 9041
@@ -17,7 +17,7 @@ qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod put mf-a-1-2-EPOCH
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod drain
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod busy
 qm config 9041
@@ -28,7 +28,7 @@ hook pod-gone a-1 9041 0
 hook-fail pod-gone a-1 9041 0
 pvesm path local:snippets/x
 qm config 9099
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 qm clone 9099 9041 --name ci-a-1
 qm set 9041 --cores 8 --memory 8192 --balloon 0 --onboot 0 --tags mayfly --description pod a-1, template 9099 --net0 virtio,bridge=vmbr0,firewall=1 --ipconfig0 ip=dhcp --cicustom user=local:snippets/mayfly-9041.yaml
 qm config 9041
@@ -41,7 +41,7 @@ qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod want
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod drain
 qm guest exec 9041 --timeout 30 -- /usr/local/sbin/mayfly-pod busy
 qm config 9041

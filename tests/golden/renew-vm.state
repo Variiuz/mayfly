@@ -2,7 +2,7 @@
 pvesm path local:snippets/x
 pvesm path local:snippets/x
 qm config 9098
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 qm clone 9098 9002 --name ci-a-1
 qm set 9002 --cores 8 --memory 1024 --balloon 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9098 --net0 virtio,bridge=vmbr0,firewall=1 --ipconfig0 ip=dhcp --cicustom user=local:snippets/mayfly-9002.yaml
 qm config 9002
@@ -10,7 +10,7 @@ qm resize 9002 scsi0 60G
 qm start 9002
 hook vm-up a-1 9002 mf-a-1-EPOCH
 hook-fail vm-up a-1 9002 mf-a-1-EPOCH
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 qm config 9002
 qm config 9002
 qm stop 9002 --skiplock 1 --timeout 30

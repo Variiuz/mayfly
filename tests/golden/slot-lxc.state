@@ -2,7 +2,7 @@
 pvesm path local:snippets/x
 pvesm path local:snippets/x
 qm config 9099
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 pct clone 9099 9051 --hostname ci-a-1
 pct set 9051 --cores 2 --memory 4096 --swap 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9099 --net0 name=eth0,bridge=vmbr0,ip=dhcp,firewall=1
 pct config 9051
@@ -14,7 +14,7 @@ lxc-attach -n 9051 -- sh -c umask 077; cat >/etc/mayfly/job.env
 lxc-attach -n 9051 -- systemctl start --no-block mayfly-job.service
 hook vm-up a-1 9051 mf-a-1-EPOCH
 hook-fail vm-up a-1 9051 mf-a-1-EPOCH
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 pct config 9051
 pct config 9051
 pct stop 9051 --skiplock 1
@@ -23,7 +23,7 @@ hook vm-gone a-1 9051 0
 hook-fail vm-gone a-1 9051 0
 pvesm path local:snippets/x
 qm config 9099
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 pct clone 9099 9051 --hostname ci-a-1
 pct set 9051 --cores 2 --memory 4096 --swap 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9099 --net0 name=eth0,bridge=vmbr0,ip=dhcp,firewall=1
 pct config 9051
@@ -35,7 +35,7 @@ lxc-attach -n 9051 -- sh -c umask 077; cat >/etc/mayfly/job.env
 lxc-attach -n 9051 -- systemctl start --no-block mayfly-job.service
 hook vm-up a-1 9051 mf-a-1-EPOCH
 hook-fail vm-up a-1 9051 mf-a-1-EPOCH
-pvesh get /nodes/vm/storage/local-lvm/status --output-format json
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
 lxc-attach -n 9051 -- sh -c p=$(pgrep -of "bin/Runner\.Worker") || exit 3; ps -o etimes= -p "$p"
 pct config 9051
 pct config 9051

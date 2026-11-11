@@ -48,6 +48,8 @@ case "$1" in
   *) exit 1 ;;
 esac
 STUB
+# The node's name is in the pvesh calls: the same on every machine that runs this.
+printf '#!/bin/sh\necho pve1\n' >"$s/bin/hostname"
 cat >"$s/bin/qm" <<'STUB'
 #!/bin/sh
 # A pod's `mayfly-pod put` carries a JIT config on its command line: the log has none.
