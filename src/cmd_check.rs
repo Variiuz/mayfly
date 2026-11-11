@@ -37,7 +37,8 @@ fn is_template(cx: &Ctx, id: &str) -> bool {
 
 /// LVM writes a metadata archive for every clone and destroy and keeps it `backup/retain_days` (30 by
 /// default): a job host piles up tens of thousands of files on its root disk. A note when retain_days is
-/// over 7 or the archive (`MAYFLY_LVM_ARCHIVE`, default /etc/lvm/archive) is over 500 MB; none without LVM.
+/// over 7, with the size of the archive (`MAYFLY_LVM_ARCHIVE`, default /etc/lvm/archive); none without LVM.
+/// Size alone does not warn: a busy host holds GBs even at retain_days = 3.
 pub fn lvm_archive_note(cx: &Ctx, dir: &str) -> Option<String> {
     let r = cx
         .pve
@@ -51,7 +52,7 @@ pub fn lvm_archive_note(cx: &Ctx, dir: &str) -> Option<String> {
         .find_map(|l| l.trim().strip_prefix("retain_days="))
         .and_then(|v| v.trim().parse().ok())?;
     let (mut files, mut bytes) = (0u64, 0u64);
-    if let Ok(rd) = std::fs::read_dir(&dir) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             if let Ok(m) = e.metadata() {
                 if m.is_file() {
@@ -62,9 +63,9 @@ pub fn lvm_archive_note(cx: &Ctx, dir: &str) -> Option<String> {
         }
     }
     let mb = bytes / 1_048_576;
-    (days > 7 || mb > 500).then(|| {
+    (days > 7).then(|| {
         format!(
-            "{dir} holds {files} files ({mb} MB), kept {days} days: every clone and destroy adds one. Set retain_days = 3 in the backup section of /etc/lvm/lvm.conf"
+            "{dir} holds {files} files ({mb} MB), kept {days} days: every clone and destroy adds one. Set retain_days = 3 (1 on a busy host) in the backup section of /etc/lvm/lvm.conf"
         )
     })
 }
