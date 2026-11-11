@@ -69,7 +69,7 @@ A setup is working when:
 | `mayfly enable [slot ...]` | starts slots (all when none is named) and the gc timer |
 | `mayfly disable [slot ...]` | stops slots; running jobs finish first |
 | `mayfly status` | each slot's service, guest, job and runner state on GitHub (`online`, `busy`, `offline`, `none`); pool and RAM |
-| `mayfly stats [hours]` | per-slot counts from the journal, last 24 hours by default |
+| `mayfly stats [hours] [--json\|--csv]` | per-slot counts and job minutes from the journal, last 24 hours by default |
 | `mayfly gc` | removes stale runner registrations, orphan guests and old snippets |
 | `mayfly update` | see [Updates](#updates) |
 | `mayfly help`, `mayfly version` | |
@@ -78,8 +78,9 @@ Logs: `journalctl -u 'mayfly-slot@*' -f`.
 
 `mayfly stats` counts guests destroyed, jobs run, guests replaced idle (`MAX_IDLE_HOURS`) or stuck
 (runner not online), jobs cut off (`MAX_JOB_HOURS`, the backstop, a full pool), errors (clone, start,
-GitHub registration) and the median life of a guest that ran a job. Pods count their VMs and errors
-only.
+GitHub registration), the minutes of the guests that ran a job (total and median, clone to destroy) and
+of all guests. Pods count their VMs, VM minutes and errors only. `--json` and `--csv` print the same per
+slot with its labels, plus an `all` row, for scripts.
 
 ## Job lifecycle
 
