@@ -326,17 +326,17 @@ fn status_fixture(pool_extra: &str) -> (Fixture, FakePve) {
     f.guest("qemu-server", "9041");
     f.guest("lxc", "9051");
     let pve = base_pve()
-        .answer("qm status 9002", "status: running\n")
-        .answer("qm status 9041", "status: running\n")
-        .answer("pct status 9051", "status: stopped\n")
+        .with_running_qemu("9002")
+        .with_running_qemu("9041")
+        .answer("lxc-info -n 9051 -sH", "STOPPED\n")
         .answer(
             "timeout 15 qm guest exec 9002 --timeout 10 -- pgrep -f bin/Runner\\.Worker",
             "{\"exitcode\":0,\"out-data\":\"123\\n\"}",
         )
-        .answer("systemctl is-active mayfly-slot@build-1", "active\n")
-        .answer("systemctl is-active mayfly-slot@pods-1", "activating\n")
-        .answer("systemctl is-active mayfly-slot@ct-1", "failed\n")
-        .answer("systemctl is-active mayfly-slot@off-1", "inactive\n")
+        .answer(
+            "systemctl is-active mayfly-slot@build-1 mayfly-slot@pods-1 mayfly-slot@ct-1 mayfly-slot@off-1",
+            "active\nactivating\nfailed\ninactive\n",
+        )
         .answer(
             "pvesh get /nodes/pve1/storage/local-lvm/status --output-format json",
             "{\"total\":1000,\"used\":425}",
@@ -403,8 +403,18 @@ fn status_asks_a_busy_guest_only_when_it_runs() {
         calls.iter().filter(|c| c.contains("pgrep")).count() == 1,
         "{calls:?}"
     );
-    assert!(calls.iter().any(|c| c == "qm status 9002"));
-    assert!(!calls.iter().any(|c| c.starts_with("qm status 9052")));
+    // No Proxmox Perl CLI per slot: state comes from the pid file and lxc-info, services in one call.
+    assert!(
+        !calls.iter().any(|c| c.starts_with("qm status")
+            || c.starts_with("pct status")
+            || c.contains(" config ")),
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("systemctl")).count(),
+        1,
+        "{calls:?}"
+    );
 }
 
 #[test]
@@ -900,17 +910,27 @@ fn status_github_column() {
         key.display(),
         gh.port
     ));
-    let pve = pve
-        .answer("pct status 9051", "status: running\n")
-        .answer(
-            "qm config 9002",
-            "name: ci-build-1\ndescription: runner ci-pve1-build-1-1700000000, template 9098\n",
-        )
-        .answer(
-            "pct config 9051",
-            "hostname: ci-ct-1\ndescription: runner ci-pve1-ct-1-1700000001, template 9096\n",
-        );
+    let pve = pve.answer("lxc-info -n 9051 -sH", "RUNNING\n");
+    // Proxmox keeps the description as percent-encoded `#` lines at the top of the config file.
+    write(
+        format!("{}/pve/qemu-server/9002.conf", f.root.display()),
+        "#runner ci-pve1-build-1-1700000000, template 9098\nname: ci-build-1\n",
+    );
+    write(
+        format!("{}/pve/lxc/9051.conf", f.root.display()),
+        "#runner ci-pve1-ct-1-1700000001%2C template 9096\nhostname: ci-ct-1\n",
+    );
     let (_, out) = f.run_status(&pve);
+    // build-1's runner is busy on GitHub, so its guest is not asked; ct-1's runner is offline, so it is.
+    let calls = pve.calls();
+    assert!(
+        !calls.iter().any(|c| c.contains("guest exec 9002")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c.contains("lxc-attach -n 9051")),
+        "{calls:?}"
+    );
     let want = "\
 SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB
 build-1    9002   vm   linux                  8c/16G  active    running  busy   busy
@@ -2254,4 +2274,20 @@ fn slot_engine_is_unset_by_default_and_kept_when_set() {
     assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "");
     write(&f.paths.pool_env, "ORG=acme\nSLOT_ENGINE=rust\n");
     assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "rust");
+}
+
+#[test]
+fn config_description_reads_the_comment_lines() {
+    use mayfly::pve::{config_description, GuestKind};
+    let f = Fixture::new("desc", "ORG=acme\n", "");
+    let pve_etc = format!("{}/pve", f.root.display());
+    write(
+        format!("{pve_etc}/qemu-server/9002.conf"),
+        "#runner mf-a-1-3%2C template 9098\n#100%25 %zz\nname: x\n#not this\n[snap]\n",
+    );
+    assert_eq!(
+        config_description(&pve_etc, GuestKind::Vm, "9002").as_deref(),
+        Some("runner mf-a-1-3, template 9098\n100% %zz")
+    );
+    assert_eq!(config_description(&pve_etc, GuestKind::Ct, "9002"), None);
 }
