@@ -4,7 +4,7 @@ use crate::cmd_update::status_text;
 use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{self, GitHub, Runner};
 use crate::out::{Colour, Out, R};
-use crate::pve::guest_kind;
+use crate::pve::{config_description, guest_kind};
 use crate::Ctx;
 use std::io::Write;
 
@@ -58,10 +58,10 @@ fn github_state(
         return format!("{}/{}", on + busy, on + off + busy);
     }
     let described = guest_kind(&cx.paths.pve_etc, vmid)
-        .and_then(|k| cx.pve.guest_config(k, vmid))
-        .and_then(|cfg| {
-            cfg.lines().find_map(|l| {
-                let rest = l.strip_prefix("description: runner ")?;
+        .and_then(|k| config_description(&cx.paths.pve_etc, k, vmid))
+        .and_then(|d| {
+            d.lines().find_map(|l| {
+                let rest = l.strip_prefix("runner ")?;
                 Some(rest.split([' ', ',']).next().unwrap_or("").to_string())
             })
         })
@@ -76,6 +76,21 @@ fn github_state(
         _ => "none",
     }
     .to_string()
+}
+
+/// `systemctl is-active` of every slot's unit in one call: one answer per unit, in order. Empty
+/// answers when systemctl prints a different number of lines.
+fn service_states(cx: &Ctx, names: &[&str]) -> Vec<String> {
+    let units: Vec<String> = names.iter().map(|n| format!("mayfly-slot@{n}")).collect();
+    let mut args = vec!["is-active"];
+    args.extend(units.iter().map(String::as_str));
+    let r = cx.pve.run("systemctl", &args);
+    let lines: Vec<String> = r.stdout.lines().map(str::to_string).collect();
+    if lines.len() == names.len() {
+        lines
+    } else {
+        vec![String::new(); names.len()]
+    }
 }
 
 pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
@@ -104,25 +119,38 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         out.reset()
     );
     let mut stuck = 0;
-    for name in slots.names() {
+    let services = service_states(cx, &slots.names());
+    for (i, name) in slots.names().into_iter().enumerate() {
         let Some(slot) = slots.get(name) else {
             continue;
         };
         let kind = slot_opt("kind", &slot.extra, "vm");
+        // Read from the config file and the qemu pid or lxc-info: no `qm status` (Perl) per slot.
         let gk = guest_kind(&cx.paths.pve_etc, &slot.vmid);
         let state = match gk {
-            Some(k) => cx.pve.guest_state(k, &slot.vmid),
-            None => String::new(),
+            Some(_) if cx.pve.guest_running(gk, &slot.vmid) => "running",
+            Some(_) => "stopped",
+            None => "",
+        };
+        let gh = match &runners {
+            None => "?".to_string(),
+            Some(list) if state == "running" => github_state(cx, &c, list, name, &slot.vmid, &kind),
+            Some(_) => "-".to_string(),
         };
         let mut job = "-".to_string();
         if state == "running" && kind == "pod" {
             job = format!("{} containers", slot_opt("containers", &slot.extra, "?"));
         } else if state == "running" {
-            // A running guest that is neither a VM nor a container cannot happen: it has a config file.
-            let active = gk.is_some_and(|k| cx.pve.job_active(k, &slot.vmid));
+            // GitHub knows whether its runner is busy; the guest is asked (up to 15 s) only when
+            // GitHub does not know the runner or cannot be asked.
+            let active = match gh.as_str() {
+                "busy" => true,
+                "online" => false,
+                _ => gk.is_some_and(|k| cx.pve.job_active(k, &slot.vmid)),
+            };
             job = if active { "busy" } else { "idle" }.to_string();
         }
-        let svc = cx.pve.service_state(&format!("mayfly-slot@{name}"));
+        let svc = services.get(i).cloned().unwrap_or_default();
         let svc = out.paint(
             &svc,
             9,
@@ -134,16 +162,11 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
             ],
         );
         let guest = out.paint(
-            if state.is_empty() { "none" } else { &state },
+            if state.is_empty() { "none" } else { state },
             8,
             &[("running", Colour::Grn)],
         );
         let job = out.paint(&job, 6, &[("busy", Colour::Blu), ("idle", Colour::Dim)]);
-        let gh = match &runners {
-            None => "?".to_string(),
-            Some(list) if state == "running" => github_state(cx, &c, list, name, &slot.vmid, &kind),
-            Some(_) => "-".to_string(),
-        };
         if gh == "offline" || gh == "none" || gh.starts_with("0/") {
             stuck += 1;
         }
@@ -228,7 +251,6 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
     if !lxc.is_empty() || !lxc_next.is_empty() {
         let _ = writeln!(w, "{d}{:<10}{z} {}{}", "lxc", or_none(lxc), next(lxc_next));
     }
-    // Only the Rust status has this line; bash status does not (tests/parity.sh ignores it).
     let _ = writeln!(w, "{d}{:<10}{z} {}", "update", status_text(cx.paths));
     Ok(0)
 }

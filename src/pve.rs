@@ -31,6 +31,45 @@ pub fn guest_kind(pve_etc: &str, id: &str) -> Option<GuestKind> {
     }
 }
 
+/// The description of a guest, read from its config file under `pve_etc` (no `qm config`, which starts
+/// the Proxmox Perl CLI): Proxmox keeps it as the `#` lines before the first key, percent-encoded.
+/// None when there is no config file.
+pub fn config_description(pve_etc: &str, kind: GuestKind, id: &str) -> Option<String> {
+    let dir = match kind {
+        GuestKind::Vm => "qemu-server",
+        GuestKind::Ct => "lxc",
+    };
+    let text = fs::read_to_string(format!("{pve_etc}/{dir}/{id}.conf")).ok()?;
+    let lines: Vec<String> = text
+        .lines()
+        .map_while(|l| l.strip_prefix('#'))
+        .map(percent_decode)
+        .collect();
+    Some(lines.join("\n"))
+}
+
+/// `%3A` -> `:`; a `%` without two hex digits stays as it is.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && b[i + 1].is_ascii_hexdigit()
+            && b[i + 2].is_ascii_hexdigit()
+        {
+            let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            out.push(hex(b[i + 1]) * 16 + hex(b[i + 2]));
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The node a VMID belongs to anywhere in the cluster (`/etc/pve/.vmlist`), if it is used.
 pub fn vmid_node(pve_etc: &str, id: &str) -> Option<String> {
     let text = fs::read_to_string(format!("{pve_etc}/.vmlist")).ok()?;
