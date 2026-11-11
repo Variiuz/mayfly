@@ -5,9 +5,9 @@
 # Without the files next to it, it downloads the release it belongs to (checked against SHA256SUMS).
 # From a checkout it builds the binary with cargo when there is none next to it, or takes the released
 # binary of the checkout's version when there is no cargo.
-# It only finds and checks the files; `mayfly install` (the binary) puts them in place: the command, mayfly.sh,
-# the units, the template files and the shipped profiles, /etc/mayfly/{pool.env,slots.conf} only when missing,
-# the timers. See src/cmd_install.rs. The arguments (--no-timer) go to it.
+# It only finds and checks the files; `mayfly install` (the binary) puts them in place: the command, the units,
+# the template files and the shipped profiles, /etc/mayfly/{pool.env,slots.conf} only when missing, the timers.
+# See src/cmd_install.rs. The arguments (--no-timer) go to it.
 # MAYFLY_SBIN, MAYFLY_SHARE, MAYFLY_SYSTEMD_DIR and MAYFLY_CONF_DIR move the command, the share directory, the
 # units and /etc/mayfly (tests; the binary reads them from the environment).
 set -euo pipefail
@@ -28,7 +28,7 @@ command -v qm >/dev/null || die "not a Proxmox host (qm is missing)"
 
 src=""
 [ -z "${BASH_SOURCE[0]:-}" ] || [ ! -f "${BASH_SOURCE[0]}" ] || src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [ -z "$src" ] || [ ! -f "$src/mayfly.sh" ]; then
+if [ -z "$src" ] || [ ! -f "$src/mayfly-slot@.service" ]; then
   # Run from a pipe or on its own: fetch the release.
   [ "$VERSION" != main ] || die "this install.sh is not from a release; use $REPO_URL/releases/latest/download/install.sh"
   command -v curl >/dev/null || die "curl is missing"
@@ -54,7 +54,8 @@ if [ ! -f "$bin" ]; then
   else
     # No cargo (a normal Proxmox host): take the released binary of the version this checkout says.
     command -v curl >/dev/null || die "no mayfly binary next to install.sh and no curl or cargo; use a release"
-    v=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' "$src/mayfly.sh")
+    v=$(awk -F'"' '/^version *=/ { print $2; exit }' "$src/Cargo.toml" 2>/dev/null) || v=""
+    [ -n "$v" ] || die "no mayfly binary next to install.sh and no Cargo.toml to tell the version; use a release"
     step "no cargo here: downloading the released mayfly $v binary"
     btmp=$(mktemp -d)
     trap 'rm -rf "$btmp"' EXIT

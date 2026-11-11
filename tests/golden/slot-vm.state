@@ -1,0 +1,128 @@
+--- calls
+pvesm path local:snippets/x
+pvesm path local:snippets/x
+qm config 9098
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+qm clone 9098 9002 --name ci-a-1
+qm set 9002 --cores 8 --memory 1024 --balloon 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9098 --net0 virtio,bridge=vmbr0,firewall=1 --ipconfig0 ip=dhcp --cicustom user=local:snippets/mayfly-9002.yaml
+qm config 9002
+qm resize 9002 scsi0 60G
+qm start 9002
+hook vm-up a-1 9002 mf-a-1-EPOCH
+hook-fail vm-up a-1 9002 mf-a-1-EPOCH
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+qm config 9002
+qm config 9002
+qm stop 9002 --skiplock 1 --timeout 30
+qm destroy 9002 --purge 1 --destroy-unreferenced-disks 1 --skiplock 1
+hook vm-gone a-1 9002 0
+hook-fail vm-gone a-1 9002 0
+pvesm path local:snippets/x
+qm config 9098
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+qm clone 9098 9002 --name ci-a-1
+qm set 9002 --cores 8 --memory 1024 --balloon 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9098 --net0 virtio,bridge=vmbr0,firewall=1 --ipconfig0 ip=dhcp --cicustom user=local:snippets/mayfly-9002.yaml
+qm config 9002
+qm resize 9002 scsi0 60G
+qm start 9002
+hook vm-up a-1 9002 mf-a-1-EPOCH
+hook-fail vm-up a-1 9002 mf-a-1-EPOCH
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+qm guest exec 9002 --timeout 10 -- sh -c p=$(pgrep -of "bin/Runner\.Worker") || exit 3; ps -o etimes= -p "$p"
+qm config 9002
+qm config 9002
+qm stop 9002 --skiplock 1 --timeout 30
+qm destroy 9002 --purge 1 --destroy-unreferenced-disks 1 --skiplock 1
+hook vm-gone a-1 9002 0
+hook-fail vm-gone a-1 9002 0
+--- github
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+POST /orgs/acme/actions/runners/generate-jitconfig Bearer ghs_fake {"name":"mf-a-1-EPOCH","runner_group_id":1,"work_folder":"_work","labels":["Linux","X64","gpu","linux","self-hosted"]}
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+DELETE /orgs/acme/actions/runners/77 Bearer ghs_fake 
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+POST /orgs/acme/actions/runners/generate-jitconfig Bearer ghs_fake {"name":"mf-a-1-EPOCH","runner_group_id":1,"work_folder":"_work","labels":["Linux","X64","gpu","linux","self-hosted"]}
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+DELETE /orgs/acme/actions/runners/78 Bearer ghs_fake 
+--- what each VM started from
+== snippet-1.mode
+600
+== snippet-1.yaml
+#cloud-config
+hostname: ci-a-1
+write_files:
+  - path: /etc/mayfly/jit
+    permissions: '0600'
+    content: JITSECRET-77
+  - path: /etc/mayfly/job.env
+    permissions: '0600'
+    content: |
+      A=1
+      B=two
+runcmd:
+  - [systemctl, start, --no-block, mayfly-job.service]
+== snippet-2.mode
+600
+== snippet-2.yaml
+#cloud-config
+hostname: ci-a-1
+write_files:
+  - path: /etc/mayfly/jit
+    permissions: '0600'
+    content: JITSECRET-78
+  - path: /etc/mayfly/job.env
+    permissions: '0600'
+    content: |
+      A=1
+      B=two
+runcmd:
+  - [systemctl, start, --no-block, mayfly-job.service]
+== fw-1.fw
+[OPTIONS]
+enable: 1
+dhcp: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[RULES]
+OUT ACCEPT -dest 10.0.0.1 -p udp -dport 53
+OUT ACCEPT -dest 10.0.0.1 -p tcp -dport 53
+OUT ACCEPT -dest 10.0.0.5
+OUT DROP -dest 10.0.0.0/8
+OUT DROP -dest 172.16.0.0/12
+OUT DROP -dest 192.168.0.0/16
+OUT DROP -dest 100.64.0.0/10
+OUT DROP -dest 169.254.0.0/16
+== fw-2.fw
+[OPTIONS]
+enable: 1
+dhcp: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[RULES]
+OUT ACCEPT -dest 10.0.0.1 -p udp -dport 53
+OUT ACCEPT -dest 10.0.0.1 -p tcp -dport 53
+OUT ACCEPT -dest 10.0.0.5
+OUT DROP -dest 10.0.0.0/8
+OUT DROP -dest 172.16.0.0/12
+OUT DROP -dest 192.168.0.0/16
+OUT DROP -dest 100.64.0.0/10
+OUT DROP -dest 169.254.0.0/16
+--- files left
+ct:
+
+fw:
+
+pve/lxc:
+9099.conf
+
+pve/qemu-server:
+9098.conf
+9099.conf
+
+snip:

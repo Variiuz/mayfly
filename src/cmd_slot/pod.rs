@@ -2,8 +2,8 @@
 //! one job each, from an image the VM builds from its own filesystem (`template/pod-vm.sh`). The App key
 //! stays here: the host makes the one-use JIT configs and hands each to the VM (`mayfly-pod put`), which
 //! feeds an idle container. The VM is recycled after `POD_MAX_AGE_HOURS` (staggered by VMID) or when its
-//! template stops being the slot's template, after running jobs finish. Step for step the `cmd_pod` of
-//! `mayfly.sh`.
+//! template stops being the slot's template, after running jobs finish. Step for step the `cmd_pod` of the
+//! bash loop (0.9.0 and earlier).
 
 use super::{Applied, Loop};
 use crate::cmd_template::base64;
@@ -145,6 +145,9 @@ impl Loop<'_> {
             let code = self.destroy(c, &vmid)?;
             if code != 0 {
                 return Ok(code);
+            }
+            if self.renew("pod") {
+                return Ok(super::RENEW);
             }
             *c = self.load()?;
             let applied = self.apply_slot(c)?;

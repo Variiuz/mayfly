@@ -1,0 +1,8 @@
+slot a-1: lxc 9051 up as mf-a-1-EPOCH (template 9099)
+warning: hook 20-fail vm-up failed
+slot a-1: VM 9051 gone after 0 min
+warning: hook 20-fail vm-gone failed
+slot a-1: lxc 9051 up as mf-a-1-EPOCH (template 9099)
+warning: hook 20-fail vm-up failed
+slot a-1: VM 9051 gone after 0 min
+warning: hook 20-fail vm-gone failed

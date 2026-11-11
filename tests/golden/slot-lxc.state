@@ -1,0 +1,114 @@
+--- calls
+pvesm path local:snippets/x
+pvesm path local:snippets/x
+qm config 9099
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+pct clone 9099 9051 --hostname ci-a-1
+pct set 9051 --cores 2 --memory 4096 --swap 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9099 --net0 name=eth0,bridge=vmbr0,ip=dhcp,firewall=1
+pct config 9051
+pct resize 9051 rootfs 20G
+pct start 9051
+lxc-attach -n 9051 -- systemctl is-system-running
+lxc-attach -n 9051 -- sh -c umask 077; mkdir -p /etc/mayfly; cat >/etc/mayfly/jit
+lxc-attach -n 9051 -- sh -c umask 077; cat >/etc/mayfly/job.env
+lxc-attach -n 9051 -- systemctl start --no-block mayfly-job.service
+hook vm-up a-1 9051 mf-a-1-EPOCH
+hook-fail vm-up a-1 9051 mf-a-1-EPOCH
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+pct config 9051
+pct config 9051
+pct stop 9051 --skiplock 1
+pct destroy 9051 --purge 1 --destroy-unreferenced-disks 1 --force 1
+hook vm-gone a-1 9051 0
+hook-fail vm-gone a-1 9051 0
+pvesm path local:snippets/x
+qm config 9099
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+pct clone 9099 9051 --hostname ci-a-1
+pct set 9051 --cores 2 --memory 4096 --swap 0 --onboot 0 --tags mayfly --description runner mf-a-1-EPOCH, template 9099 --net0 name=eth0,bridge=vmbr0,ip=dhcp,firewall=1
+pct config 9051
+pct resize 9051 rootfs 20G
+pct start 9051
+lxc-attach -n 9051 -- systemctl is-system-running
+lxc-attach -n 9051 -- sh -c umask 077; mkdir -p /etc/mayfly; cat >/etc/mayfly/jit
+lxc-attach -n 9051 -- sh -c umask 077; cat >/etc/mayfly/job.env
+lxc-attach -n 9051 -- systemctl start --no-block mayfly-job.service
+hook vm-up a-1 9051 mf-a-1-EPOCH
+hook-fail vm-up a-1 9051 mf-a-1-EPOCH
+pvesh get /nodes/pve1/storage/local-lvm/status --output-format json
+lxc-attach -n 9051 -- sh -c p=$(pgrep -of "bin/Runner\.Worker") || exit 3; ps -o etimes= -p "$p"
+pct config 9051
+pct config 9051
+pct stop 9051 --skiplock 1
+pct destroy 9051 --purge 1 --destroy-unreferenced-disks 1 --force 1
+hook vm-gone a-1 9051 0
+hook-fail vm-gone a-1 9051 0
+--- github
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+POST /orgs/acme/actions/runners/generate-jitconfig Bearer ghs_fake {"name":"mf-a-1-EPOCH","runner_group_id":1,"work_folder":"_work","labels":["Linux","X64","gpu","linux","self-hosted"]}
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+DELETE /orgs/acme/actions/runners/77 Bearer ghs_fake 
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+POST /orgs/acme/actions/runners/generate-jitconfig Bearer ghs_fake {"name":"mf-a-1-EPOCH","runner_group_id":1,"work_folder":"_work","labels":["Linux","X64","gpu","linux","self-hosted"]}
+GET /orgs/acme/installation Bearer <jwt> 
+POST /app/installations/42/access_tokens Bearer <jwt> 
+DELETE /orgs/acme/actions/runners/78 Bearer ghs_fake 
+--- what each VM started from
+== fw-1.fw
+[OPTIONS]
+enable: 1
+dhcp: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[RULES]
+OUT ACCEPT -dest 10.0.0.1 -p udp -dport 53
+OUT ACCEPT -dest 10.0.0.1 -p tcp -dport 53
+OUT ACCEPT -dest 10.0.0.5
+OUT DROP -dest 10.0.0.0/8
+OUT DROP -dest 172.16.0.0/12
+OUT DROP -dest 192.168.0.0/16
+OUT DROP -dest 100.64.0.0/10
+OUT DROP -dest 169.254.0.0/16
+== fw-2.fw
+[OPTIONS]
+enable: 1
+dhcp: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[RULES]
+OUT ACCEPT -dest 10.0.0.1 -p udp -dport 53
+OUT ACCEPT -dest 10.0.0.1 -p tcp -dport 53
+OUT ACCEPT -dest 10.0.0.5
+OUT DROP -dest 10.0.0.0/8
+OUT DROP -dest 172.16.0.0/12
+OUT DROP -dest 192.168.0.0/16
+OUT DROP -dest 100.64.0.0/10
+OUT DROP -dest 169.254.0.0/16
+== snip-1.ls
+== snip-2.ls
+== ct-env-1
+A=1
+B=two
+== ct-env-2
+A=1
+B=two
+== ct-jit-1
+JITSECRET-77== ct-jit-2
+JITSECRET-78--- files left
+ct:
+
+fw:
+
+pve/lxc:
+9099.conf
+
+pve/qemu-server:
+9098.conf
+9099.conf
+
+snip:

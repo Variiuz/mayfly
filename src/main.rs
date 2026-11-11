@@ -1,13 +1,14 @@
-use mayfly::cmd_slot::{self, Route};
+use mayfly::cmd_slot;
 use mayfly::cmd_slots::Verb;
 use mayfly::config::Paths;
-use mayfly::out::{print_die, Out};
+use mayfly::out::{print_die, Die, Out};
 use mayfly::pve::RealPve;
 use mayfly::{
     cmd_check, cmd_gc, cmd_help, cmd_install, cmd_slots, cmd_stats, cmd_status, cmd_template,
-    cmd_update, forward, Ctx,
+    cmd_update, Ctx,
 };
 use std::io::{IsTerminal, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 
 /// `hostname -s`.
@@ -60,7 +61,7 @@ fn main() -> ExitCode {
                 _ => cmd_slots::run(&cx, Verb::Disable, &args[1..], &out, &mut stdout),
             }
         }
-        Some("slot") if args.len() == 2 && cmd_slot::route(&paths, &args[1]) == Route::Rust => {
+        Some("slot") => {
             let node = node();
             let cx = Ctx {
                 paths: &paths,
@@ -68,17 +69,25 @@ fn main() -> ExitCode {
                 node: &node,
                 meminfo: "/proc/meminfo",
             };
-            cmd_slot::run(&cx, &args[1..], &mut stdout)
-        }
-        _ => {
-            // A slot that stays on bash says so first (an engine value that is not rust or bash).
-            if let (Some("slot"), Some(name)) = (args.first().map(String::as_str), args.get(1)) {
-                if let Route::Bash { note: Some(note) } = cmd_slot::route(&paths, name) {
-                    let _ = writeln!(stdout, "{note}");
+            match cmd_slot::run(&cx, &args[1..], &mut stdout) {
+                Ok(cmd_slot::RENEW) => {
+                    // The installed command was replaced while this loop ran: it takes over, in this
+                    // process, so the unit keeps running. When it cannot start, systemd restarts the unit.
+                    let _ = stdout.flush();
+                    let new = format!("{}/mayfly", paths.sbin);
+                    let err = Command::new(&new).args(&args).exec();
+                    Err(Die(format!("cannot run {new}: {err}")))
                 }
+                r => r,
             }
-            let _ = stdout.flush();
-            forward::exec(&paths, &args)
+        }
+        other => {
+            let mut stderr = std::io::stderr();
+            cmd_help::help(&paths, &out, &mut stderr);
+            match other {
+                Some(cmd) => Err(Die(format!("unknown command: {cmd}"))),
+                None => Ok(2),
+            }
         }
     };
     let _ = stdout.flush();

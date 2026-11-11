@@ -1,16 +1,16 @@
 //! `mayfly slot <name>`: the loop behind `mayfly-slot@<name>.service`. `kind=vm` runs one throwaway VM per
 //! job, `kind=lxc` one throwaway container (`lxc`), `kind=pod` one long-lived VM that runs containers
-//! (`pod`). It does what the `cmd_slot` of `mayfly.sh` does, step for step: the same `qm`, `pct`, `lxc-attach`
-//! and `pvesh` calls with the same flags in the same order, the same files, hooks, log lines, waits and
-//! limits.
+//! (`pod`). It does what the bash loop of 0.9.0 and earlier did, step for step: the same `qm`, `pct`,
+//! `lxc-attach` and `pvesh` calls with the same flags in the same order, the same files, hooks, log lines,
+//! waits and limits. Comments that say "bash" name the function of that script a piece comes from.
 //!
-//! Which loop runs is chosen per slot (`route`): `engine=rust` in `slots.conf`, else `SLOT_ENGINE` in
-//! `pool.env` (default `bash`).
+//! The loop is one long process, so an update would not reach it: between two guests it looks whether the
+//! installed command was replaced and, when it was, ends with `RENEW`, on which `main` starts the new one.
 //!
 //! The JIT runner config reaches only the 0600 cloud-init snippet: not a command line, not a log line.
 
 use crate::cmd_status::free_ram_gb;
-use crate::config::{self, parse_pool_env, slot_opt, Config, Slots};
+use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{AppSlot, SlotApi};
 use crate::guest;
 use crate::out::{die, R};
@@ -27,88 +27,28 @@ mod pod;
 /// A guest's runner has to be online on GitHub within this many minutes.
 const REGISTER_MINUTES: i64 = 10;
 
-// ------------------------------------------------------------------ which loop runs a slot
+/// What the loop ends with, in place of an exit code, when the installed command was replaced: `main`
+/// then runs the new command with the same arguments. No exit code is this large.
+pub const RENEW: i32 = 1 << 16;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Engine {
-    Rust,
-    Bash,
+// ------------------------------------------------------------------ settings that are gone
+
+/// `engine=` of a slot's extra fields, when it is set: 0.6.0 to 0.9.0 chose between the bash and the Rust
+/// loop with it. It does nothing now; `mayfly check` says so.
+pub fn engine_key(extra: &str) -> Option<String> {
+    Some(slot_opt("engine", extra, "")).filter(|v| !v.is_empty())
 }
 
-/// `rust` or `bash`; anything else is not an engine.
-pub fn parse_engine(v: &str) -> Option<Engine> {
-    match v {
-        "rust" => Some(Engine::Rust),
-        "bash" => Some(Engine::Bash),
-        _ => None,
-    }
-}
+// ------------------------------------------------------------------ a newer mayfly
 
-/// The engine a slot asks for: its `engine=` key, else `pool` (`SLOT_ENGINE`; empty = bash). An empty
-/// `engine=` counts as not set. The second value is the text that is not an engine, when there is one
-/// (the slot then runs on bash).
-pub fn engine_setting(extra: &str, pool: &str) -> (Engine, Option<String>) {
-    let own = slot_opt("engine", extra, "");
-    let v = if own.is_empty() { pool } else { own.as_str() };
-    if v.is_empty() {
-        return (Engine::Bash, None);
-    }
-    match parse_engine(v) {
-        Some(e) => (e, None),
-        None => (Engine::Bash, Some(v.to_string())),
-    }
-}
-
-/// The engine that really runs a slot of this kind: `vm`, `lxc` and `pod` have a Rust loop.
-pub fn engine_for_kind(kind: &str, extra: &str, pool: &str) -> Engine {
-    match engine_setting(extra, pool) {
-        (Engine::Rust, _) if matches!(kind, "vm" | "lxc" | "pod") => Engine::Rust,
-        _ => Engine::Bash,
-    }
-}
-
-/// What `mayfly slot <name>` does.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Route {
-    /// The loop of this binary.
-    Rust,
-    /// `exec mayfly.sh`, after printing `note` (when there is one).
-    Bash { note: Option<String> },
-}
-
-/// `SLOT_ENGINE` of pool.env, read on its own like `update_mode`: the last assignment wins, "" when unset.
-fn pool_engine(paths: &config::Paths) -> String {
-    let text = fs::read(&paths.pool_env)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
-    let (vars, _) = parse_pool_env(&text);
-    vars.iter()
-        .rev()
-        .find(|(k, _)| k == "SLOT_ENGINE")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default()
-}
-
-/// Decides between the Rust loop and `mayfly.sh` for a slot. Anything unclear (no such slot, an
-/// unreadable file) goes to `mayfly.sh`, which has the messages for it.
-pub fn route(paths: &config::Paths, name: &str) -> Route {
-    let slots = Slots::read(&paths.slots_conf);
-    let Some(slot) = slots.line_for_name(name) else {
-        return Route::Bash { note: None };
-    };
-    let kind = slot_opt("kind", &slot.extra, "vm");
-    let pool = pool_engine(paths);
-    let (engine, unknown) = engine_setting(&slot.extra, &pool);
-    if let Some(v) = unknown {
-        return Route::Bash {
-            note: Some(format!(
-                "slot {name}: engine {v} is not rust or bash; running it on bash"
-            )),
-        };
-    }
-    match (engine, kind.as_str()) {
-        (Engine::Rust, "vm" | "pod" | "lxc") => Route::Rust,
-        _ => Route::Bash { note: None },
+/// The installed command is another file than the one this process runs: `mayfly update` or `install.sh`
+/// replaced it (they rename a new file over it). The loop then starts the new one between two guests.
+pub fn command_replaced(paths: &config::Paths) -> bool {
+    let installed = fs::metadata(format!("{}/mayfly", paths.sbin));
+    let running = fs::metadata("/proc/self/exe");
+    match (installed, running) {
+        (Ok(i), Ok(r)) => i.is_file() && (i.dev(), i.ino()) != (r.dev(), r.ino()),
+        _ => false,
     }
 }
 
@@ -204,6 +144,8 @@ enum Flow {
     Next,
     /// The slot is stopping: leave the loop.
     Done,
+    /// The installed command was replaced: leave the loop for the new one.
+    Renew,
     /// A command failed that ends bash (`set -e`): exit with its code.
     Exit(i32),
 }
@@ -792,10 +734,24 @@ impl Loop<'_> {
             match self.iteration(&mut c)? {
                 Flow::Next => {}
                 Flow::Done => break,
+                Flow::Renew => return Ok(RENEW),
                 Flow::Exit(code) => return Ok(code),
             }
         }
         Ok(0)
+    }
+
+    /// No guest exists right now. True when the installed command is a newer file and the slot is not
+    /// stopping: the loop then ends with `RENEW`.
+    pub(super) fn renew(&mut self, what: &str) -> bool {
+        if self.stopping() || !command_replaced(self.cx.paths) {
+            return false;
+        }
+        let name = self.name.clone();
+        self.log(&format!(
+            "{what} {name}: mayfly was updated; going on with the new command"
+        ));
+        true
     }
 
     /// One VM, from clone to destroy.
@@ -806,6 +762,9 @@ impl Loop<'_> {
         let code = self.destroy(c, &vmid)?;
         if code != 0 {
             return Ok(Flow::Exit(code));
+        }
+        if self.renew("slot") {
+            return Ok(Flow::Renew);
         }
         *c = self.load()?;
         let applied = self.apply_slot(c)?;
@@ -1076,38 +1035,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn engine_comes_from_the_slot_then_pool_env() {
-        assert_eq!(engine_setting("", ""), (Engine::Bash, None));
-        assert_eq!(engine_setting("", "rust"), (Engine::Rust, None));
-        assert_eq!(engine_setting("engine=rust", ""), (Engine::Rust, None));
-        assert_eq!(engine_setting("engine=bash", "rust"), (Engine::Bash, None));
-        assert_eq!(
-            engine_setting("engine= kind=vm", "rust"),
-            (Engine::Rust, None)
-        );
-        assert_eq!(
-            engine_setting("kind=vm engine=rust", "bash"),
-            (Engine::Rust, None)
-        );
-        assert_eq!(
-            engine_setting("engine=fast", "rust"),
-            (Engine::Bash, Some("fast".to_string()))
-        );
-        assert_eq!(
-            engine_setting("", "Rust"),
-            (Engine::Bash, Some("Rust".to_string()))
-        );
-    }
-
-    #[test]
-    fn vm_lxc_and_pod_slots_run_on_rust() {
-        assert_eq!(engine_for_kind("vm", "engine=rust", ""), Engine::Rust);
-        assert_eq!(engine_for_kind("pod", "engine=rust", "rust"), Engine::Rust);
-        assert_eq!(engine_for_kind("lxc", "", "rust"), Engine::Rust);
-        assert_eq!(engine_for_kind("pod", "", ""), Engine::Bash);
-        assert_eq!(engine_for_kind("zzz", "engine=rust", ""), Engine::Bash);
-        assert_eq!(engine_for_kind("vm", "", ""), Engine::Bash);
-        assert_eq!(engine_for_kind("vm", "engine=x", "rust"), Engine::Bash);
+    fn a_leftover_engine_key_is_found() {
+        assert_eq!(engine_key(""), None);
+        assert_eq!(engine_key("kind=vm"), None);
+        assert_eq!(engine_key("engine= kind=vm"), None);
+        assert_eq!(engine_key("kind=vm engine=rust"), Some("rust".to_string()));
+        assert_eq!(engine_key("engine=bash"), Some("bash".to_string()));
     }
 
     #[test]

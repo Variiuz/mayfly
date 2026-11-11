@@ -174,4 +174,4 @@ fi
 update-grub
 
 log "stage 2 done (ufw stays installed and active)."
-log "next: reboot once more, then run nat-bridge.sh, then install.sh (see README: Second host behind NAT)"
+log "next: reboot once more, then run nat-bridge.sh, then install.sh (see README: Hosts behind NAT)"

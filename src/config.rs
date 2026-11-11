@@ -284,7 +284,8 @@ fn defaults(conf_dir: &str) -> Vec<(&'static str, String)> {
         ),
         ("RUNNER_PREFIX", s("")),
         ("UPDATE", s("auto")),
-        ("SLOT_ENGINE", s("bash")),
+        // Chose the slot loop from 0.6.0 to 0.9.0; read only so that `mayfly check` can say it is unused.
+        ("SLOT_ENGINE", s("")),
     ]
 }
 

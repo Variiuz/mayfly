@@ -5,7 +5,7 @@
 #   install.sh                        the one-line installer, pinned to <version>
 #   SHA256SUMS
 # <binary> is the static x86_64 build of this commit (cargo build --release --target x86_64-unknown-linux-musl).
-# Cargo.toml, mayfly.sh and <version> must agree.
+# Cargo.toml, the binary and <version> must agree.
 # Usage: scripts/package.sh <version> <outdir> <binary>
 set -euo pipefail
 usage="usage: scripts/package.sh <version> <outdir> <binary>"
@@ -13,9 +13,7 @@ v=${1:?$usage} out=${2:?$usage} bin=${3:?$usage}
 [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version $v: x.y.z" >&2; exit 1; }
 [ -x "$bin" ] || { echo "$bin is not an executable file" >&2; exit 1; }
 root=$(cd "$(dirname "$0")/.." && pwd)
-have=$(awk -F'[= ]' '/^MAYFLY_VERSION=/ { print $2; exit }' "$root/mayfly.sh")
 crate=$(awk -F'"' '/^version *=/ { print $2; exit }' "$root/Cargo.toml")
-[ "$have" = "$v" ] || { echo "mayfly.sh says $have, not $v" >&2; exit 1; }
 [ "$crate" = "$v" ] || { echo "Cargo.toml says $crate, not $v" >&2; exit 1; }
 [ "$("$bin" version)" = "mayfly $v" ] || { echo "$bin says $("$bin" version), not mayfly $v" >&2; exit 1; }
 

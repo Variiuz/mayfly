@@ -1,8 +1,7 @@
-//! The Rust slot loops (`engine=rust`, `kind=vm`, `lxc` and `pod`) against the recording fake Proxmox host and a fake
-//! GitHub: whole job cycles with the exact commands in their exact order, the snippet and firewall
+//! The slot loops (`kind=vm`, `lxc` and `pod`) against the recording fake Proxmox host and a fake GitHub: whole job cycles with the exact commands in their exact order, the snippet and firewall
 //! file, the hooks, the log lines and the drain. Nothing here needs Proxmox, a network or root.
 
-use mayfly::cmd_slot::{self, route, Route, Stop};
+use mayfly::cmd_slot::{self, Stop};
 use mayfly::config::{self, Config, Paths};
 use mayfly::github::{jit_body, AppSlot, Jit, SlotApi};
 use mayfly::pve::FakePve;
@@ -1490,83 +1489,105 @@ fn a_runner_that_is_offline_or_unknown_is_not_online() {
     assert!(!AppSlot.runner_online(&c, "tok", "78"));
 }
 
-// ------------------------------------------------------------------ which engine runs a slot
+// ------------------------------------------------------------------ a newer mayfly is installed
 
-fn routed(pool: &str, slots: &str, name: &str) -> Route {
-    let rig = Rig::new(pool, slots);
-    route(&rig.paths, name)
+const UPDATED: &str = "slot a-1: mayfly was updated; going on with the new command\n";
+
+/// The rig with a command installed in its own sbin directory: `content`, or (None) a link to the file
+/// this test runs from.
+fn rig_with_command(slots: &str, content: Option<&str>) -> Rig {
+    let mut rig = Rig::new("", slots);
+    rig.paths.sbin = rig.dir("sbin");
+    fs::create_dir_all(&rig.paths.sbin).unwrap();
+    let installed = format!("{}/mayfly", rig.paths.sbin);
+    match content {
+        Some(text) => fs::write(&installed, text).unwrap(),
+        None => std::os::unix::fs::symlink("/proc/self/exe", &installed).unwrap(),
+    }
+    rig
 }
 
 #[test]
-fn engine_routing() {
-    let bash = Route::Bash { note: None };
-    // The default is bash; a vm slot asks for rust with engine= or SLOT_ENGINE.
-    assert_eq!(routed("", SLOT_LINE, "a-1"), bash);
-    assert_eq!(routed("SLOT_ENGINE=bash\n", SLOT_LINE, "a-1"), bash);
-    assert_eq!(routed("SLOT_ENGINE=rust\n", SLOT_LINE, "a-1"), Route::Rust);
-    assert_eq!(
-        routed("", "a-1 9002 l 8 16 60 no current engine=rust\n", "a-1"),
-        Route::Rust
-    );
-    assert_eq!(
-        routed(
-            "",
-            "a-1 9002 l 8 16 60 no current kind=vm engine=rust\n",
-            "a-1"
-        ),
-        Route::Rust
-    );
-    // The slot's own key wins over pool.env, both ways.
-    assert_eq!(
-        routed(
-            "SLOT_ENGINE=rust\n",
-            "a-1 9002 l 8 16 60 no current engine=bash\n",
-            "a-1"
-        ),
-        bash
-    );
-    assert_eq!(
-        routed(
-            "SLOT_ENGINE=bash\n",
-            "a-1 9002 l 8 16 60 no current engine=rust\n",
-            "a-1"
-        ),
-        Route::Rust
-    );
-    // The last assignment in pool.env wins.
-    assert_eq!(
-        routed("SLOT_ENGINE=bash\nSLOT_ENGINE=rust\n", SLOT_LINE, "a-1"),
-        Route::Rust
-    );
-    // Pods and containers run on rust too, by the slot's key or by pool.env.
-    for kind in ["pod", "lxc"] {
-        let slots = format!("p-1 9041 l 8 16 60 no current kind={kind} engine=rust\n");
-        assert_eq!(routed("", &slots, "p-1"), Route::Rust);
-        let slots = format!("p-1 9041 l 8 16 60 no current kind={kind}\n");
-        assert_eq!(routed("SLOT_ENGINE=rust\n", &slots, "p-1"), Route::Rust);
-        // On bash anyway: nothing to say.
-        assert_eq!(routed("", &slots, "p-1"), bash);
-        let slots = format!("p-1 9041 l 8 16 60 no current kind={kind} engine=bash\n");
-        assert_eq!(routed("SLOT_ENGINE=rust\n", &slots, "p-1"), bash);
-    }
-    // Not an engine: bash, and a line about it.
-    assert_eq!(
-        routed("", "a-1 9002 l 8 16 60 no current engine=fast\n", "a-1"),
-        Route::Bash {
-            note: Some("slot a-1: engine fast is not rust or bash; running it on bash".to_string())
-        }
-    );
-    // Unknown slot, unknown kind: bash has the messages.
-    assert_eq!(routed("SLOT_ENGINE=rust\n", SLOT_LINE, "zz"), bash);
-    assert_eq!(
-        routed(
-            "",
-            "a-1 9002 l 8 16 60 no current kind=zzz engine=rust\n",
-            "a-1"
-        ),
-        bash
-    );
+fn a_replaced_command_ends_the_loop_for_the_new_one_before_the_next_vm() {
+    let rig = rig_with_command(SLOT_LINE, Some("a newer mayfly\n"));
+    let pve = rig.pve(&[]);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(cmd_slot::RENEW));
+    assert_eq!(o.out, UPDATED);
+    // Nothing was cloned and nothing registered: the new command does that.
+    assert_eq!(pve.calls(), lines![PVESM]);
+    assert!(gh.calls().is_empty());
 }
+
+#[test]
+fn a_replaced_command_is_taken_after_the_running_vm_is_gone() {
+    let rig = rig_with_command(SLOT_LINE, None);
+    rig.stop_after_destroy.set(false);
+    let installed = format!("{}/mayfly", rig.paths.sbin);
+    // The update arrives while the VM runs: a new file is renamed over the installed one.
+    let swap = move || {
+        let tmp = format!("{installed}.new");
+        fs::write(&tmp, "a newer mayfly\n").unwrap();
+        fs::rename(&tmp, &installed).unwrap();
+    };
+    let pve = rig.pve(&[true, true, false]).on_call(START, swap);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(cmd_slot::RENEW));
+    assert_eq!(
+        o.out,
+        format!(
+            "slot a-1: vm 9002 up as {RUNNER} (template 9098)\nslot a-1: VM 9002 gone after 1 min\n{UPDATED}"
+        )
+    );
+    // One VM, from clone to destroy, and its runner removed; no second clone.
+    let calls = pve.calls();
+    assert_eq!(calls.iter().filter(|c| *c == CLONE).count(), 1);
+    assert_eq!(calls.last().map(String::as_str), Some(DESTROY));
+    assert_eq!(gh.calls().last().map(String::as_str), Some("delete 77 tok"));
+}
+
+#[test]
+fn the_installed_command_being_the_running_one_changes_nothing() {
+    let rig = rig_with_command(SLOT_LINE, None);
+    let pve = rig.pve(&[true, true, false]);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert!(o.out.contains("gone after"), "{}", o.out);
+    assert!(!o.out.contains("was updated"), "{}", o.out);
+}
+
+#[test]
+fn a_stopping_slot_does_not_start_the_new_command() {
+    let rig = rig_with_command(SLOT_LINE, Some("a newer mayfly\n"));
+    rig.terms.store(1, Ordering::SeqCst);
+    let pve = rig.pve(&[]);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(0));
+    assert_eq!(o.out, "");
+}
+
+#[test]
+fn a_pod_slot_takes_the_new_command_between_two_vms() {
+    let rig = rig_with_command(
+        "a-1 9002 linux 8 16 60 no current kind=pod containers=4\n",
+        Some("a newer mayfly\n"),
+    );
+    let pve = rig.pve(&[]);
+    let gh = FakeGh::new();
+    let o = rig.run(&pve, &gh);
+    assert_eq!(o.code, Ok(cmd_slot::RENEW));
+    assert_eq!(
+        o.out,
+        "pod a-1: mayfly was updated; going on with the new command\n"
+    );
+    assert_eq!(pve.calls(), lines![PVESM]);
+}
+
+// ------------------------------------------------------------------ the binary
 
 fn tmp(name: &str) -> PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
@@ -1579,10 +1600,11 @@ fn tmp(name: &str) -> PathBuf {
     d
 }
 
-/// Runs the binary as `mayfly slot <name>` with a stand-in `mayfly.sh` (exit 7) and a pool.env with no
-/// ORG: the Rust loop stops at that with a message, the stand-in prints its arguments.
-fn slot_binary(pool: &str, slots: &str, name: &str) -> std::process::Output {
-    let root = tmp("route");
+/// Runs the binary as `mayfly slot <args>` with a pool.env that has no ORG: the loop stops at that with a
+/// message. A `mayfly.sh` (0.9.0 and earlier ran some slots with it) sits in the share directory and must
+/// not be run.
+fn slot_binary(pool: &str, slots: &str, args: &[&str]) -> std::process::Output {
+    let root = tmp("bin");
     fs::create_dir_all(root.join("share")).unwrap();
     fs::create_dir_all(root.join("conf")).unwrap();
     let script = root.join("share/mayfly.sh");
@@ -1590,21 +1612,17 @@ fn slot_binary(pool: &str, slots: &str, name: &str) -> std::process::Output {
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(root.join("conf/pool.env"), format!("APP_ID=1\n{pool}")).unwrap();
     fs::write(root.join("conf/slots.conf"), slots).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mayfly"));
-    cmd.args(["slot", name])
+    let out = Command::new(env!("CARGO_BIN_EXE_mayfly"))
+        .arg("slot")
+        .args(args)
         .env("MAYFLY_SHARE", root.join("share"))
         .env("MAYFLY_CONF_DIR", root.join("conf"))
-        .env_remove("NO_COLOR");
-    // A script written a moment ago can be "Text file busy" while another test forks.
-    for _ in 0..20 {
-        let out = cmd.output().unwrap();
-        if !String::from_utf8_lossy(&out.stderr).contains("Text file busy") {
-            let _ = fs::remove_dir_all(&root);
-            return out;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    cmd.output().unwrap()
+        .env("MAYFLY_SBIN", root.join("sbin"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&root);
+    out
 }
 
 fn text(b: &[u8]) -> String {
@@ -1612,47 +1630,39 @@ fn text(b: &[u8]) -> String {
 }
 
 #[test]
-fn the_binary_runs_the_rust_loop_for_slots_on_rust() {
-    // Rust: the loop starts and stops at the missing ORG.
-    for (pool, slots) in [
-        ("", "a-1 9002 l 8 16 60 no current engine=rust\n"),
-        ("SLOT_ENGINE=rust\n", "a-1 9002 l 8 16 60 no current\n"),
-    ] {
-        let o = slot_binary(pool, slots, "a-1");
-        assert_eq!(o.status.code(), Some(1), "{slots}");
-        assert!(text(&o.stderr).contains("set ORG"), "{}", text(&o.stderr));
-        assert_eq!(text(&o.stdout), "");
-    }
-    // Bash: the stand-in runs with the arguments, exit code and all.
+fn the_binary_runs_the_loop_for_every_slot() {
+    // Every kind, with and without the settings that chose a loop from 0.6.0 to 0.9.0.
     for (pool, slots) in [
         ("", "a-1 9002 l 8 16 60 no current\n"),
+        ("", "a-1 9002 l 8 16 60 no current engine=rust\n"),
         ("", "a-1 9002 l 8 16 60 no current engine=bash\n"),
-        (
-            "SLOT_ENGINE=rust\n",
-            "a-1 9002 l 8 16 60 no current engine=bash\n",
-        ),
         ("SLOT_ENGINE=bash\n", "a-1 9002 l 8 16 60 no current\n"),
+        ("SLOT_ENGINE=rust\n", "a-1 9002 l 8 16 60 no current\n"),
+        ("SLOT_ENGINE=nope\n", "a-1 9002 l 8 16 60 no current\n"),
+        ("", "a-1 9041 l 8 16 60 no current kind=pod\n"),
+        ("", "a-1 9051 l 8 16 60 no current kind=lxc\n"),
+        (
+            "SLOT_ENGINE=bash\n",
+            "a-1 9051 l 8 16 60 no current kind=lxc engine=bash\n",
+        ),
     ] {
-        let o = slot_binary(pool, slots, "a-1");
-        assert_eq!(o.status.code(), Some(7), "{slots}");
-        assert_eq!(text(&o.stdout), "bash: slot a-1\n", "{slots}");
-    }
-    // Pods and containers: the Rust loop too.
-    for kind in ["pod", "lxc"] {
-        let slots = format!("p-1 9041 l 8 16 60 no current kind={kind} engine=rust\n");
-        let o = slot_binary("", &slots, "p-1");
-        assert_eq!(o.status.code(), Some(1), "{kind}");
+        let o = slot_binary(pool, slots, &["a-1"]);
+        assert_eq!(o.status.code(), Some(1), "{pool}{slots}");
         assert!(text(&o.stderr).contains("set ORG"), "{}", text(&o.stderr));
-        assert_eq!(text(&o.stdout), "");
+        assert_eq!(text(&o.stdout), "", "{pool}{slots}");
     }
-    // No such slot: bash says so.
-    let o = slot_binary(
-        "SLOT_ENGINE=rust\n",
-        "a-1 9002 l 8 16 60 no current\n",
-        "nope",
+}
+
+#[test]
+fn the_binary_wants_a_slot_name() {
+    let o = slot_binary("ORG=acme\n", "a-1 9002 l 8 16 60 no current\n", &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        text(&o.stderr).contains("usage: mayfly slot <name>"),
+        "{}",
+        text(&o.stderr)
     );
-    assert_eq!(o.status.code(), Some(7));
-    assert_eq!(text(&o.stdout), "bash: slot nope\n");
+    assert_eq!(text(&o.stdout), "");
 }
 
 // ------------------------------------------------------------------ kind=lxc
