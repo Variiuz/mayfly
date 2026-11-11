@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/Variiuz/mayfly/compare/v0.9.0...v0.10.0) (2026-11-11)
+
+
+### Features
+
+* the binary runs every slot; mayfly.sh and the engine switch are gone ([#42](https://github.com/Variiuz/mayfly/issues/42)) ([3da6cce](https://github.com/Variiuz/mayfly/commit/3da6cce7f064758fe70df13a7bcc22e840d91260))
+
 ## [0.9.0](https://github.com/Variiuz/mayfly/compare/v0.8.1...v0.9.0) (2026-11-10)
 
 
