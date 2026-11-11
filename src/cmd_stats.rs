@@ -2,9 +2,11 @@
 //!
 //! Per slot: guests it destroyed, of those how many ran a job, how many were replaced idle or because
 //! their runner never came online, jobs that were cut off (MAX_JOB_HOURS, the backstop or a full pool),
-//! errors (clone, start, GitHub registration), and the median life of the guests that ran a job. Pods show
-//! their VMs and errors only: one pod VM runs many jobs.
+//! errors (clone, start, GitHub registration), the minutes of the guests that ran a job (total and
+//! median) and of all guests. Pods show their VMs, VM minutes and errors only: one pod VM runs many
+//! jobs. `--json` and `--csv` print the same numbers for scripts, with each slot's labels.
 
+use crate::config::{slot_opt, Slots};
 use crate::out::{die, Out, R};
 use crate::Ctx;
 use std::collections::BTreeMap;
@@ -20,6 +22,8 @@ pub struct Tally {
     pub errors: u32,
     /// Minutes of each guest that ran a job.
     pub minutes: Vec<u32>,
+    /// Minutes of every guest, with or without a job (pod VMs too).
+    pub guest_minutes: u64,
     /// The next "gone" line belongs to a guest that was replaced without a job.
     pending_no_job: bool,
 }
@@ -27,6 +31,11 @@ pub struct Tally {
 impl Tally {
     pub fn jobs(&self) -> Option<u32> {
         (!self.pod).then(|| self.guests.saturating_sub(self.idle + self.stuck))
+    }
+
+    /// Minutes of the guests that ran a job, from clone to destroy (boot included).
+    pub fn job_minutes(&self) -> Option<u64> {
+        (!self.pod).then(|| self.minutes.iter().map(|&m| u64::from(m)).sum())
     }
 
     /// Median minutes of the guests that ran a job (the lower one of the middle two).
@@ -58,6 +67,7 @@ pub fn tally(journal: &str) -> BTreeMap<String, Tally> {
         t.pod |= pod;
         if let Some(min) = gone_minutes(msg) {
             t.guests += 1;
+            t.guest_minutes += u64::from(min);
             if std::mem::take(&mut t.pending_no_job) {
                 continue;
             }
@@ -90,21 +100,75 @@ fn gone_minutes(msg: &str) -> Option<u32> {
     after.strip_suffix(" min")?.parse().ok()
 }
 
-fn parse_hours(args: &[String]) -> R<u32> {
-    match args {
-        [] => Ok(24),
-        [h] => match h.parse::<u32>() {
-            Ok(n) if (1..=24 * 90).contains(&n) => Ok(n),
-            _ => die(format!(
-                "hours: a number from 1 to 2160, not {h}; usage: mayfly stats [hours]"
-            )),
-        },
-        _ => die("usage: mayfly stats [hours]"),
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Format {
+    Table,
+    Json,
+    Csv,
+}
+
+const USAGE: &str = "usage: mayfly stats [hours] [--json | --csv]";
+
+fn parse_args(args: &[String]) -> R<(u32, Format)> {
+    let mut hours = None;
+    let mut format = Format::Table;
+    for a in args {
+        match a.as_str() {
+            "--json" | "--csv" if format != Format::Table => return die(USAGE),
+            "--json" => format = Format::Json,
+            "--csv" => format = Format::Csv,
+            h if hours.is_none() => match h.parse::<u32>() {
+                Ok(n) if (1..=24 * 90).contains(&n) => hours = Some(n),
+                _ => return die(format!("hours: a number from 1 to 2160, not {h}; {USAGE}")),
+            },
+            _ => return die(USAGE),
+        }
+    }
+    Ok((hours.unwrap_or(24), format))
+}
+
+/// One row of the output: a slot, or `all`.
+struct Row<'a> {
+    name: &'a str,
+    labels: String,
+    kind: String,
+    t: &'a Tally,
+    jobs: Option<u32>,
+    job_minutes: Option<u64>,
+}
+
+fn json_row(r: &Row) -> serde_json::Value {
+    serde_json::json!({
+        "slot": r.name,
+        "labels": r.labels,
+        "kind": r.kind,
+        "guests": r.t.guests,
+        "jobs": r.jobs,
+        "idle": r.t.idle,
+        "stuck": r.t.stuck,
+        "cut": r.t.cut,
+        "errors": r.t.errors,
+        "job_minutes": r.job_minutes,
+        "guest_minutes": r.t.guest_minutes,
+        "median_minutes": r.t.median(),
+    })
+}
+
+/// A CSV field: quoted when it holds a comma, a quote or a line break.
+fn csv(v: &str) -> String {
+    if v.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_string()
     }
 }
 
+fn opt<T: ToString>(v: Option<T>) -> String {
+    v.map_or(String::new(), |v| v.to_string())
+}
+
 pub fn run(cx: &Ctx, args: &[String], out: &Out, w: &mut dyn Write) -> R<i32> {
-    let hours = parse_hours(args)?;
+    let (hours, format) = parse_args(args)?;
     let since = format!("{hours} hours ago");
     let j = cx.pve.run(
         "journalctl",
@@ -123,6 +187,79 @@ pub fn run(cx: &Ctx, args: &[String], out: &Out, w: &mut dyn Write) -> R<i32> {
         return die("cannot read the journal (journalctl -u 'mayfly-slot@*'); run as root");
     }
     let slots = tally(&j.stdout);
+    let conf = Slots::read(&cx.paths.slots_conf);
+    let mut all = Tally::default();
+    let mut jobs_all = 0;
+    let mut rows = Vec::new();
+    for (name, t) in &slots {
+        // A slot no longer in slots.conf has no labels; its kind follows from its log lines.
+        let (labels, kind) = match conf.get(name) {
+            Some(s) => (s.labels.clone(), slot_opt("kind", &s.extra, "vm")),
+            None if t.pod => (String::new(), "pod".to_string()),
+            None => (String::new(), String::new()),
+        };
+        rows.push(Row {
+            name,
+            labels,
+            kind,
+            t,
+            jobs: t.jobs(),
+            job_minutes: t.job_minutes(),
+        });
+        all.guests += t.guests;
+        all.idle += t.idle;
+        all.stuck += t.stuck;
+        all.cut += t.cut;
+        all.errors += t.errors;
+        all.guest_minutes += t.guest_minutes;
+        all.minutes.extend(&t.minutes);
+        jobs_all += t.jobs().unwrap_or(0);
+    }
+    let total = Row {
+        name: "all",
+        labels: String::new(),
+        kind: String::new(),
+        job_minutes: Some(all.minutes.iter().map(|&m| u64::from(m)).sum()),
+        t: &all,
+        jobs: Some(jobs_all),
+    };
+    match format {
+        Format::Json => {
+            let v = serde_json::json!({
+                "hours": hours,
+                "slots": rows.iter().map(json_row).collect::<Vec<_>>(),
+                "all": json_row(&total),
+            });
+            let _ = writeln!(w, "{v}");
+            return Ok(0);
+        }
+        Format::Csv => {
+            let _ = writeln!(
+                w,
+                "slot,labels,kind,guests,jobs,idle,stuck,cut,errors,job_minutes,guest_minutes,median_minutes"
+            );
+            for r in rows.iter().chain([&total]) {
+                let _ = writeln!(
+                    w,
+                    "{},{},{},{},{},{},{},{},{},{},{},{}",
+                    csv(r.name),
+                    csv(&r.labels),
+                    csv(&r.kind),
+                    r.t.guests,
+                    opt(r.jobs),
+                    r.t.idle,
+                    r.t.stuck,
+                    r.t.cut,
+                    r.t.errors,
+                    opt(r.job_minutes),
+                    r.t.guest_minutes,
+                    opt(r.t.median())
+                );
+            }
+            return Ok(0);
+        }
+        Format::Table => {}
+    }
     let (b, d, z) = (out.bold(), out.dim(), out.reset());
     if slots.is_empty() {
         let _ = writeln!(w, "no slot activity in the last {hours} h");
@@ -130,36 +267,28 @@ pub fn run(cx: &Ctx, args: &[String], out: &Out, w: &mut dyn Write) -> R<i32> {
     }
     let _ = writeln!(
         w,
-        "{b}{:<14} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8}{z}",
-        "SLOT", "GUESTS", "JOBS", "IDLE", "STUCK", "CUT", "ERRORS", "MEDIAN"
+        "{b}{:<14} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8}{z}",
+        "SLOT", "GUESTS", "JOBS", "IDLE", "STUCK", "CUT", "ERRORS", "JOB MIN", "MEDIAN"
     );
-    let mut all = Tally::default();
-    let mut jobs_all = 0;
-    for (name, t) in &slots {
-        let jobs = t.jobs().map_or("-".to_string(), |j| j.to_string());
-        let med = t.median().map_or("-".to_string(), |m| format!("{m} min"));
+    for r in rows.iter().chain([&total]) {
+        let (b, z) = if r.name == "all" { (b, z) } else { ("", "") };
         let _ = writeln!(
             w,
-            "{:<14} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8}",
-            name, t.guests, jobs, t.idle, t.stuck, t.cut, t.errors, med
+            "{b}{:<14} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8}{z}",
+            r.name,
+            r.t.guests,
+            r.jobs.map_or("-".to_string(), |j| j.to_string()),
+            r.t.idle,
+            r.t.stuck,
+            r.t.cut,
+            r.t.errors,
+            r.job_minutes.map_or("-".to_string(), |m| m.to_string()),
+            r.t.median().map_or("-".to_string(), |m| format!("{m} min"))
         );
-        all.guests += t.guests;
-        all.idle += t.idle;
-        all.stuck += t.stuck;
-        all.cut += t.cut;
-        all.errors += t.errors;
-        all.minutes.extend(&t.minutes);
-        jobs_all += t.jobs().unwrap_or(0);
     }
-    let med = all.median().map_or("-".to_string(), |m| format!("{m} min"));
     let _ = writeln!(
         w,
-        "{b}{:<14} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8}{z}",
-        "all", all.guests, jobs_all, all.idle, all.stuck, all.cut, all.errors, med
-    );
-    let _ = writeln!(
-        w,
-        "{d}last {hours} h of mayfly-slot@* in the journal; JOBS and MEDIAN count VM and container slots, not pods{z}"
+        "{d}last {hours} h of mayfly-slot@* in the journal; JOBS, JOB MIN and MEDIAN count VM and container slots, not pods; minutes run from clone to destroy{z}"
     );
     Ok(0)
 }
@@ -222,13 +351,32 @@ slot weird name: VM 1 gone after 1 min
     }
 
     #[test]
-    fn hours() {
+    fn minutes() {
+        let s = tally(J);
+        assert_eq!(s["a-1"].job_minutes(), Some(377));
+        assert_eq!(s["a-1"].guest_minutes, 12 + 360 + 10 + 4 + 361);
+        assert_eq!((s["p-1"].job_minutes(), s["p-1"].guest_minutes), (None, 31));
+    }
+
+    #[test]
+    fn args() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(parse_hours(&a(&[])).unwrap(), 24);
-        assert_eq!(parse_hours(&a(&["168"])).unwrap(), 168);
-        for bad in ["0", "x", "-1", "9999"] {
-            assert!(parse_hours(&a(&[bad])).is_err(), "{bad}");
+        assert_eq!(parse_args(&a(&[])).unwrap(), (24, Format::Table));
+        assert_eq!(parse_args(&a(&["168"])).unwrap(), (168, Format::Table));
+        assert_eq!(parse_args(&a(&["--json"])).unwrap(), (24, Format::Json));
+        assert_eq!(parse_args(&a(&["--csv", "6"])).unwrap(), (6, Format::Csv));
+        assert_eq!(parse_args(&a(&["6", "--json"])).unwrap(), (6, Format::Json));
+        for bad in ["0", "x", "-1", "9999", "--yaml"] {
+            assert!(parse_args(&a(&[bad])).is_err(), "{bad}");
         }
-        assert!(parse_hours(&a(&["1", "2"])).is_err());
+        assert!(parse_args(&a(&["1", "2"])).is_err());
+        assert!(parse_args(&a(&["--json", "--csv"])).is_err());
+    }
+
+    #[test]
+    fn csv_quotes_only_when_needed() {
+        assert_eq!(csv("linux"), "linux");
+        assert_eq!(csv("a,b"), "\"a,b\"");
+        assert_eq!(csv("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 }

@@ -28,7 +28,7 @@ pub fn help(paths: &Paths, out: &Out, w: &mut dyn Write) {
   enable [slot ...]                 start slots (all when none named) and the gc timer
   disable [slot ...]                stop slots; running jobs finish first
   status                            slots, guests, jobs, pool and RAM
-  stats [hours]                     jobs, idle and stuck guests, errors per slot (last 24 h)
+  stats [hours] [--json|--csv]      jobs, job minutes, idle and stuck guests, errors per slot (24 h)
 
 {d}Other{z}
   gc                                stale runners, orphan guests, old snippets (the timer runs it)
