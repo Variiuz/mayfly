@@ -2255,3 +2255,46 @@ fn slot_engine_is_unset_by_default_and_kept_when_set() {
     write(&f.paths.pool_env, "ORG=acme\nSLOT_ENGINE=rust\n");
     assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "rust");
 }
+
+// ------------------------------------------------------------------ LVM metadata archive
+
+#[test]
+fn lvm_archive_note_when_kept_long() {
+    let f = Fixture::new("lvm", "", "");
+    let cx_with = |pve: &FakePve, dir: &str| {
+        let cx = Ctx {
+            paths: &f.paths,
+            pve,
+            node: "pve1",
+            meminfo: &f.meminfo,
+        };
+        cmd_check::lvm_archive_note(&cx, dir)
+    };
+    let dir = tmp("lvm-archive");
+    for i in 0..3 {
+        write(format!("{}/vg_{i}.vg", dir.display()), &"x".repeat(10));
+    }
+    let d = dir.display().to_string();
+    let lvm = |days: &str| {
+        FakePve::new().answer(
+            "lvmconfig --type full backup/retain_days",
+            &format!("retain_days={days}\n"),
+        )
+    };
+    // The default 30 days.
+    assert_eq!(
+        cx_with(&lvm("30"), &d).as_deref(),
+        Some(format!("{d} holds 3 files (0 MB), kept 30 days: every clone and destroy adds one. Set retain_days = 3 (1 on a busy host) in the backup section of /etc/lvm/lvm.conf").as_str())
+    );
+    // Kept 7 days or less: nothing, whatever the size.
+    assert_eq!(cx_with(&lvm("3"), &d), None);
+    assert_eq!(cx_with(&lvm("7"), &d), None);
+    // No LVM (lvmconfig missing or failing), or output it cannot read: nothing.
+    assert_eq!(cx_with(&FakePve::new(), &d), None);
+    assert_eq!(cx_with(&lvm("x"), &d), None);
+    // A directory that does not exist counts as empty.
+    assert_eq!(
+        cx_with(&lvm("8"), "/nonexistent/lvm").as_deref(),
+        Some("/nonexistent/lvm holds 0 files (0 MB), kept 8 days: every clone and destroy adds one. Set retain_days = 3 (1 on a busy host) in the backup section of /etc/lvm/lvm.conf")
+    );
+}

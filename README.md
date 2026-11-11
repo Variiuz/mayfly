@@ -245,6 +245,10 @@ ct-1  9051  small  2  4  20  no  current  kind=lxc
   reach the internet but not each other or the LAN. This requires the cluster firewall to be enabled
   (`mayfly check` reports it). Before enabling the cluster firewall, allow SSH and port 8006 from your
   admin network: its default input policy drops all other traffic to the host.
+- LVM writes a metadata archive to `/etc/lvm/archive` for every clone and destroy and keeps it
+  `retain_days` (30 by default): a busy host collects tens of thousands of files on its root disk.
+  `mayfly check` warns when `retain_days` is over 7. Set `retain_days = 3` in the `backup` section of
+  `/etc/lvm/lvm.conf`, or 1 on a busy host (at about 1,000 jobs an hour the archive holds 1.9 GB at 3 days).
 
 ## Hosts behind NAT
 
