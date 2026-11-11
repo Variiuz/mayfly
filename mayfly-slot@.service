@@ -1,5 +1,5 @@
 [Unit]
-Description=mayfly slot %i (one throwaway VM per job)
+Description=mayfly slot %i (one throwaway guest per job)
 After=network-online.target pve-cluster.service pvedaemon.service
 Wants=network-online.target
 

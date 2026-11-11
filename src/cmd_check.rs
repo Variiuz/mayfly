@@ -1,6 +1,6 @@
 //! `mayfly check`: App key, storage, network, template; changes nothing.
 
-use crate::cmd_slot::engine_setting;
+use crate::cmd_slot::engine_key;
 use crate::config::{self, slot_opt, Config, Slots};
 use crate::github::{self, GitHub};
 use crate::out::{die, Kind, Out, R};
@@ -129,12 +129,15 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
         );
     }
 
-    if let (_, Some(v)) = engine_setting("", c.get("SLOT_ENGINE")) {
+    if !c.get("SLOT_ENGINE").is_empty() {
         t.item(
             w,
             Kind::Warn,
             "pool.env",
-            &format!("SLOT_ENGINE={v} is not rust or bash; slots run on bash"),
+            &format!(
+                "SLOT_ENGINE={} is no longer used (every slot runs the same loop); remove the line",
+                c.get("SLOT_ENGINE")
+            ),
         );
     }
 
@@ -297,12 +300,12 @@ pub fn run(cx: &Ctx, out: &Out, w: &mut dyn Write) -> R<i32> {
                 &format!("unknown kind={kind} (vm, pod or lxc)"),
             ),
         }
-        if let (_, Some(v)) = engine_setting(&slot.extra, "") {
+        if let Some(v) = engine_key(&slot.extra) {
             t.item(
                 w,
                 Kind::Warn,
                 name,
-                &format!("engine={v} is not rust or bash; the slot runs on bash"),
+                &format!("engine={v} is no longer used; remove it from the slot's line"),
             );
         }
         let pinned = slot_opt("template", &slot.extra, "");

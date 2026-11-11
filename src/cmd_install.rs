@@ -1,11 +1,14 @@
 //! `mayfly install [--no-timer] [--from <dir>]`: puts a release (or a checkout with a built binary) in place.
-//! It is what `install.sh` used to do once it had the files; `install.sh` now only finds or downloads the
-//! release, checks it and runs this. Same steps, same lines, same order of calls as the bash version.
+//! `install.sh` only finds or downloads the release, checks it and runs this.
 //!
-//! Installs the command (this binary, and `mayfly.sh`, which it hands most commands to), the units, the
-//! template files and the shipped profiles. Creates `pool.env` and `slots.conf` only when missing. Starts no
-//! slot and touches no VM. The gc timer is switched on by the first install only; `--no-timer` leaves it off.
-//! The update timer is switched on the first time its units are installed, unless pool.env says `UPDATE=off`.
+//! Installs the command (this binary), the units, the template files and the shipped profiles. Creates
+//! `pool.env` and `slots.conf` only when missing. Starts no slot and touches no guest. The gc timer is
+//! switched on by the first install only; `--no-timer` leaves it off. The update timer is switched on the
+//! first time its units are installed, unless pool.env says `UPDATE=off`.
+//!
+//! Releases up to 0.9.0 came with `mayfly.sh`, which ran the slot loops. Over such an install the script is
+//! removed and the running slots are restarted (a restart drains: a job in progress finishes first), because
+//! their loops cannot switch to a new command on their own. Loops of this version on can (`cmd_slot::RENEW`).
 //! `MAYFLY_SBIN`, `MAYFLY_SHARE`, `MAYFLY_SYSTEMD_DIR` and `MAYFLY_CONF_DIR` move the files (`Paths`).
 
 use crate::cmd_update::UNITS;
@@ -121,7 +124,10 @@ fn on_path(name: &str) -> bool {
     })
 }
 
-/// The release directory: `--from`, or the directory of the running binary when `mayfly.sh` is next to it.
+/// A file every release and checkout has next to the binary or `install.sh`.
+const MARKER: &str = "mayfly-slot@.service";
+
+/// The release directory: `--from`, or the directory of the running binary when the units are next to it.
 fn source_dir(from: Option<PathBuf>) -> R<PathBuf> {
     let dir = match from {
         Some(d) => d,
@@ -129,17 +135,20 @@ fn source_dir(from: Option<PathBuf>) -> R<PathBuf> {
             let exe = std::env::current_exe()
                 .map_err(|e| Die(format!("cannot tell where mayfly is: {e}")))?;
             let d = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-            if !d.join("mayfly.sh").is_file() {
+            if !d.join(MARKER).is_file() {
                 return die(format!(
-                    "no mayfly.sh next to {}; run mayfly install --from <release or checkout directory>",
+                    "no release files next to {}; run mayfly install --from <release or checkout directory>",
                     exe.display()
                 ));
             }
             d
         }
     };
-    if !dir.join("mayfly.sh").is_file() {
-        return die(format!("{} has no mayfly.sh", dir.display()));
+    if !dir.join(MARKER).is_file() {
+        return die(format!(
+            "{} is not a release or checkout directory (no {MARKER})",
+            dir.display()
+        ));
     }
     Ok(dir)
 }
@@ -270,6 +279,52 @@ fn storage_content(say: &mut Say, storage: &str) -> Res<String> {
     })
 }
 
+/// Slots started by 0.9.0 or earlier run a loop that never looks for a new command: restart them once.
+/// `systemctl restart` drains (a guest in a job finishes it first) and `--no-block` does not wait for that.
+/// A slot that cannot be restarted is named and keeps its old loop until it is.
+fn restart_old_loops(say: &mut Say) {
+    say.flush();
+    let listed = Command::new("systemctl")
+        .args([
+            "list-units",
+            "--plain",
+            "--no-legend",
+            "--state=active",
+            "mayfly-slot@*",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let units: Vec<String> = listed
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|u| u.starts_with("mayfly-slot@"))
+        .map(str::to_string)
+        .collect();
+    if units.is_empty() {
+        return;
+    }
+    say.step(&format!(
+        "restarting {} running slot{} so that they run this version (jobs in progress finish first)",
+        units.len(),
+        if units.len() == 1 { "" } else { "s" }
+    ));
+    for u in units {
+        say.flush();
+        let ok = Command::new("systemctl")
+            .args(["restart", "--no-block", &u])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            say.warn(&format!(
+                "could not restart {u}; it runs the old loop until: systemctl restart {u}"
+            ));
+        }
+    }
+}
+
 pub fn run(paths: &Paths, args: &[String], tty: bool, w: &mut dyn Write) -> R<i32> {
     let mut say = Say { w, tty };
     match install(paths, args, &mut say) {
@@ -316,11 +371,11 @@ fn install(paths: &Paths, args: &[String], say: &mut Say) -> Res<()> {
     let was = old.map(|o| format!(" (was {o})")).unwrap_or_default();
     say.step(&format!("installing Mayfly {new}{was}"));
 
-    // mayfly.sh still uses jq, curl and openssl for the slot loop and for templates.
+    // `template build` downloads the cloud image with curl.
     must(
         say,
         Command::new("apt-get")
-            .args(["install", "-y", "-q", "jq", "curl", "openssl"])
+            .args(["install", "-y", "-q", "curl"])
             .stdout(Stdio::null()),
     )?;
     install_d(conf, Some(0o700))?;
@@ -330,7 +385,12 @@ fn install(paths: &Paths, args: &[String], say: &mut Say) -> Res<()> {
     install_d(sbin, None)?;
     put(&exe, &installed, 0o755)?;
     install_d(share, None)?;
-    put(&src.join("mayfly.sh"), &share.join("mayfly.sh"), 0o755)?;
+    // The script of 0.9.0 and earlier. Its slot loops are still running: see `restart_old_loops`.
+    let script = share.join("mayfly.sh");
+    let had_script = script.exists();
+    if had_script {
+        io_err(fs::remove_file(&script), &script)?;
+    }
     for f in TEMPLATE_FILES {
         put(&src.join("template").join(f), &share.join(f), 0o644)?;
     }
@@ -415,7 +475,10 @@ fn install(paths: &Paths, args: &[String], say: &mut Say) -> Res<()> {
         }
         _ => {}
     }
-    // Running slots pick up the new command at their next job; restarting them would cancel jobs.
+    // Running slots switch to the new command by themselves between two guests (`cmd_slot::RENEW`).
+    if had_script {
+        restart_old_loops(say);
+    }
     let made = if created.is_empty() {
         String::new()
     } else {

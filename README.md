@@ -4,8 +4,8 @@ Ephemeral GitHub Actions runners on Proxmox VE. Each job runs in its own VM or L
 clone of a template, destroyed when the job ends. Short jobs can instead run in [pods](#pods): one
 long-lived VM that runs one throwaway container per job.
 
-Mayfly is a static binary, a Bash script and a set of systemd units on the Proxmox host. It requires a
-GitHub App, a thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
+Mayfly is one static binary and a set of systemd units on the Proxmox host. It requires a GitHub App, a
+thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
 
 ## Install
 
@@ -121,22 +121,7 @@ pods-1   9041  small   12    36      120      no       current   kind=pod contai
 - `template` is `current`, or `next` for canary slots that use the template under test.
 - `key=value` fields override `pool.env` for that slot: `kind=vm|pod|lxc`, `containers=N`,
   `template=<vmid>` (pin a template or use another profile), `bridge=`, `vlan=`, `cpu=`, `disk_cache=`,
-  `max_job_hours=`, `max_idle_hours=`, `engine=rust|bash`.
-
-### Slot engine (temporary)
-
-The slot loop is moving from Bash to Rust. `engine=rust|bash` on a slot, else `SLOT_ENGINE` in
-`pool.env` (default `bash`), picks the loop that runs it. Every kind (`vm`, `lxc`, `pod`) has a Rust
-loop; both loops make the same calls and log the same lines. `mayfly status` adds an `ENGINE` column
-while any slot runs Rust.
-
-To switch:
-
-1. Set `engine=rust` on one slot and restart it: `systemctl restart mayfly-slot@<name>` (drains first).
-2. Watch it for a day.
-3. Set `SLOT_ENGINE=rust`.
-
-The switch goes away once every kind has moved.
+  `max_job_hours=`, `max_idle_hours=`.
 
 ### Profiles
 
@@ -292,7 +277,21 @@ mayfly update --rollback         # restore previous/ (the version before the las
 5. runs the new `mayfly check`. If the old one passed and the new one fails, everything is restored,
    the version is skipped and the exit code is 1.
 
-Running slots are not restarted; they use the new command from their next job.
+Running slots are not restarted and no job is cancelled. A slot switches to the new command by itself
+once its current guest is gone: a VM or container slot after its job (or after `MAX_IDLE_HOURS` without
+one), a pod slot when its VM is recycled (`POD_MAX_AGE_HOURS`). The slot logs `mayfly was updated`.
+
+### From 0.9.0 or earlier
+
+Up to 0.9.0 a Bash script, `mayfly.sh`, ran the slots, or with `engine=rust` / `SLOT_ENGINE=rust` the
+binary did. Now the binary always does, with the same calls and the same log lines. Updating needs
+nothing from you:
+
+- The script is removed. `mayfly update --rollback` brings it back with the old version.
+- Slots that are running are restarted once, because loops of those versions cannot switch by themselves.
+  A restart drains: an idle guest is replaced, a job in progress finishes first.
+- `engine=` in `slots.conf` and `SLOT_ENGINE` in `pool.env` do nothing. `mayfly check` lists them until
+  you remove them.
 
 ### Automatic updates
 
@@ -323,14 +322,13 @@ skips the version it removed. `mayfly status` ends with the installed version an
 
 | File | Installed to | Purpose |
 | --- | --- | --- |
-| `mayfly` | `/usr/local/sbin` | the command (Rust); runs `mayfly.sh` for `slot` unless the slot is `engine=rust` |
-| `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC); also still has its own `gc`, `enable`, `disable` and `template` |
-| `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf` |
+| `mayfly` | `/usr/local/sbin` | the command |
+| `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf`: `mayfly slot <name>` |
 | `mayfly-gc.{service,timer}` | systemd | every 15 min: `mayfly gc` |
 | `mayfly-update.{service,timer}` | systemd | daily: `mayfly update --auto` |
 | `pool.env.example`, `slots.conf.example` | `/etc/mayfly/` | host settings and slots, with all options documented |
-| `template/` | template guest | core provisioning (runner, Docker, gh), single-job service, pod script |
-| `profiles/<name>/` | template guest | additional toolchains, libraries and images |
+| `template/` | `/usr/local/share/mayfly`, then the template guest | core provisioning (runner, Docker, gh), single-job service, pod script |
+| `profiles/<name>/` | `/usr/local/share/mayfly/profiles`, then the template guest | additional toolchains, libraries and images |
 | `host/pve-on-debian.sh`, `host/nat-bridge.sh` | new host, once | Proxmox on Debian; NAT bridge for job guests |
 
 Tests and other installs can move the paths: `MAYFLY_SBIN`, `MAYFLY_SHARE`, `MAYFLY_SYSTEMD_DIR`,
@@ -359,8 +357,8 @@ scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/in
 
 The binary is built with `cargo` when the host has it; otherwise the released binary of the checkout's
 version is downloaded and checked against `SHA256SUMS`. `install.sh` only finds and checks the files;
-`mayfly install [--no-timer] [--from <dir>]` does the rest (`<dir>` is a release or checkout directory
-with `mayfly.sh`; by default the directory of the binary).
+`mayfly install [--no-timer] [--from <dir>]` does the rest (`<dir>` is a release or checkout directory;
+by default the directory of the binary).
 
 ### Tests
 
@@ -368,15 +366,13 @@ Tests run without Proxmox.
 
 | Command | Checks |
 | --- | --- |
-| `cargo test` | the binary |
-| `bash tests/run.sh` | `mayfly.sh` |
-| `bash tests/parity.sh` | the binary against `mayfly.sh`, and `mayfly install` against the 0.4.1 `install.sh` |
+| `cargo test` | every command against a fake Proxmox host and a fake GitHub |
+| `bash tests/e2e.sh` | the built binary running a slot of each kind against stub commands |
+| `bash tests/update.sh <dist>` | an older release updating itself to this build, and rolling back |
 
-`tests/parity.sh` checks that the binary and `mayfly.sh` print the same for `version`, `help`, `status`,
-`check`, `gc`, `enable` and `disable`; for the last three it also compares the commands the stubs
-recorded and the files left behind. It runs the 0.4.1 `install.sh` (`tests/fixtures/install-0.4.1.sh`)
-and `mayfly install` against the same stub root and compares what they print, the calls and the
-resulting files.
+`tests/e2e.sh` compares every call, file, request and log line of a run with `tests/golden/`. Those
+recordings were made from the Bash loop of 0.9.0, so they hold the binary to what that loop did. After
+an intended change, `UPDATE_GOLDEN=1 bash tests/e2e.sh` records them anew; review the diff.
 
 ## License
 

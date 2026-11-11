@@ -1,0 +1,6 @@
+slot a-1: vm 9002 up as mf-a-1-EPOCH (template 9098)
+warning: hook 20-fail vm-up failed
+slot a-1: VM 9002 gone after 0 min
+warning: hook 20-fail vm-gone failed
+slot a-1: mayfly was updated; going on with the new command
+the new mayfly: slot a-1

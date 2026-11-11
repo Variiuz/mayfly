@@ -1658,8 +1658,8 @@ fn an_unknown_subcommand_is_a_usage_error() {
 
 #[test]
 fn the_binary_runs_template_itself() {
-    // `template` is not forwarded to mayfly.sh any more: with no pool.env the Rust command says so, and
-    // the script (which would print "forwarded") is never run.
+    // 0.5.0 and earlier forwarded `template` to mayfly.sh: with no pool.env the command says so itself, and
+    // a script that is still there (it would print "forwarded") is never run.
     let root = std::env::temp_dir().join(format!("mayfly-tbin-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();

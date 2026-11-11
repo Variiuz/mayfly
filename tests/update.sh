@@ -103,7 +103,7 @@ out=$("$t/root/sbin/mayfly" update 2>&1); rc=$?
 echo "$out" | sed 's/^/  | /'
 ok "mayfly $old updates to $new" '[ "$rc" = 0 ] && [ "$("$t/root/sbin/mayfly" version)" = "mayfly $new" ]'
 ok "the config is unchanged" '[ "$(conf_sum)" = "$before" ]'
-ok "the share directory has the new mayfly.sh" 'grep -q "^MAYFLY_VERSION=$new" "$t/root/share/mayfly.sh"'
+ok "the script of the old release is gone" '[ ! -e "$t/root/share/mayfly.sh" ]'
 for u in mayfly-slot@.service mayfly-gc.service mayfly-gc.timer mayfly-update.service mayfly-update.timer; do
   ok "unit $u is installed" '[ -f "$t/root/systemd/$u" ]'
 done
@@ -114,6 +114,8 @@ ok "a second update finds nothing newer" '"$t/root/sbin/mayfly" update --check 2
 out=$("$t/root/sbin/mayfly" update --rollback 2>&1); rc=$?
 echo "$out" | sed 's/^/  | /'
 ok "rollback restores $old" '[ "$rc" = 0 ] && [ "$("$t/root/sbin/mayfly" version)" = "mayfly $old" ]'
+# Releases up to 0.9.0 came with mayfly.sh, which ran their slots.
+ok "and its files" '[ ! -f "$t/old/mayfly-$old/mayfly.sh" ] || grep -q "^MAYFLY_VERSION=$old" "$t/root/share/mayfly.sh"'
 ok "the config is still unchanged" '[ "$(conf_sum)" = "$before" ]'
 ok "the timer then skips $new" '"$t/root/sbin/mayfly" update --auto 2>&1 | grep -q "skipped"'
 

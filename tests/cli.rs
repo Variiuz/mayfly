@@ -1,4 +1,4 @@
-//! `status`, `check`, the config parser and the forwarding, against a fake Proxmox host and a fake
+//! `status`, `check`, the config parser, `update` and `install`, against a fake Proxmox host and a fake
 //! GitHub. Nothing here needs Proxmox, a network or root (the key is made with `openssl`).
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
@@ -841,14 +841,8 @@ fn run_retry(c: &mut Command) -> std::process::Output {
     c.output().unwrap()
 }
 
-fn script(share: &Path, body: &str) {
-    let p = share.join("mayfly.sh");
-    write(&p, body);
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 #[test]
-fn version_and_help_need_no_script() {
+fn version_and_help() {
     let share = tmp("noscript");
     let out = mayfly(&share).arg("version").output().unwrap();
     assert_eq!(
@@ -870,37 +864,28 @@ fn version_and_help_need_no_script() {
 }
 
 #[test]
-fn other_commands_are_forwarded_with_args_env_and_exit_code() {
-    let share = tmp("forward");
-    script(
-        &share,
-        "#!/bin/sh\necho \"args=$#:$*\"\necho \"env=$MAYFLY_TEST_VAR\"\necho oops >&2\nexit 7\n",
-    );
-    for args in [vec!["slot", "build-1"], vec!["frobnicate", "--now"], vec![]] {
-        let out = run_retry(mayfly(&share).args(&args).env("MAYFLY_TEST_VAR", "kept"));
-        assert_eq!(out.status.code(), Some(7), "{args:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            format!("args={}:{}\nenv=kept\n", args.len(), args.join(" ")),
-            "{args:?}"
-        );
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops\n");
-    }
-}
-
-#[test]
-fn a_missing_script_is_a_clear_error() {
-    let share = tmp("missing");
-    let out = mayfly(&share).args(["slot", "a-1"]).output().unwrap();
+fn an_unknown_command_and_no_command_print_the_help_and_fail() {
+    let share = tmp("unknown");
+    // 0.9.0 and earlier handed these to mayfly.sh; one that is still there is not run.
+    let p = share.join("mayfly.sh");
+    write(&p, "#!/bin/sh\necho forwarded\nexit 7\n");
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = mayfly(&share)
+        .args(["frobnicate", "--now"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert_eq!(out.status.code(), Some(1));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains(&format!(
-            "{}/mayfly.sh is missing; run install.sh again",
-            share.display()
-        )),
-        "{err}"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(err.contains("Usage  mayfly <command>"), "{err}");
+    assert!(err.contains("unknown command: frobnicate"), "{err}");
+
+    let out = mayfly(&share).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(err.contains("Usage  mayfly <command>"), "{err}");
+    assert!(!err.contains("unknown command"), "{err}");
 }
 
 // ------------------------------------------------------------------ GitHub column, foreign templates
@@ -1700,8 +1685,6 @@ impl Install {
     fn new(name: &str) -> Install {
         let i = Install { root: tmp(name) };
         let src = i.src();
-        write(src.join("mayfly.sh"), "new mayfly.sh\n");
-        fs::set_permissions(src.join("mayfly.sh"), fs::Permissions::from_mode(0o700)).unwrap();
         for f in TEMPLATE_FILES {
             write(src.join("template").join(f), &format!("template {f}\n"));
         }
@@ -1858,7 +1841,7 @@ fn the_first_install_creates_the_files_and_enables_the_timers() {
     assert_eq!(
         i.calls(),
         [
-            "apt-get install -y -q jq curl openssl",
+            "apt-get install -y -q curl",
             "pvesh get /storage/local --output-format json",
             "pvesm set local --content iso,vztmpl,snippets",
             "systemctl daemon-reload",
@@ -1882,8 +1865,6 @@ fn the_first_install_creates_the_files_and_enables_the_timers() {
         fs::read(env!("CARGO_BIN_EXE_mayfly")).unwrap()
     );
     assert_eq!(i.mode(i.sbin().join("mayfly")), 0o755);
-    assert_eq!(i.read(i.share().join("mayfly.sh")), "new mayfly.sh\n");
-    assert_eq!(i.mode(i.share().join("mayfly.sh")), 0o755);
     for f in TEMPLATE_FILES {
         assert_eq!(i.read(i.share().join(f)), format!("template {f}\n"));
         assert_eq!(i.mode(i.share().join(f)), 0o644, "{f}");
@@ -1910,7 +1891,7 @@ fn the_first_install_creates_the_files_and_enables_the_timers() {
     assert_eq!(i.mode(i.conf().join("slots.conf")), 0o644);
     assert_eq!(i.names(i.sbin()), ["mayfly"]);
     assert_eq!(i.names(i.units()).len(), 5);
-    assert_eq!(i.names(i.share()).len(), 7);
+    assert_eq!(i.names(i.share()).len(), 6);
 }
 
 #[test]
@@ -1924,7 +1905,6 @@ fn a_second_install_keeps_the_config_the_timers_and_your_profiles() {
     // A profile that is no longer shipped goes, and a changed one is replaced.
     write(i.share().join("profiles/gone/provision.sh"), "old\n");
     write(i.share().join("profiles/default/provision.sh"), "stale\n");
-    write(i.share().join("mayfly.sh"), "stale\n");
     i.clear_calls();
     let o = i.run(&[]);
     let (out, err) = text(&o);
@@ -1936,7 +1916,7 @@ fn a_second_install_keeps_the_config_the_timers_and_your_profiles() {
     assert_eq!(
         i.calls(),
         [
-            "apt-get install -y -q jq curl openssl",
+            "apt-get install -y -q curl",
             "pvesh get /storage/local --output-format json",
             "systemctl daemon-reload",
         ]
@@ -1955,7 +1935,100 @@ fn a_second_install_keeps_the_config_the_timers_and_your_profiles() {
         i.read(i.share().join("profiles/default/provision.sh")),
         "profile provision\n"
     );
-    assert_eq!(i.read(i.share().join("mayfly.sh")), "new mayfly.sh\n");
+}
+
+/// An install of 0.9.0 or earlier: the command, and the script that ran its slot loops.
+fn install_with_script(name: &str) -> Install {
+    let i = Install::new(name);
+    assert_eq!(i.run(&[]).status.code(), Some(0));
+    write(i.share().join("mayfly.sh"), "the slot loops of 0.9.0\n");
+    i.clear_calls();
+    i
+}
+
+#[test]
+fn over_an_install_with_the_script_it_goes_and_running_slots_are_restarted() {
+    let i = install_with_script("install-script");
+    // Two slots run, one more unit is listed that is not a slot's.
+    write(
+        i.root.join("bin/systemctl"),
+        "#!/bin/sh\necho \"systemctl $*\" >>\"$CALLS\"\n\
+         [ \"$1\" != list-units ] || printf '%s\\n' \\\n\
+         'mayfly-slot@build-1.service loaded active running mayfly slot build-1' \\\n\
+         'mayfly-slot@pods-1.service loaded active running mayfly slot pods-1'\n",
+    );
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert_eq!(
+        out,
+        format!(
+            "\u{203a} installing Mayfly {V} (was {V})\n\
+             \u{203a} restarting 2 running slots so that they run this version (jobs in progress finish first)\n\
+             \u{2713} Mayfly {V} installed\n"
+        )
+    );
+    assert!(!i.share().join("mayfly.sh").exists());
+    assert_eq!(
+        i.calls(),
+        [
+            "apt-get install -y -q curl",
+            "pvesh get /storage/local --output-format json",
+            "systemctl daemon-reload",
+            "systemctl list-units --plain --no-legend --state=active mayfly-slot@*",
+            "systemctl restart --no-block mayfly-slot@build-1.service",
+            "systemctl restart --no-block mayfly-slot@pods-1.service",
+        ]
+    );
+
+    // The next install finds no script: the loops of this version switch by themselves.
+    i.clear_calls();
+    let o = i.run(&[]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        !i.calls().iter().any(|c| c.contains("restart")),
+        "{:?}",
+        i.calls()
+    );
+    assert!(!i.calls().iter().any(|c| c.contains("list-units")));
+}
+
+#[test]
+fn over_an_install_with_the_script_and_no_running_slot_nothing_is_restarted() {
+    let i = install_with_script("install-script-idle");
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert_eq!(
+        out,
+        format!("\u{203a} installing Mayfly {V} (was {V})\n\u{2713} Mayfly {V} installed\n")
+    );
+    assert!(!i.share().join("mayfly.sh").exists());
+    assert!(!i.calls().iter().any(|c| c.contains("restart")));
+}
+
+#[test]
+fn a_slot_that_cannot_be_restarted_is_named_and_the_install_goes_on() {
+    let i = install_with_script("install-script-fail");
+    write(
+        i.root.join("bin/systemctl"),
+        "#!/bin/sh\n\
+         [ \"$1\" != list-units ] || echo 'mayfly-slot@a-1.service loaded active running x'\n\
+         [ \"$1\" != restart ] || exit 1\n",
+    );
+    let o = i.run(&[]);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}{err}");
+    assert!(
+        out.contains(
+            "! could not restart mayfly-slot@a-1.service; it runs the old loop until: systemctl restart mayfly-slot@a-1.service\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.ends_with(&format!("\u{2713} Mayfly {V} installed\n")),
+        "{out}"
+    );
 }
 
 #[test]
@@ -2016,7 +2089,7 @@ fn the_update_timer_is_enabled_when_its_units_are_new() {
     assert_eq!(
         i.calls(),
         [
-            "apt-get install -y -q jq curl openssl",
+            "apt-get install -y -q curl",
             "pvesh get /storage/local --output-format json",
             "systemctl daemon-reload",
             "systemctl enable -q --now mayfly-update.timer",
@@ -2067,16 +2140,22 @@ fn install_refuses_without_root_qm_or_files() {
     assert!(text(&o).1.contains("not a Proxmox host (qm is missing)"));
     write(i.root.join("bin/qm"), "#!/bin/sh\n");
     fs::set_permissions(i.root.join("bin/qm"), fs::Permissions::from_mode(0o755)).unwrap();
-    // No --from and no mayfly.sh next to the binary, a directory without mayfly.sh, an unknown argument.
+    // No --from and no release next to the binary, a directory that is not a release, an unknown argument.
     let o = run_retry(&mut i.command(&[]));
     assert_eq!(o.status.code(), Some(1));
     assert!(
-        text(&o).1.contains("no mayfly.sh next to"),
+        text(&o).1.contains("no release files next to"),
         "{:?}",
         text(&o)
     );
     let o = run_retry(i.command(&[]).arg("--from").arg(i.root.join("bin")));
-    assert!(text(&o).1.contains("has no mayfly.sh"), "{:?}", text(&o));
+    assert!(
+        text(&o)
+            .1
+            .contains("is not a release or checkout directory (no mayfly-slot@.service)"),
+        "{:?}",
+        text(&o)
+    );
     let o = i.run(&["--frobnicate"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(text(&o).1.contains("unknown argument --frobnicate"));
@@ -2099,62 +2178,28 @@ fn a_failing_command_stops_the_install_with_its_exit_code() {
     assert!(!i.calls().iter().any(|c| c.starts_with("systemctl")));
 }
 
-// ------------------------------------------------------------------ engine= and SLOT_ENGINE
+// ------------------------------------------------------------------ engine= and SLOT_ENGINE (0.6.0 to 0.9.0)
 
 #[test]
-fn status_shows_the_engine_only_while_a_slot_runs_rust() {
-    // No engine setting anywhere: the columns of the bash status.
+fn status_has_no_engine_column_whatever_the_old_settings_say() {
+    let header =
+        "SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB\n";
     let (f, pve) = status_fixture("");
-    let (_, out) = f.run_status(&pve);
-    assert!(!out.contains("ENGINE"), "{out}");
-    assert!(out.starts_with(
-        "SLOT       VMID   KIND LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB\n"
-    ));
+    let (_, plain) = f.run_status(&pve);
+    assert!(plain.starts_with(header), "{plain}");
 
-    // One slot on rust: a column for all of them; pods and containers run on rust too.
-    write(
-        &f.paths.slots_conf,
-        "build-1 9002 linux 8 16 60 no current engine=rust\n\
-         pods-1 9041 small 12 36 120 no current kind=pod containers=6 engine=rust\n\
-         ct-1 9051 small 2 4 20 no current kind=lxc engine=rust\n\
-         off-1 9052 small 1 1 1 no current engine=bash\n",
-    );
-    let (_, out) = f.run_status(&pve);
-    let rows: Vec<&str> = out.lines().take(5).collect();
-    assert_eq!(
-        rows[0],
-        "SLOT       VMID   KIND ENGINE LABELS                 SIZE    SERVICE   GUEST    JOB    GITHUB"
-    );
-    assert!(rows[1].starts_with("build-1    9002   vm   rust   linux                  8c/16G  "));
-    assert!(rows[2].starts_with("pods-1     9041   pod  rust   small                  12c/36G "));
-    assert!(rows[3].starts_with("ct-1       9051   lxc  rust   small                  2c/4G   "));
-    assert!(rows[4].starts_with("off-1      9052   vm   bash   small                  1c/1G   "));
-
-    // SLOT_ENGINE in pool.env is the default of every slot.
     let (f, pve) = status_fixture("SLOT_ENGINE=rust\n");
+    let slots = fs::read_to_string(&f.paths.slots_conf)
+        .unwrap()
+        .replace("current\n", "current engine=rust\n");
+    assert!(slots.contains("engine=rust"));
+    write(&f.paths.slots_conf, &slots);
     let (_, out) = f.run_status(&pve);
-    let rows: Vec<&str> = out.lines().take(5).collect();
-    assert!(
-        rows[1].starts_with("build-1    9002   vm   rust   "),
-        "{out}"
-    );
-    assert!(
-        rows[2].starts_with("pods-1     9041   pod  rust   "),
-        "{out}"
-    );
-    assert!(
-        rows[4].starts_with("off-1      9052   vm   rust   "),
-        "{out}"
-    );
-
-    // Only an unknown value: the slot runs on bash, and no slot runs rust.
-    let (f, pve) = status_fixture("SLOT_ENGINE=nope\n");
-    let (_, out) = f.run_status(&pve);
-    assert!(!out.contains("ENGINE"), "{out}");
+    assert_eq!(out, plain);
 }
 
 #[test]
-fn check_accepts_engine_and_warns_about_an_unknown_value() {
+fn check_says_that_the_engine_settings_are_no_longer_used() {
     let dir = tmp("key-engine");
     let (key, _) = make_key(&dir, false);
     let gh = fake_github(200);
@@ -2163,13 +2208,13 @@ fn check_accepts_engine_and_warns_about_an_unknown_value() {
         &f.paths.slots_conf,
         "r-1 9002 x 1 1 1 no current engine=rust\n\
          b-1 9003 x 1 1 1 no current engine=bash\n\
-         u-1 9004 x 1 1 1 no current engine=fast\n\
+         n-1 9004 x 1 1 1 no current\n\
          p-1 9005 x 1 1 1 no current kind=pod engine=rust\n",
     );
     write(
         &f.paths.pool_env,
         &format!(
-            "APP_ID=12345\nKEY_PATH={}\nAPI_URL=http://127.0.0.1:{}\nORG=acme\nTEMPLATE_VMID=9098\nSLOT_ENGINE=nope\n",
+            "APP_ID=12345\nKEY_PATH={}\nAPI_URL=http://127.0.0.1:{}\nORG=acme\nTEMPLATE_VMID=9098\nSLOT_ENGINE=bash\n",
             key.display(),
             gh.port
         ),
@@ -2183,12 +2228,20 @@ fn check_accepts_engine_and_warns_about_an_unknown_value() {
         got,
         [
             format!(
-                "warn {:<9} SLOT_ENGINE=nope is not rust or bash; slots run on bash",
+                "warn {:<9} SLOT_ENGINE=bash is no longer used (every slot runs the same loop); remove the line",
                 "pool.env"
             ),
             format!(
-                "warn {:<9} engine=fast is not rust or bash; the slot runs on bash",
-                "u-1"
+                "warn {:<9} engine=rust is no longer used; remove it from the slot's line",
+                "r-1"
+            ),
+            format!(
+                "warn {:<9} engine=bash is no longer used; remove it from the slot's line",
+                "b-1"
+            ),
+            format!(
+                "warn {:<9} engine=rust is no longer used; remove it from the slot's line",
+                "p-1"
             ),
         ]
     );
@@ -2196,9 +2249,9 @@ fn check_accepts_engine_and_warns_about_an_unknown_value() {
 }
 
 #[test]
-fn slot_engine_defaults_to_bash() {
+fn slot_engine_is_unset_by_default_and_kept_when_set() {
     let f = Fixture::new("engine-default", "ORG=acme\n", "");
-    assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "bash");
+    assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "");
     write(&f.paths.pool_env, "ORG=acme\nSLOT_ENGINE=rust\n");
     assert_eq!(load(&f, true).unwrap().get("SLOT_ENGINE"), "rust");
 }

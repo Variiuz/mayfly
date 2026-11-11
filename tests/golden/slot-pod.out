@@ -1,0 +1,11 @@
+pod a-1: VM 9041 booting (4 containers, template 9098)
+warning: hook 20-fail pod-up failed
+pod a-1: ready after 0 min
+pod a-1: recycling VM 9041 (template 9099 replaces 9098)
+pod a-1: VM 9041 gone after 0 min
+warning: hook 20-fail pod-gone failed
+pod a-1: VM 9041 booting (4 containers, template 9099)
+warning: hook 20-fail pod-up failed
+pod a-1: ready after 0 min
+pod a-1: VM 9041 gone after 0 min
+warning: hook 20-fail pod-gone failed
