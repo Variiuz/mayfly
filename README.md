@@ -1,12 +1,11 @@
 # Mayfly
 
 Ephemeral GitHub Actions runners on Proxmox VE. Each job runs in its own VM or LXC container, a linked
-clone of a template, which is destroyed when the job ends. Short jobs can instead run in pods: one
+clone of a template, destroyed when the job ends. Short jobs can instead run in [pods](#pods): one
 long-lived VM that runs one throwaway container per job.
 
-Mayfly is a static binary, a Bash script and a set of systemd units on the Proxmox host. The binary
-(Rust) runs `version`, `help`, `status`, `check`, `update`, `gc`, `enable`, `disable` and `template`, and
-`slot` for slots on `engine=rust`; it hands the other slots to the script. It requires a GitHub App, a thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
+Mayfly is a static binary, a Bash script and a set of systemd units on the Proxmox host. It requires a
+GitHub App, a thin-provisioned storage pool (LVM-thin, ZFS or Ceph) and a network bridge.
 
 ## Install
 
@@ -16,15 +15,15 @@ On the Proxmox host, as root:
 curl -fsSL https://github.com/variiuz/mayfly/releases/latest/download/install.sh | bash
 ```
 
-The installer downloads the latest release, verifies it against `SHA256SUMS` and runs its
-`mayfly install`, which installs `mayfly` and its units and creates `/etc/mayfly`. It does not start any unit or touch any guest. To update, run it
-again; configuration, slots and running jobs are kept.
+The installer downloads the latest release, verifies it against `SHA256SUMS`, installs `mayfly` and its
+units and creates `/etc/mayfly`. It starts no unit and touches no guest. Run it again to update;
+configuration, slots and running jobs are kept.
 
 ## Setup
 
 1. Create a GitHub App without a webhook. Permissions: *Self-hosted runners: read and write* for
    organization runners, or *Administration: read and write* for repository runners. Install it on the
-   organization or repository, generate a private key, and copy it to the host:
+   organization or repository, generate a private key and copy it to the host:
 
    ```
    install -m 600 my-app.private-key.pem /etc/mayfly/app.pem
@@ -32,9 +31,7 @@ again; configuration, slots and running jobs are kept.
 
 2. In `/etc/mayfly/pool.env`, set `APP_ID`, either `ORG=<org>` or `REPO=<owner>/<name>`, and
    `STORAGE` (thin pool), `BRIDGE` and `VLAN` for job guests. All other options have defaults; see
-   [pool.env.example](pool.env.example). The file is read as plain `KEY=value` lines, optionally
-   quoted, never run as shell: `$VAR`, `$(...)` and other commands are refused, and `mayfly check`
-   lists such lines.
+   [pool.env.example](pool.env.example).
 
 3. In `/etc/mayfly/slots.conf`, add one line per runner slot: name, VMID, labels, vCPU, RAM, disk. See
    [slots.conf.example](slots.conf.example).
@@ -56,14 +53,33 @@ again; configuration, slots and running jobs are kept.
    runs-on: [self-hosted, linux]
    ```
 
-`mayfly status` lists each slot's service, guest, job and the state of its runner on GitHub
-(`online`, `busy`, `offline`, `none`). `mayfly help` lists all commands. Logs:
-`journalctl -u 'mayfly-slot@*' -f`.
+A setup is working when:
 
-`mayfly stats [hours]` counts, per slot over the last 24 hours (or `hours`), from that journal: guests
-destroyed, jobs run, guests replaced idle (`MAX_IDLE_HOURS`) or stuck (runner not online), jobs cut off
-(`MAX_JOB_HOURS`, the backstop, a full pool), errors (clone, start, GitHub registration) and the median
-life of a guest that ran a job. Pods count their VMs and errors only.
+- Runners register with the base labels plus the slot's labels and are removed after their job.
+- `ACTIONS_RUNNER_INPUT_JITCONFIG` is not present in a job's environment.
+- `mayfly status` and thin pool usage stay stable over a day of jobs.
+- `mayfly stats` after a day shows no stuck guests and no errors.
+
+## Commands
+
+| Command | Does |
+| --- | --- |
+| `mayfly check` | checks App key, storage, network and template; changes nothing |
+| `mayfly template build\|canary\|promote\|list` | see [Templates](#templates) |
+| `mayfly enable [slot ...]` | starts slots (all when none is named) and the gc timer |
+| `mayfly disable [slot ...]` | stops slots; running jobs finish first |
+| `mayfly status` | each slot's service, guest, job and runner state on GitHub (`online`, `busy`, `offline`, `none`); pool and RAM |
+| `mayfly stats [hours]` | per-slot counts from the journal, last 24 hours by default |
+| `mayfly gc` | removes stale runner registrations, orphan guests and old snippets |
+| `mayfly update` | see [Updates](#updates) |
+| `mayfly help`, `mayfly version` | |
+
+Logs: `journalctl -u 'mayfly-slot@*' -f`.
+
+`mayfly stats` counts guests destroyed, jobs run, guests replaced idle (`MAX_IDLE_HOURS`) or stuck
+(runner not online), jobs cut off (`MAX_JOB_HOURS`, the backstop, a full pool), errors (clone, start,
+GitHub registration) and the median life of a guest that ran a job. Pods count their VMs and errors
+only.
 
 ## Job lifecycle
 
@@ -73,29 +89,22 @@ life of a guest that ran a job. Pods count their VMs and errors only.
    VMID with the slot's vCPU, RAM (no balloon, no swap), disk, network and firewall settings, and
    started. The snippet is deleted once the VM is running.
 3. In the guest, `mayfly-job` reads and deletes the config, runs the job as `runner` (no sudo) and
-   powers off.
-   If the runner is not online on GitHub within 10 minutes, the slot replaces the guest, runs the
-   `vm-stuck` hook and backs off (2 min per repeat, at most 30 min).
+   powers off. If the runner is not online on GitHub within 10 minutes, the slot replaces the guest,
+   runs the `vm-stuck` hook and backs off (2 min per repeat, at most 30 min).
 4. The slot destroys the VM and its disk, removes the runner registration if it still exists, and
    starts the next clone.
 
-## Files
-
-| File | Installed to | Purpose |
-| --- | --- | --- |
-| `mayfly` | `/usr/local/sbin` | the command: `version`, `help`, `status`, `check`, `update`, `gc`, `enable`, `disable`, `template`; runs `mayfly.sh` for `slot` unless the slot is `engine=rust` |
-| `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC); also still has its own `gc`, `enable`, `disable` and `template` |
-| `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf` |
-| `mayfly-gc.{service,timer}` | systemd | every 15 min: removes stale runner registrations, orphan guests, old snippets |
-| `mayfly-update.{service,timer}` | systemd | daily: `mayfly update --auto` (see Updates) |
-| `pool.env.example`, `slots.conf.example` | `/etc/mayfly/` | host settings and slots, with all options documented |
-| `template/` | template guest | core provisioning (runner, Docker, gh), single-job service, pod script |
-| `profiles/<name>/` | template guest | additional toolchains, libraries and images |
-| `host/pve-on-debian.sh`, `host/nat-bridge.sh` | new host, once | Proxmox on Debian; NAT bridge for job guests |
-
 ## Configuration
 
-`pool.env` holds host settings. `slots.conf` has one line per slot:
+### pool.env
+
+Host settings, documented in [pool.env.example](pool.env.example). The file is read as plain
+`KEY=value` lines, optionally quoted, and never run as shell: `$VAR`, `$(...)` and other commands are
+refused, and `mayfly check` lists such lines.
+
+### slots.conf
+
+One line per slot:
 
 ```
 # name   vmid  labels  vcpu  ram_gb  disk_gb  env      template  [key=value ...]
@@ -112,25 +121,36 @@ pods-1   9041  small   12    36      120      no       current   kind=pod contai
 - `template` is `current`, or `next` for canary slots that use the template under test.
 - `key=value` fields override `pool.env` for that slot: `kind=vm|pod|lxc`, `containers=N`,
   `template=<vmid>` (pin a template or use another profile), `bridge=`, `vlan=`, `cpu=`, `disk_cache=`,
-  `max_job_hours=`, `max_idle_hours=`, `engine=rust|bash` (see below).
+  `max_job_hours=`, `max_idle_hours=`, `engine=rust|bash`.
 
 ### Slot engine (temporary)
 
-While the slot loop moves from Bash to Rust, `engine=rust|bash` on a slot (else `SLOT_ENGINE` in
-`pool.env`, default `bash`) picks the loop that runs it. Slots of every kind (`vm`, `lxc`, `pod`) have a
-Rust loop. Both loops make the same calls and log the same lines. Put one slot on `engine=rust`, restart
-it (`systemctl restart mayfly-slot@<name>` drains first), watch it for a day, then set `SLOT_ENGINE=rust`. `mayfly status` adds an `ENGINE` column
-while any slot runs Rust. The switch goes away once every kind has moved.
+The slot loop is moving from Bash to Rust. `engine=rust|bash` on a slot, else `SLOT_ENGINE` in
+`pool.env` (default `bash`), picks the loop that runs it. Every kind (`vm`, `lxc`, `pod`) has a Rust
+loop; both loops make the same calls and log the same lines. `mayfly status` adds an `ENGINE` column
+while any slot runs Rust.
+
+To switch:
+
+1. Set `engine=rust` on one slot and restart it: `systemctl restart mayfly-slot@<name>` (drains first).
+2. Watch it for a day.
+3. Set `SLOT_ENGINE=rust`.
+
+The switch goes away once every kind has moved.
 
 ### Profiles
 
 A template consists of the core (runner, Docker, gh, single-job service) and a profile. A profile is a
-directory with a `provision.sh`, run as root in the template guest from `/opt/mayfly-profile`
-(readable for `runner`, removed when the template is sealed), and a `template.env` with versions
-and `PREPULL_IMAGES`. The shipped `default` profile installs build-essential, pkg-config, OpenSSL
-headers and shellcheck. Profiles in `/etc/mayfly/profiles/<name>/` take precedence over shipped profiles
-of the same name. `PROFILE` in `pool.env` sets the default; `mayfly template build <name>` builds
-another. Slots can use templates of different profiles via `template=<vmid>`.
+directory with:
+
+- `provision.sh`, run as root in the template guest from `/opt/mayfly-profile` (readable for `runner`,
+  removed when the template is sealed);
+- `template.env`, with versions and `PREPULL_IMAGES`.
+
+The shipped `default` profile installs build-essential, pkg-config, OpenSSL headers and shellcheck.
+Profiles in `/etc/mayfly/profiles/<name>/` take precedence over shipped profiles of the same name.
+`PROFILE` in `pool.env` sets the default; `mayfly template build <name>` builds another. Slots can use
+templates of different profiles via `template=<vmid>`.
 
 ### Hooks
 
@@ -146,10 +166,30 @@ Each hook has a 30 s timeout. Failures are logged and otherwise ignored.
 
 ### GitHub
 
-`ORG` registers organization runners in `RUNNER_GROUP_ID`; `REPO=owner/name` registers repository
-runners. For GitHub Enterprise Server, set `API_URL` to `https://<host>/api/v3`. Runners are named
-`<RUNNER_PREFIX>-<slot>-<epoch>`. `mayfly gc` removes only offline registrations with that prefix and
-no matching guest.
+- `ORG` registers organization runners in `RUNNER_GROUP_ID`; `REPO=owner/name` registers repository
+  runners.
+- For GitHub Enterprise Server, set `API_URL` to `https://<host>/api/v3`.
+- Runners are named `<RUNNER_PREFIX>-<slot>-<epoch>`. `mayfly gc` removes only offline registrations
+  with that prefix and no matching guest.
+
+## Templates
+
+| Command | Does |
+| --- | --- |
+| `mayfly template build [profile]` | builds into a free template VMID; `--lxc` builds a container template |
+| `mayfly template canary <vmid>` | points slots marked `next` at it |
+| `mayfly template promote <vmid>` | switches all slots at their next job |
+| `mayfly template list` | lists templates |
+
+- The build runs in the systemd unit `mayfly-template-build`, so it survives the SSH session; one build
+  runs at a time. `--foreground` runs it in the terminal instead.
+- The previous template is kept; roll back with `mayfly template promote <old>`.
+- `canary` and `promote` accept only templates built by `mayfly template build` (description
+  `profile <name>`); `mayfly check` reports a current or next template that was not.
+- The template disk size is `TEMPLATE_DISK` GB. Set it to the largest slot disk: clones keep the
+  template size and are resized only when `disk_gb` is larger, because growing a disk makes ext4 in the
+  guest zero-fill new inode tables (about 32 MB per GB added). Unwritten space in a thin pool is not
+  allocated.
 
 ## Pods
 
@@ -164,16 +204,16 @@ whole pod; each container is limited to `vcpu/N` CPUs and `ram/N` GB.
   environment variable. The App key stays on the host.
 - Image: at boot, the guest imports its root filesystem (excluding Docker data, logs and keys) as the
   image `mayfly-pod:local`, so containers have the template's tools. This takes a few minutes per pod.
-- Containers run as `runner`, unprivileged, with all capabilities dropped, `no-new-privileges`, no
-  Docker socket, a separate network namespace without container-to-container traffic, CPU, memory and
-  pid limits, and scratch space removed with the container. Jobs that need a Docker daemon or service
-  containers cannot run in pods.
-- Recycling: the host drains, destroys and reclones a pod when its VM stops, when the guest agent has not
-  responded for 5 min, after `POD_MAX_AGE_HOURS` (24, plus 0 to 3.5 h offset by VMID), and when its
+- Isolation: containers run as `runner`, unprivileged, with all capabilities dropped,
+  `no-new-privileges`, no Docker socket, a separate network namespace without container-to-container
+  traffic, CPU, memory and pid limits, and scratch space removed with the container. Jobs that need a
+  Docker daemon or service containers cannot run in pods.
+- Recycling: the host drains, destroys and reclones a pod when its VM stops, when the guest agent has
+  not responded for 5 min, after `POD_MAX_AGE_HOURS` (24, plus 0 to 3.5 h offset by VMID), and when its
   template changes. Draining lets running jobs finish within `MAX_JOB_HOURS`; `systemctl stop` drains
   as well.
-- A pod that is not ready within 30 min is replaced; each repeat waits longer before the next clone
-  (2 min per repeat, at most 30 min).
+- Startup: a pod that is not ready within 30 min is replaced; each repeat waits longer before the next
+  clone (2 min per repeat, at most 30 min).
 
 To move back from pods to VMs, restore the VM slots in `slots.conf`, `mayfly enable` them and
 `mayfly disable` the pod slots.
@@ -207,58 +247,33 @@ ct-1  9051  small  2  4  20  no  current  kind=lxc
 
 ## Safety limits
 
-- Mayfly stops or destroys only guests that have the tag `TAG` (`mayfly`), a name starting with
+- Scope: Mayfly stops or destroys only guests that have the tag `TAG` (`mayfly`), a name starting with
   `NAME_PREFIX` (`ci-`) and a VMID in `VMID_MIN..VMID_MAX`. During a migration from another tool,
   guests with a tag in `LEGACY_TAGS` and a `ci-` name are included. No other guests are touched.
-- No new job guest is created while the thin pool is above `MAX_POOL_PERCENT` (70) or while it would
-  leave less than `MIN_FREE_RAM_GB` (8) for the host. The slot logs the reason.
-- A job running longer than `MAX_JOB_HOURS` (3) is stopped and its guest destroyed. All job guests are
-  destroyed while the pool is above `POOL_PANIC_PERCENT` (85). A guest without a job for
-  `MAX_IDLE_HOURS` (2) is replaced.
-- Per-guest firewall (`FIREWALL=yes`): no inbound traffic; outbound only DNS to `GATEWAY`, `CACHE_IP`,
+- Capacity: no new job guest is created while the thin pool is above `MAX_POOL_PERCENT` (70) or while it
+  would leave less than `MIN_FREE_RAM_GB` (8) for the host. The slot logs the reason.
+- Time: a job running longer than `MAX_JOB_HOURS` (3) is stopped and its guest destroyed. A guest
+  without a job for `MAX_IDLE_HOURS` (2) is replaced.
+- Full pool: all job guests are destroyed while the pool is above `POOL_PANIC_PERCENT` (85).
+- Firewall (`FIREWALL=yes`, per guest): no inbound traffic; outbound only DNS to `GATEWAY`, `CACHE_IP`,
   `ALLOW_OUT`, and destinations outside `BLOCK_NETS` (private ranges, Tailscale, link-local). Job guests
   reach the internet but not each other or the LAN. This requires the cluster firewall to be enabled
   (`mayfly check` reports it). Before enabling the cluster firewall, allow SSH and port 8006 from your
   admin network: its default input policy drops all other traffic to the host.
 
-## Templates
-
-`mayfly template build [profile]` builds into a free template VMID (`--lxc` for a container template).
-The build runs in the systemd unit `mayfly-template-build`, so it survives the SSH session; one build
-runs at a time. `--foreground` runs it in the terminal instead.
-`mayfly template canary <vmid>` points slots marked `next` at it. `mayfly template promote <vmid>`
-switches all slots at their next job. The previous template is kept for rollback with
-`mayfly template promote <old>`.
-
-`canary` and `promote` accept only templates built by `mayfly template build` (description
-`profile <name>`); `mayfly check` reports a current or next template that was not.
-
-The template disk size is `TEMPLATE_DISK` GB. Set it to the largest slot disk: clones keep the template
-size and are resized only when `disk_gb` is larger, because growing a disk makes ext4 in the guest
-zero-fill new inode tables (about 32 MB per GB added). Unwritten space in a thin pool is not allocated.
-
 ## Hosts behind NAT
 
-For hosts without a VLAN for job guests: `host/pve-on-debian.sh` installs Proxmox on Debian 13 (two
-stages, each followed by a reboot). `host/nat-bridge.sh` adds `vmbr1` (10.66.0.0/24, or set `BRIDGE=`
-and `NET=`) with dnsmasq, forwarding and nftables isolation (`mayfly-nat.service`). Then set
-`BRIDGE=vmbr1`, `VLAN=` and `GATEWAY=10.66.0.1` in `pool.env`. Use bare metal: on nested Proxmox, fsync
-latency breaks file-lock and timing tests, even with `DISK_CACHE=unsafe`.
+For hosts without a VLAN for job guests:
 
-## Verifying a setup
+1. `host/pve-on-debian.sh` installs Proxmox on Debian 13 (two stages, each followed by a reboot).
+2. `host/nat-bridge.sh` adds `vmbr1` (10.66.0.0/24, or set `BRIDGE=` and `NET=`) with dnsmasq,
+   forwarding and nftables isolation (`mayfly-nat.service`).
+3. Set `BRIDGE=vmbr1`, `VLAN=` and `GATEWAY=10.66.0.1` in `pool.env`.
 
-- Runners register with the base labels plus the slot's labels and are removed after their job.
-- `ACTIONS_RUNNER_INPUT_JITCONFIG` is not present in a job's environment.
-- `mayfly status` and thin pool usage stay stable over a day of jobs.
-- `mayfly stats` after a day shows no stuck guests and no errors.
+Use bare metal: on nested Proxmox, fsync latency breaks file-lock and timing tests, even with
+`DISK_CACHE=unsafe`.
 
 ## Updates
-
-`mayfly update` installs the latest release: it downloads `mayfly-<version>.tar.gz` and `SHA256SUMS`
-from the GitHub release (no token), checks the checksum, runs the new `mayfly version`, saves the
-installed files in `/usr/local/share/mayfly/previous/` and runs the new `mayfly install --from <release>`. Running slots
-are not restarted; they use the new command from their next job. Then it runs the new `mayfly check`: if
-the old one passed and the new one fails, everything is restored, the version is skipped and the exit code is 1.
 
 ```
 mayfly update                    # latest release
@@ -267,44 +282,101 @@ mayfly update --version 0.3.1    # that release (also an older one, or one that 
 mayfly update --rollback         # restore previous/ (the version before the last update)
 ```
 
+`mayfly update`:
+
+1. downloads `mayfly-<version>.tar.gz` and `SHA256SUMS` from the GitHub release (no token) and checks
+   the checksum;
+2. runs the new `mayfly version`;
+3. saves the installed files in `/usr/local/share/mayfly/previous/`;
+4. runs the new `mayfly install --from <release>`;
+5. runs the new `mayfly check`. If the old one passed and the new one fails, everything is restored,
+   the version is skipped and the exit code is 1.
+
+Running slots are not restarted; they use the new command from their next job.
+
+### Automatic updates
+
 `mayfly-update.timer` runs `mayfly update --auto` daily, up to an hour late. The first install that has
-the timer switches it on. `UPDATE` in `pool.env` sets what `--auto` does: `auto` (default) takes any newer
-release, `patch` only a newer patch of the installed `major.minor`, `off` nothing (also keeps the timer
-from being switched on). `mayfly update` by hand ignores `UPDATE`. `journalctl -u mayfly-update` has the log.
+the timer switches it on. Log: `journalctl -u mayfly-update`.
+
+`UPDATE` in `pool.env` sets what `--auto` does; `mayfly update` by hand ignores it.
+
+| `UPDATE` | `--auto` installs |
+| --- | --- |
+| `auto` (default) | any newer release |
+| `patch` | only a newer patch of the installed `major.minor` |
+| `off` | nothing; the timer is not switched on either |
 
 `--auto` never installs a release whose notes have a `BREAKING CHANGES` section, nor one with such a
-release between it and the installed version; it logs that, records `last_result=breaking` and leaves the
-update to `mayfly update` by hand (`--check` says so too). It also waits when the release list cannot be read.
+release between it and the installed version. It logs that, records `last_result=breaking` and leaves
+the update to `mayfly update` by hand (`--check` says so too). It also waits when the release list
+cannot be read.
+
+### State
 
 `/var/lib/mayfly/update.state` holds `last_attempt`, `last_result` (`ok`, `up-to-date`, `rolled-back`,
-`failed`, `breaking`) and `skipped=<version>`. A skipped version is not installed again by the timer or by a plain
-`mayfly update`; `mayfly update --version <version>` forces it. `mayfly update --rollback` skips the
-version it removed. `mayfly status` ends with the installed version and the last attempt.
+`failed`, `breaking`) and `skipped=<version>`. A skipped version is not installed again by the timer or
+by a plain `mayfly update`; `mayfly update --version <version>` forces it. `mayfly update --rollback`
+skips the version it removed. `mayfly status` ends with the installed version and the last attempt.
+
+## Files
+
+| File | Installed to | Purpose |
+| --- | --- | --- |
+| `mayfly` | `/usr/local/sbin` | the command (Rust); runs `mayfly.sh` for `slot` unless the slot is `engine=rust` |
+| `mayfly.sh` | `/usr/local/share/mayfly` | slot loop (VM, pod, LXC); also still has its own `gc`, `enable`, `disable` and `template` |
+| `mayfly-slot@.service` | systemd | one instance per slot in `slots.conf` |
+| `mayfly-gc.{service,timer}` | systemd | every 15 min: `mayfly gc` |
+| `mayfly-update.{service,timer}` | systemd | daily: `mayfly update --auto` |
+| `pool.env.example`, `slots.conf.example` | `/etc/mayfly/` | host settings and slots, with all options documented |
+| `template/` | template guest | core provisioning (runner, Docker, gh), single-job service, pod script |
+| `profiles/<name>/` | template guest | additional toolchains, libraries and images |
+| `host/pve-on-debian.sh`, `host/nat-bridge.sh` | new host, once | Proxmox on Debian; NAT bridge for job guests |
 
 Tests and other installs can move the paths: `MAYFLY_SBIN`, `MAYFLY_SHARE`, `MAYFLY_SYSTEMD_DIR`,
-`MAYFLY_CONF_DIR`, `MAYFLY_STATE_DIR`, `MAYFLY_TMP` (default `/var/tmp`), `MAYFLY_RELEASE_API` and `MAYFLY_REPO_URL`.
+`MAYFLY_CONF_DIR`, `MAYFLY_STATE_DIR`, `MAYFLY_TMP` (default `/var/tmp`), `MAYFLY_RELEASE_API` and
+`MAYFLY_REPO_URL`.
 
-## Releases
+## Development
+
+### Releases
 
 Releases are managed by [release-please](https://github.com/googleapis/release-please). Merging the
 release PR tags the version and attaches `mayfly-<version>.tar.gz`, the binary on its own as
-`mayfly-<version>-x86_64-linux`, a version-pinned `install.sh` and `SHA256SUMS`. To install a specific version:
+`mayfly-<version>-x86_64-linux`, a version-pinned `install.sh` and `SHA256SUMS`.
+
+To install a specific version:
 
 ```
 curl -fsSL https://github.com/variiuz/mayfly/releases/download/v0.1.0/install.sh | bash
 ```
 
-To install from a checkout (the binary is built with `cargo` when the host has it, otherwise the released
-binary of the checkout's version is downloaded and checked against `SHA256SUMS`):
-`scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/install.sh`.
-`install.sh` only finds and checks the files; `mayfly install [--no-timer] [--from <dir>]` does the rest
-(`<dir>` is a release or checkout directory with `mayfly.sh`; by default the directory of the binary).
+To install from a checkout:
 
-Tests run without Proxmox: `cargo test` and `bash tests/run.sh`. `bash tests/parity.sh` checks that the
-binary and `mayfly.sh` print the same for `version`, `help`, `status`, `check`, `gc`, `enable` and `disable`
-(for the last three it also compares the commands the stubs recorded and the files left behind). It also
-runs the 0.4.1 `install.sh` (`tests/fixtures/install-0.4.1.sh`) and `mayfly install` against the same stub
-root and compares what they print, the calls and the resulting files.
+```
+scp -r mayfly root@HOST:/opt/mayfly-src && ssh root@HOST bash /opt/mayfly-src/install.sh
+```
+
+The binary is built with `cargo` when the host has it; otherwise the released binary of the checkout's
+version is downloaded and checked against `SHA256SUMS`. `install.sh` only finds and checks the files;
+`mayfly install [--no-timer] [--from <dir>]` does the rest (`<dir>` is a release or checkout directory
+with `mayfly.sh`; by default the directory of the binary).
+
+### Tests
+
+Tests run without Proxmox.
+
+| Command | Checks |
+| --- | --- |
+| `cargo test` | the binary |
+| `bash tests/run.sh` | `mayfly.sh` |
+| `bash tests/parity.sh` | the binary against `mayfly.sh`, and `mayfly install` against the 0.4.1 `install.sh` |
+
+`tests/parity.sh` checks that the binary and `mayfly.sh` print the same for `version`, `help`, `status`,
+`check`, `gc`, `enable` and `disable`; for the last three it also compares the commands the stubs
+recorded and the files left behind. It runs the 0.4.1 `install.sh` (`tests/fixtures/install-0.4.1.sh`)
+and `mayfly install` against the same stub root and compares what they print, the calls and the
+resulting files.
 
 ## License
 
